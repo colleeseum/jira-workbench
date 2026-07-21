@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jira-workbench"
+version = "0.1.0"
+description = "Local-first Jira sync, search, and browsing workbench"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+authors = [
+  {name = "Serge Colle"}
+]
+keywords = ["jira", "atlassian", "cli", "sync", "search"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Framework :: Pytest",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Software Development :: Bug Tracking"
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/YOUR-GITHUB-USER/jira-workbench"
+Issues = "https://github.com/YOUR-GITHUB-USER/jira-workbench/issues"
+
+[project.scripts]
+jira-wb = "jira_workbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

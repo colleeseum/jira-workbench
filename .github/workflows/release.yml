@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with Path("pyproject.toml").open("rb") as stream:
+              print(tomllib.load(stream)["project"]["version"])
+          PY
+          )"
+
+          if [[ "$tag_version" != "$package_version" ]]; then
+              echo "Tag version $tag_version does not match pyproject.toml version $package_version" >&2
+              exit 1
+          fi
+
+      - name: Install build and test tools
+        run: python -m pip install --upgrade build pytest
+
+      - name: Compile
+        run: python -m compileall -q src
+
+      - name: Test
+        run: python -m pytest
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Verify distributions
+        run: |
+          test -n "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          python -m pip install --force-reinstall dist/*.whl
+          jira-wb --help >/dev/null
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
