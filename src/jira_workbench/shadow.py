@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -9,27 +10,49 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
-from .sync import find_existing_issue, read_json, updated_at, write_json
+from .sync import build_manifest, component_slug, find_existing_issue, issue_key_sort_key, read_json, updated_at, utc_now, write_json
 
 
-SUPPORTED_PUSH_FIELDS = {
-    "assignee": "--assignee",
-    "description": "--description",
-    "labels": "--labels",
-    "summary": "--summary",
-    "type": "--type",
+API_PUSH_FIELDS = {
+    "assignee",
+    "description",
+    "fixVersions",
+    "labels",
+    "parent",
+    "priority",
+    "summary",
+    "type",
 }
+TRANSITION_PUSH_FIELDS = {"status"}
 
 
 class ShadowError(RuntimeError):
     pass
 
 
-class Runner(Protocol):
-    def json(self, args: list[str], *, allow_failure: bool = False) -> Any:
+class JiraClient(Protocol):
+    def get_issue(self, issue_id_or_key: str, fields: str | list | tuple | set | None = None, **kwargs: Any) -> Any:
         pass
 
-    def run(self, args: list[str], *, allow_failure: bool = False) -> str:
+    def get_all_resolutions(self) -> Any:
+        pass
+
+    def issue_transition(self, issue_key: str, status: str) -> Any:
+        pass
+
+    def issue_update(
+        self,
+        issue_key: str,
+        fields: str | dict[str, Any],
+        update: dict[Any, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        pass
+
+    def issue_add_comment(self, issue_key: str, comment: str, visibility: dict[str, Any] | None = None) -> Any:
+        pass
+
+    def update_issue_field(self, key: str, fields: dict[str, Any], notify_users: bool = True) -> Any:
         pass
 
 
@@ -41,6 +64,8 @@ class PushResult:
     pushed: int
     skipped: int
     blocked: int
+    failed: int = 0
+    errors: tuple[str, ...] = ()
 
 
 def now() -> str:
@@ -102,12 +127,23 @@ def ensure_shadow(jira_dir: Path, key: str) -> dict[str, Any]:
     return load_shadow(jira_dir, key) or new_shadow(jira_dir, key)
 
 
-def set_field(jira_dir: Path, key: str, field: str, value: str) -> dict[str, Any]:
+def set_field(jira_dir: Path, key: str, field: str, value: Any) -> dict[str, Any]:
     shadow = ensure_shadow(jira_dir, key)
     fields = shadow.setdefault("fields", {})
     if not isinstance(fields, dict):
         raise ShadowError(f"shadow fields for {key} are not a JSON object")
     fields[field] = value
+    shadow["state"] = "working"
+    save_shadow(jira_dir, key, shadow)
+    return shadow
+
+
+def unset_field(jira_dir: Path, key: str, field: str) -> dict[str, Any]:
+    shadow = ensure_shadow(jira_dir, key)
+    fields = shadow.setdefault("fields", {})
+    if not isinstance(fields, dict):
+        raise ShadowError(f"shadow fields for {key} are not a JSON object")
+    fields.pop(field, None)
     shadow["state"] = "working"
     save_shadow(jira_dir, key, shadow)
     return shadow
@@ -131,6 +167,22 @@ def add_comment(jira_dir: Path, key: str, body: str) -> dict[str, Any]:
     return shadow
 
 
+def set_status_change(
+    jira_dir: Path,
+    key: str,
+    *,
+    resolution: str | None = None,
+) -> dict[str, Any]:
+    shadow = ensure_shadow(jira_dir, key)
+    if resolution:
+        shadow["statusChange"] = {"resolution": resolution}
+    else:
+        shadow.pop("statusChange", None)
+    shadow["state"] = "working"
+    save_shadow(jira_dir, key, shadow)
+    return shadow
+
+
 def commit_shadow(jira_dir: Path, key: str) -> dict[str, Any]:
     shadow = load_shadow(jira_dir, key)
     if shadow is None:
@@ -148,7 +200,7 @@ def all_shadow_keys(jira_dir: Path) -> list[str]:
     components = jira_dir / "components"
     if not components.exists():
         return []
-    return sorted(path.parent.name for path in components.glob("*/*/shadow.json"))
+    return sorted((path.parent.name for path in components.glob("*/*/shadow.json")), key=issue_key_sort_key)
 
 
 def shadow_status(jira_dir: Path) -> list[dict[str, Any]]:
@@ -215,6 +267,12 @@ def render_diff(jira_dir: Path, key: str) -> str:
             if isinstance(comment, dict):
                 state = comment.get("state", "working")
                 lines.append(f"+ [{state}] {comment.get('body', '')}")
+    status_change = shadow.get("statusChange", {})
+    if isinstance(status_change, dict) and status_change:
+        lines.append("\nstatus change:")
+        resolution = status_change.get("resolution")
+        if resolution:
+            lines.append(f"+ resolution: {resolution}")
     return "\n".join(lines)
 
 
@@ -222,31 +280,285 @@ def unsupported_fields(shadow: dict[str, Any]) -> list[str]:
     fields = shadow.get("fields", {})
     if not isinstance(fields, dict):
         return []
-    return sorted(field for field in fields if field not in SUPPORTED_PUSH_FIELDS)
+    return sorted(
+        field
+        for field in fields
+        if field not in API_PUSH_FIELDS and field not in TRANSITION_PUSH_FIELDS and not field.startswith("customfield_")
+    )
 
 
-def remote_updated(runner: Runner, key: str) -> str | None:
-    payload = runner.json(["jira", "workitem", "view", key, "--fields", "updated", "--json"])
-    if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
-        payload = payload[0]
+def remote_updated(client: JiraClient, key: str) -> str | None:
+    payload = client.get_issue(key, fields="updated")
     if not isinstance(payload, dict):
         raise ShadowError(f"could not read remote updated value for {key}")
     return updated_at(payload)
 
 
+def resolution_payload(client: JiraClient, resolution: str) -> dict[str, str]:
+    normalized = resolution.strip().lower()
+    try:
+        for item in client.get_all_resolutions():
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            item_name = str(item.get("name") or "")
+            if normalized in {item_id.lower(), item_name.lower()}:
+                return {"id": item_id} if item_id else {"name": item_name}
+    except Exception:
+        pass
+    return {"name": resolution}
+
+
+def plain_text_adf(value: str) -> dict[str, Any]:
+    paragraphs = value.splitlines() or [""]
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": line}] if line else [],
+            }
+            for line in paragraphs
+        ],
+    }
+
+
+def user_payload(jira_dir: Path, value: Any) -> Any:
+    text = str(value).strip()
+    if not text or text == "(unassigned)":
+        return None
+    for path in (jira_dir / "components").glob("*/*/issue.json"):
+        issue = read_json(path)
+        fields = issue.get("fields") if isinstance(issue, dict) else {}
+        if not isinstance(fields, dict):
+            continue
+        for field in ("assignee", "reporter"):
+            user = fields.get(field)
+            if not isinstance(user, dict):
+                continue
+            candidates = {
+                str(user.get("accountId") or ""),
+                str(user.get("displayName") or ""),
+                str(user.get("emailAddress") or ""),
+                str(user.get("name") or ""),
+            }
+            if text in candidates:
+                account_id = str(user.get("accountId") or "")
+                if account_id:
+                    return {"accountId": account_id}
+    return {"accountId": text}
+
+
+def api_field_name(field: str) -> str:
+    return "issuetype" if field == "type" else field
+
+
+def api_field_value(jira_dir: Path, field: str, value: Any) -> Any:
+    if field == "type" and isinstance(value, str):
+        return {"name": value}
+    if field == "assignee":
+        return user_payload(jira_dir, value)
+    return value
+
+
+def update_field_summary(field: str, value: Any) -> str:
+    if field == "fixVersions" and isinstance(value, list):
+        names = []
+        for item in value:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("id")
+                if name:
+                    names.append(str(name))
+            elif item:
+                names.append(str(item))
+        return f"fixVersions={', '.join(names) if names else '(none)'}"
+    if field == "parent" and isinstance(value, dict):
+        parent = value.get("key") or value.get("id")
+        return f"parent={parent}" if parent else "parent=(unknown)"
+    if field == "issuetype" and isinstance(value, dict):
+        issue_type = value.get("name") or value.get("id")
+        return f"type={issue_type}" if issue_type else "type=(unknown)"
+    if field == "priority" and isinstance(value, dict):
+        priority = value.get("name") or value.get("id")
+        return f"priority={priority}" if priority else "priority=(unknown)"
+    if field == "assignee" and isinstance(value, dict):
+        assignee = value.get("displayName") or value.get("accountId")
+        return f"assignee={assignee}" if assignee else "assignee=(unassigned)"
+    return f"{field}={json.dumps(value, sort_keys=True)}"
+
+
+def update_fields_summary(fields: dict[str, Any]) -> str:
+    return "; ".join(update_field_summary(field, value) for field, value in sorted(fields.items()))
+
+
+def jira_update_error(key: str, fields: dict[str, Any], exc: Exception) -> ShadowError:
+    names = ", ".join(sorted(fields)) or "(none)"
+    values = update_fields_summary(fields)
+    detail = f" ({values})" if values else ""
+    hint = ""
+    if "fixVersions" in fields:
+        hint = "; verify the fixVersion exists in Jira and the value matches exactly"
+    return ShadowError(f"{key}: Jira update failed for fields [{names}]{detail}: {exc}{hint}")
+
+
+def shadow_parent_key(shadow: dict[str, Any]) -> str | None:
+    fields = shadow.get("fields")
+    if not isinstance(fields, dict):
+        return None
+    parent = fields.get("parent")
+    if not isinstance(parent, dict):
+        return None
+    key = parent.get("key")
+    return key if isinstance(key, str) and key else None
+
+
+def optional_shadow(jira_dir: Path, key: str) -> dict[str, Any] | None:
+    issue_path = find_existing_issue(jira_dir / "components", key)
+    if issue_path is None:
+        return None
+    path = issue_path.parent / "shadow.json"
+    if not path.exists():
+        return None
+    value = read_json(path)
+    if not isinstance(value, dict):
+        raise ShadowError(f"shadow file for {key} is not a JSON object")
+    return value
+
+
+def local_issue_type(jira_dir: Path, key: str) -> str | None:
+    issue_path = find_existing_issue(jira_dir / "components", key)
+    if issue_path is None:
+        return None
+    issue = read_json(issue_path)
+    fields = issue.get("fields") if isinstance(issue, dict) else {}
+    if not isinstance(fields, dict):
+        return None
+    issue_type = fields.get("issuetype")
+    if isinstance(issue_type, dict):
+        name = issue_type.get("name")
+        return name if isinstance(name, str) and name else None
+    return None
+
+
+def push_dependencies(jira_dir: Path, keys: list[str]) -> dict[str, set[str]]:
+    selected = set(keys)
+    dependencies: dict[str, set[str]] = {key: set() for key in keys}
+    for key in keys:
+        shadow = load_shadow(jira_dir, key)
+        if shadow is None:
+            continue
+        parent_key = shadow_parent_key(shadow)
+        if parent_key in selected and parent_key != key:
+            dependencies[key].add(parent_key)
+    return dependencies
+
+
+def unselected_parent_blocker(jira_dir: Path, key: str, selected: set[str]) -> str | None:
+    shadow = load_shadow(jira_dir, key)
+    if shadow is None:
+        return None
+    parent_key = shadow_parent_key(shadow)
+    if parent_key is None or parent_key in selected:
+        return None
+    parent_shadow = optional_shadow(jira_dir, parent_key)
+    if parent_shadow is not None:
+        return f"parent {parent_key} has unpushed local changes and is not included in this push"
+    parent_type = local_issue_type(jira_dir, parent_key)
+    if parent_type is None:
+        return f"parent {parent_key} is not synced locally, cannot verify it can accept children"
+    if parent_type.lower() != "epic":
+        return f"parent {parent_key} is {parent_type}, not Epic"
+    return None
+
+
+def order_push_keys(jira_dir: Path, keys: list[str]) -> tuple[list[str], dict[str, set[str]]]:
+    ordered_input = list(dict.fromkeys(keys))
+    dependencies = push_dependencies(jira_dir, ordered_input)
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(key: str) -> None:
+        if key in visited:
+            return
+        if key in visiting:
+            return
+        visiting.add(key)
+        for dependency in sorted(dependencies.get(key, set()), key=issue_key_sort_key):
+            visit(dependency)
+        visiting.remove(key)
+        visited.add(key)
+        ordered.append(key)
+
+    for key in ordered_input:
+        visit(key)
+    return ordered, dependencies
+
+
+def refreshed_comments(client: JiraClient, key: str, issue: dict[str, Any]) -> Any:
+    issue_get_comments = getattr(client, "issue_get_comments", None)
+    if callable(issue_get_comments):
+        return issue_get_comments(key)
+    fields = issue.get("fields")
+    if isinstance(fields, dict) and isinstance(fields.get("comment"), dict):
+        return fields["comment"]
+    return {"comments": []}
+
+
+def refreshed_attachments(issue: dict[str, Any]) -> Any:
+    fields = issue.get("fields")
+    if isinstance(fields, dict) and isinstance(fields.get("attachment"), list):
+        return fields["attachment"]
+    return []
+
+
+def refresh_local_issue_after_push(
+    jira_dir: Path,
+    key: str,
+    jira_client: JiraClient,
+    component_field: str,
+) -> None:
+    try:
+        issue = jira_client.get_issue(key, fields="*all")
+    except Exception as exc:
+        raise ShadowError(f"{key}: Jira push succeeded but local refresh failed: {exc}") from exc
+    if not isinstance(issue, dict):
+        raise ShadowError(f"{key}: Jira push succeeded but local refresh returned non-object issue")
+
+    components_dir = jira_dir / "components"
+    existing = find_existing_issue(components_dir, key)
+    old_dest = existing.parent if existing is not None else None
+    component = component_slug(issue, component_field)
+    dest = components_dir / component / key
+
+    if old_dest is not None and old_dest != dest and dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    write_json(dest / "issue.json", issue)
+    write_json(dest / "comments.json", refreshed_comments(jira_client, key, issue))
+    write_json(dest / "attachments.json", refreshed_attachments(issue))
+    write_json(dest / "sync.json", {"key": key, "component": component, "syncedAt": utc_now()})
+
+    if old_dest is not None and old_dest != dest and old_dest.exists():
+        shutil.rmtree(old_dest)
+    build_manifest(jira_dir)
+
+
 def push_key(
     jira_dir: Path,
     key: str,
-    runner: Runner,
+    jira_client: JiraClient,
     *,
     dry_run: bool = False,
     progress: Progress | None = print,
+    component_field: str = "components",
 ) -> str:
     shadow = load_shadow(jira_dir, key)
     if shadow is None:
         return "skipped"
 
-    current_updated = remote_updated(runner, key)
+    current_updated = remote_updated(jira_client, key)
     if shadow.get("baseUpdated") != current_updated:
         if progress:
             progress(f"{key}: skipped, remote changed since local edits")
@@ -256,7 +568,7 @@ def push_key(
     if unsupported:
         raise ShadowError(
             f"{key} has fields that cannot be pushed yet: {', '.join(unsupported)}. "
-            f"Supported push fields: {', '.join(sorted(SUPPORTED_PUSH_FIELDS))}"
+            f"Supported push fields: {', '.join(sorted(API_PUSH_FIELDS | TRANSITION_PUSH_FIELDS))}, customfield_*"
         )
 
     if dry_run:
@@ -266,28 +578,46 @@ def push_key(
 
     fields = shadow.get("fields", {})
     if isinstance(fields, dict) and fields:
-        args = ["jira", "workitem", "edit", "--key", key, "--yes"]
-        for field, value in sorted(fields.items()):
-            args.extend([SUPPORTED_PUSH_FIELDS[field], str(value)])
-        runner.run(args)
+        status = fields.get("status")
+        if status:
+            jira_client.issue_transition(key, str(status))
+            status_change = shadow.get("statusChange", {})
+            resolution = status_change.get("resolution") if isinstance(status_change, dict) else None
+            if resolution:
+                resolution_fields = {"resolution": resolution_payload(jira_client, str(resolution))}
+                try:
+                    jira_client.update_issue_field(
+                        key,
+                        resolution_fields,
+                        notify_users=False,
+                    )
+                except Exception as exc:
+                    raise jira_update_error(key, resolution_fields, exc) from exc
+        update_fields = {
+            api_field_name(field): api_field_value(jira_dir, field, value)
+            for field, value in fields.items()
+            if field != "status" and (field != "parent" or value is not None)
+        }
+        if fields.get("parent") is None and "parent" in fields:
+            jira_client.issue_update(
+                key,
+                fields={},
+                update={"parent": [{"set": {"none": True}}]},
+                notify_users=False,
+            )
+        if update_fields:
+            try:
+                jira_client.update_issue_field(key, update_fields, notify_users=False)
+            except Exception as exc:
+                raise jira_update_error(key, update_fields, exc) from exc
 
     comments = shadow.get("comments", [])
     if isinstance(comments, list):
         for comment in comments:
             if isinstance(comment, dict) and comment.get("state") != "pushed":
-                runner.run(
-                    [
-                        "jira",
-                        "workitem",
-                        "comment",
-                        "create",
-                        "--key",
-                        key,
-                        "--body",
-                        str(comment.get("body", "")),
-                    ]
-                )
+                jira_client.issue_add_comment(key, str(comment.get("body", "")))
 
+    refresh_local_issue_after_push(jira_dir, key, jira_client, component_field)
     delete_shadow(jira_dir, key)
     if progress:
         progress(f"{key}: pushed")
@@ -297,19 +627,60 @@ def push_key(
 def push_shadows(
     jira_dir: Path,
     keys: list[str],
-    runner: Runner,
+    jira_client: JiraClient,
     *,
     dry_run: bool = False,
     progress: Progress | None = print,
+    component_field: str = "components",
 ) -> PushResult:
-    selected = keys or all_shadow_keys(jira_dir)
-    pushed = skipped = blocked = 0
-    for key in selected:
-        result = push_key(jira_dir, key, runner, dry_run=dry_run, progress=progress)
+    selected, dependencies = order_push_keys(jira_dir, keys or all_shadow_keys(jira_dir))
+    selected_set = set(selected)
+    pushed = skipped = blocked = failed = 0
+    errors: list[str] = []
+    results: dict[str, str] = {}
+    total = len(selected)
+    for index, key in enumerate(selected, start=1):
+        unmet = sorted(
+            (dependency for dependency in dependencies.get(key, set()) if results.get(dependency) != "pushed"),
+            key=issue_key_sort_key,
+        )
+        if unmet:
+            blocked += 1
+            results[key] = "blocked"
+            if progress:
+                progress(f"{key}: blocked, dependency did not push: {', '.join(unmet)}")
+            continue
+        blocker = unselected_parent_blocker(jira_dir, key, selected_set)
+        if blocker:
+            blocked += 1
+            results[key] = "blocked"
+            if progress:
+                progress(f"{key}: blocked, {blocker}")
+            continue
+        if progress:
+            progress(f"{key}: pushing ({index}/{total})")
+        try:
+            result = push_key(
+                jira_dir,
+                key,
+                jira_client,
+                dry_run=dry_run,
+                progress=progress,
+                component_field=component_field,
+            )
+        except ShadowError as exc:
+            failed += 1
+            error = str(exc)
+            errors.append(error)
+            results[key] = "failed"
+            if progress:
+                progress(f"{key}: failed: {error}")
+            continue
         if result == "pushed":
             pushed += 1
         elif result == "blocked":
             blocked += 1
         else:
             skipped += 1
-    return PushResult(pushed=pushed, skipped=skipped, blocked=blocked)
+        results[key] = result
+    return PushResult(pushed=pushed, skipped=skipped, blocked=blocked, failed=failed, errors=tuple(errors))

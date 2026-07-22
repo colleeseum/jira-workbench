@@ -12,12 +12,13 @@ The first implementation is a Python refactor of the original `jira-sync` shell 
 - Local shadow edits for fields and comments before pushing to Jira
 - Generated `manifest.json` for fast browsing and search
 - Local read-only web UI via `jira-wb serve`
-- No third-party runtime Python dependencies
+- Jira project metadata admin commands through `atlassian-python-api`
 
 ## Requirements
 
 - Python 3.11 or newer
 - `acli` authenticated against your Jira site
+- Jira API token credentials for project metadata admin commands
 
 ## Installation
 
@@ -37,9 +38,21 @@ Create `~/.jira-wb.conf`:
 
 ```toml
 project = "SAT"
-component_field = "customfield_10071"
 jira_dir = "jira"
 acli = "acli"
+jira_url = "https://example.atlassian.net"
+jira_email = "you@example.com"
+jira_api_token = "..."
+
+# Optional. Defaults to Jira's native components field.
+component_field = "customfield_10071"
+
+[view]
+component = "helm-chart"
+filter = "prometheus"
+
+[versions]
+filter = "helm-chart-sa 3\\.[45]"
 
 [serve]
 host = "127.0.0.1"
@@ -52,7 +65,7 @@ Sync the configured project:
 jira-wb sync
 ```
 
-Or pass the required sync values explicitly:
+Or pass the sync values explicitly:
 
 ```bash
 jira-wb sync --project SAT --component-field customfield_10071 --jira-dir jira --acli acli
@@ -76,22 +89,58 @@ Then open:
 http://127.0.0.1:8765
 ```
 
+Refresh and inspect cached Jira project metadata:
+
+```bash
+jira-wb meta
+jira-wb meta doctor
+jira-wb meta refresh
+jira-wb meta refresh --components
+jira-wb meta versions
+jira-wb meta versions --cached
+jira-wb meta components
+jira-wb meta components --cached
+jira-wb meta version-add "helm-chart-sa 3.5.0"
+jira-wb meta version-rename "helm-chart-sa 3.5.0" "helm-chart-sa 3.5.1"
+jira-wb meta version-release "helm-chart-sa 3.5.1" --release-date 2026-07-21
+jira-wb meta version-archive "helm-chart-sa 3.5.1"
+jira-wb meta version-delete "helm-chart-sa 3.5.1"
+jira-wb meta version-delete "old-version" --move-fix-to "new-version"
+jira-wb meta component-add "helm-chart"
+```
+
+Project fix versions are cached under `jira/meta/versions.json`. Project components are cached under `jira/meta/components.json`. `jira-wb sync` refreshes the version cache. `jira-wb meta` commands use the Jira API credentials, not `acli`; use `--cached` for offline inspection.
+
+`jira-wb meta version-add` and `jira-wb meta component-add` write directly to Jira through the Python API and then refresh the corresponding local cache. These project metadata operations do not use the issue shadow workflow.
+
+Without a subcommand, `jira-wb meta` opens a curses metadata browser where Enter lists versions or components and `a` adds the selected metadata type.
+
+The `[versions].filter` setting applies to the curses version list. It uses Python regular expression syntax, case-insensitive. It is not a full PCRE engine.
+
 View synced work items in the terminal:
 
 ```bash
 jira-wb view
+jira-wb view --components
+jira-wb view --component helm-chart
+jira-wb view --filter prometheus
+jira-wb view --all
 jira-wb view SAT-1
 jira-wb view SAT-1 --original
 jira-wb view SAT-1 --diff
 ```
 
-Without a work item key, `jira-wb view` opens a curses browser inspired by mail-style index navigation. Use `j`/`k` or arrow keys to move, Enter to open an item, `s` for the local shadow view, `o` for the original synced Jira issue, `d` for the shadow diff, and `q` to go back or quit.
+Without a work item key, `jira-wb view` opens a curses browser inspired by mail-style index navigation. Active-only filtering is enabled by default; pass `--all` to include closed, done, and resolved items. Configure `[view].component` and `[view].filter` to choose the default interactive subset; pass `--component` or `--filter` to override them for one run. Use `h` for full help, `j`/`k` or arrow keys to move, Enter to open an item, `/` to search rows vi-style such as `SAT-612`, `n`/`N` to repeat search, `g` to go to a matching row, `v` to type and view a work item key, `w` to toggle summary wrapping, `a` to toggle active-only filtering, `[` and `]` to cycle component filters, `c` to type a component filter, `C` to clear the component filter, `f` to type a text filter, `\` to clear the text filter, `s` for the local shadow view, `o` for the original synced Jira issue, `d` for the shadow diff, `r` to revert the current item shadow, `p` to push the current item shadow to Jira, and `q` to go back or quit.
+
+Work item detail shows local hierarchy when available. Child items show their parent epic above the title; epics show locally synced children below the epic line.
 
 The generated layout is:
 
 ```text
 jira/
 ├── project.json
+├── meta/
+│   └── versions.json
 ├── manifest.json
 └── components/
     └── <component>/

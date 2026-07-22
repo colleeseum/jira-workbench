@@ -21,7 +21,9 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Topic :: Software Development :: Bug Tracking"
 ]
-dependencies = []
+dependencies = [
+  "atlassian-python-api>=4.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/YOUR-GITHUB-USER/jira-workbench"

@@ -15,6 +15,19 @@ class JsonRunner(Protocol):
         pass
 
 
+class JiraSearchClient(Protocol):
+    def jql(
+        self,
+        jql: str,
+        fields: str | list[str] = "*all",
+        start: int = 0,
+        limit: int | None = None,
+        expand: str | None = None,
+        validate_query: str | None = None,
+    ) -> dict[str, Any] | None:
+        pass
+
+
 class SyncError(RuntimeError):
     pass
 
@@ -25,8 +38,8 @@ Progress = Callable[[str], None]
 @dataclass(frozen=True)
 class SyncConfig:
     project: str
-    component_field: str
     jira_dir: Path
+    component_field: str = "components"
 
 
 @dataclass(frozen=True)
@@ -34,6 +47,7 @@ class SyncResult:
     work_item_count: int
     changed_count: int
     skipped_count: int
+    version_count: int = 0
 
 
 def utc_now() -> str:
@@ -92,14 +106,39 @@ def component_slug(issue: dict[str, Any], field_name: str) -> str:
     value: Any = None
     if isinstance(fields, dict):
         field_value = fields.get(field_name)
-        if isinstance(field_value, dict):
-            value = field_value.get("value")
+        if isinstance(field_value, list):
+            parts = [field_value_name(item) for item in field_value]
+            value = "--".join(part for part in parts if part)
+        elif isinstance(field_value, dict):
+            value = field_value_name(field_value)
         elif isinstance(field_value, str):
             value = field_value
     if not value:
         value = "_unassigned"
     slug = re.sub(r"[^a-z0-9._-]", "-", str(value).lower())
     return slug or "_unassigned"
+
+
+def field_value_name(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("value", "name", "displayName", "key"):
+            item = value.get(key)
+            if isinstance(item, str):
+                return item
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def issue_key_sort_key(key: str) -> tuple[str, int, str]:
+    match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]*)-(\d+)", key)
+    if match:
+        return (match.group(1).upper(), int(match.group(2)), "")
+    return (key.upper(), -1, key)
+
+
+def issue_path_sort_key(path: Path) -> tuple[str, int, str]:
+    return issue_key_sort_key(path.parent.name)
 
 
 def find_existing_issue(components_dir: Path, key: str) -> Path | None:
@@ -110,6 +149,53 @@ def find_existing_issue(components_dir: Path, key: str) -> Path | None:
     return None
 
 
+def fetch_work_item_index_acli(config: SyncConfig, runner: JsonRunner) -> list[dict[str, Any]]:
+    index_payload = runner.json(
+        [
+            "jira",
+            "workitem",
+            "search",
+            "--jql",
+            f"project={config.project} ORDER BY key",
+            "--fields",
+            "issuetype,key,updated",
+            "--paginate",
+            "--json",
+        ]
+    )
+    return normalize_work_items(index_payload)
+
+
+def fetch_work_item_index_api(project: str, client: JiraSearchClient) -> list[dict[str, Any]]:
+    work_items: list[dict[str, Any]] = []
+    start = 0
+    limit = 100
+    while True:
+        payload = client.jql(
+            f"project={project} ORDER BY key",
+            fields=["issuetype", "key", "updated"],
+            start=start,
+            limit=limit,
+        )
+        if not isinstance(payload, dict):
+            raise SyncError(f"Jira API search for {project} returned unexpected JSON")
+        page_items = normalize_work_items(payload)
+        work_items.extend(page_items)
+
+        total = payload.get("total")
+        start_at = payload.get("startAt")
+        max_results = payload.get("maxResults")
+        if not isinstance(total, int) or not isinstance(start_at, int) or not isinstance(max_results, int):
+            if len(page_items) < limit:
+                break
+            start += len(page_items)
+            continue
+        start = start_at + max_results
+        if start >= total or not page_items:
+            break
+    return work_items
+
+
 def issue_summary(component: str, key: str, issue_path: Path, base_dir: Path) -> dict[str, str | None]:
     issue = read_json(issue_path)
     fields = issue.get("fields") if isinstance(issue, dict) else {}
@@ -117,10 +203,22 @@ def issue_summary(component: str, key: str, issue_path: Path, base_dir: Path) ->
         fields = {}
     status = fields.get("status")
     issue_type = fields.get("issuetype")
+    priority = fields.get("priority")
+    assignee = fields.get("assignee")
+    fix_versions = fields.get("fixVersions")
+    parent = fields.get("parent")
+    parent_fields = parent.get("fields") if isinstance(parent, dict) else {}
+    if not isinstance(parent_fields, dict):
+        parent_fields = {}
     directory = issue_path.parent
     return {
         "component": component,
+        "epic": parent.get("key") if isinstance(parent, dict) else None,
+        "epicSummary": parent_fields.get("summary") if isinstance(parent_fields.get("summary"), str) else None,
+        "fixVersion": field_value_name(fix_versions[0]) if isinstance(fix_versions, list) and fix_versions else None,
         "key": key,
+        "priority": priority.get("name") if isinstance(priority, dict) else None,
+        "assignee": assignee.get("displayName") if isinstance(assignee, dict) else None,
         "summary": fields.get("summary") if isinstance(fields.get("summary"), str) else None,
         "status": status.get("name") if isinstance(status, dict) else None,
         "type": issue_type.get("name") if isinstance(issue_type, dict) else None,
@@ -133,7 +231,7 @@ def build_manifest(jira_dir: Path) -> dict[str, Any]:
     components_dir = jira_dir / "components"
     items: list[dict[str, Any]] = []
     if components_dir.exists():
-        for issue_path in sorted(components_dir.glob("*/*/issue.json")):
+        for issue_path in sorted(components_dir.glob("*/*/issue.json"), key=issue_path_sort_key):
             issue_dir = issue_path.parent
             component = issue_dir.parent.name
             key = issue_dir.name
@@ -141,7 +239,10 @@ def build_manifest(jira_dir: Path) -> dict[str, Any]:
 
     components = []
     for component in sorted({item["component"] for item in items if item.get("component")}):
-        work_items = [item["key"] for item in items if item["component"] == component]
+        work_items = sorted(
+            (item["key"] for item in items if item["component"] == component),
+            key=issue_key_sort_key,
+        )
         components.append({"component": component, "count": len(work_items), "workItems": work_items})
 
     manifest = {
@@ -154,39 +255,67 @@ def build_manifest(jira_dir: Path) -> dict[str, Any]:
     return manifest
 
 
-def sync_project(config: SyncConfig, runner: JsonRunner, *, progress: Progress | None = print) -> SyncResult:
+def sync_project(
+    config: SyncConfig,
+    runner: JsonRunner,
+    *,
+    progress: Progress | None = print,
+    api_client: JiraSearchClient | None = None,
+) -> SyncResult:
     jira_dir = config.jira_dir
     components_dir = jira_dir / "components"
     components_dir.mkdir(parents=True, exist_ok=True)
 
     if progress:
-        progress("[1/4] Refreshing project index...")
-    index_payload = runner.json(
-        [
-            "jira",
-            "workitem",
-            "search",
-            "--jql",
-            f"project={config.project} ORDER BY key",
-            "--fields",
-            "issuetype,key",
-            "--paginate",
-            "--json",
-        ]
-    )
-    work_items = normalize_work_items(index_payload)
+        progress("[1/5] Refreshing project metadata...")
+    from .metadata import refresh_versions
+
+    version_count = 0
+    try:
+        version_cache = refresh_versions(jira_dir, config.project, runner, allow_failure=True)
+        versions = version_cache.get("versions")
+        version_count = len(versions) if isinstance(versions, list) else 0
+    except Exception as exc:
+        if progress:
+            progress(f"metadata refresh skipped: {exc}")
+
+    if progress:
+        progress("[2/5] Refreshing project index...")
+    if api_client is not None:
+        try:
+            work_items = fetch_work_item_index_api(config.project, api_client)
+        except Exception as exc:
+            if progress:
+                progress(f"API project index failed, falling back to acli: {exc}")
+            work_items = fetch_work_item_index_acli(config, runner)
+    else:
+        work_items = fetch_work_item_index_acli(config, runner)
     write_json(jira_dir / "project.json", work_items)
 
     if progress:
-        progress("[2/4] Syncing changed issues...")
+        progress("[3/5] Syncing changed issues...")
     changed = 0
     skipped = 0
-    for work_item in work_items:
+    total = len(work_items)
+    for index, work_item in enumerate(work_items, start=1):
         key = work_item.get("key")
         if not isinstance(key, str) or not key:
             continue
 
+        if progress:
+            progress(
+                f"[3/5] Syncing changed issues... {index}/{total} {key} "
+                f"changed={changed} unchanged={skipped}"
+            )
+
         existing = find_existing_issue(components_dir, key)
+        index_updated = updated_at(work_item)
+        if existing is not None and index_updated is not None:
+            existing_issue = read_json(existing)
+            if isinstance(existing_issue, dict) and updated_at(existing_issue) == index_updated:
+                skipped += 1
+                continue
+
         issue = normalize_issue(
             runner.json(["jira", "workitem", "view", key, "--fields", "*all", "--json"]),
             key,
@@ -201,6 +330,11 @@ def sync_project(config: SyncConfig, runner: JsonRunner, *, progress: Progress |
         component = component_slug(issue, config.component_field)
         dest = components_dir / component / key
         old_dest = existing.parent if existing is not None else None
+        shadow = None
+        if old_dest is not None:
+            shadow_path = old_dest / "shadow.json"
+            if shadow_path.exists():
+                shadow = read_json(shadow_path)
 
         if dest.exists():
             shutil.rmtree(dest)
@@ -221,14 +355,21 @@ def sync_project(config: SyncConfig, runner: JsonRunner, *, progress: Progress |
             ),
         )
         write_json(dest / "sync.json", {"key": key, "component": component, "syncedAt": utc_now()})
+        if shadow is not None:
+            write_json(dest / "shadow.json", shadow)
 
         if old_dest is not None and old_dest != dest and old_dest.exists():
             shutil.rmtree(old_dest)
         changed += 1
 
     if progress:
-        progress("[3/4] Building manifest...")
+        progress("[4/5] Building manifest...")
     build_manifest(jira_dir)
     if progress:
-        progress("[4/4] Done.")
-    return SyncResult(work_item_count=len(work_items), changed_count=changed, skipped_count=skipped)
+        progress("[5/5] Done.")
+    return SyncResult(
+        work_item_count=len(work_items),
+        changed_count=changed,
+        skipped_count=skipped,
+        version_count=version_count,
+    )
