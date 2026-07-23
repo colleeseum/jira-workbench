@@ -24,6 +24,7 @@ from jira_workbench.view import (
     editable_detail_fields,
     encode_edit_value,
     filter_items,
+    filter_items_for_swimlane,
     find_item_index,
     find_next_item_index,
     format_issue,
@@ -1182,6 +1183,31 @@ def test_sort_items_for_swimlane_groups_virtual_none_first() -> None:
     assert [item["key"] for item in ordered] == ["SAT-2", "SAT-11", "SAT-12"]
 
 
+def test_epic_swimlane_keeps_epic_items_as_lane_headers() -> None:
+    items = [
+        {"key": "SAT-742", "type": "Epic", "summary": "FluxCD Starter Foundation"},
+        {"key": "SAT-743", "type": "Improvement", "epic": "SAT-742"},
+        {"key": "SAT-999", "type": "Improvement", "summary": "No parent"},
+    ]
+
+    filtered = filter_items_for_swimlane(items, "epic")
+    ordered = sort_items_for_swimlane(filtered, "epic")
+
+    assert [item["key"] for item in filtered] == ["SAT-742", "SAT-743", "SAT-999"]
+    assert [item["key"] for item in ordered] == ["SAT-999", "SAT-742", "SAT-743"]
+    assert swimlane_label(items[0], "epic") == "SAT-742 FluxCD Starter Foundation"
+
+
+def test_non_epic_swimlane_keeps_epic_items() -> None:
+    items = [
+        {"key": "SAT-742", "type": "Epic", "component": "iac-fluxcd"},
+        {"key": "SAT-743", "type": "Improvement", "component": "iac-fluxcd"},
+    ]
+
+    assert filter_items_for_swimlane(items, "component") == items
+    assert filter_items_for_swimlane(items, "version") == items
+
+
 def test_swimlane_header_names_mode() -> None:
     assert swimlane_header("SAT-10 Parent", "epic") == "== Epic: SAT-10 Parent =="
     assert swimlane_header("(none)", "version") == "== Version: (none) =="
@@ -1238,6 +1264,32 @@ def test_index_rows_use_stable_columns_and_truncate_by_default() -> None:
     assert "kube-stardog-stack" in row[1]
     narrow = index_row_lines(item, width=58, wrap=False)
     assert "Marlon Garcia" in narrow[1]
+
+
+def test_index_rows_can_hide_second_row() -> None:
+    item = {
+        "key": "SAT-741",
+        "status": "In Progress",
+        "priority": "High",
+        "assignee": "Marlon Garcia",
+        "component": "helm-chart",
+        "epic": "SAT-740",
+        "fixVersion": "kube-stardog-stack 1.2.0",
+        "summary": "A title",
+    }
+
+    rows = index_row_lines(item, width=110, wrap=False, show_second_row=False)
+
+    assert rows == ["SAT-741    In Progress   helm-chart      A title"]
+
+
+def test_index_header_can_hide_second_row() -> None:
+    header = index_header(110, show_second_row=False)
+
+    assert header.count("\n") == 0
+    assert "ID" in header
+    assert "Summary" in header
+    assert "Parent" not in header
 
 
 def test_index_header_hides_grouped_swimlane_column_label() -> None:
@@ -1457,6 +1509,70 @@ def test_draw_index_shows_swimlane_headers() -> None:
     assert "swimlane=epic" in output
     assert "== Epic: (none) ==" in output
     assert "== Epic: SAT-10 Parent ==" in output
+
+
+def test_draw_index_shows_empty_epic_lane_header() -> None:
+    window = FakeWindow(height=8, width=100)
+
+    draw_index(
+        window,
+        [
+            {
+                "key": "SAT-800",
+                "type": "Epic",
+                "status": "To Do",
+                "component": "resource-as-stardog",
+                "summary": "Resource Model And Ownership",
+            },
+        ],
+        0,
+        0,
+        8,
+        100,
+        component=None,
+        pattern=None,
+        fix_version=None,
+        active=True,
+        wrap=False,
+        swimlane="epic",
+    )
+
+    output = "\n".join(window.lines)
+    assert "== Epic: SAT-800 Resource Model And Ownership ==" in output
+    assert "SAT-800    To Do" not in output
+
+
+def test_draw_index_can_hide_second_row() -> None:
+    window = FakeWindow(height=8, width=100)
+
+    draw_index(
+        window,
+        [
+            {
+                "key": "SAT-2",
+                "status": "To Do",
+                "component": "helm-chart",
+                "summary": "Without parent",
+                "priority": "Medium",
+                "epic": "SAT-1",
+            },
+        ],
+        0,
+        0,
+        8,
+        100,
+        component=None,
+        pattern=None,
+        fix_version=None,
+        active=True,
+        wrap=False,
+        show_second_row=False,
+    )
+
+    output = "\n".join(window.lines)
+    assert "single-row" in output
+    assert "Parent" not in output
+    assert "-> SAT-1" not in output
 
 
 def test_textbox_geometry_keeps_rectangle_inside_screen() -> None:

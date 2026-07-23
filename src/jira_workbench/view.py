@@ -98,6 +98,7 @@ HELP_LINES = [
     "  R               Reload local list",
     "  \\               Clear text filter",
     "  m               Toggle modified-only filter",
+    "  s               Toggle item second row",
     "  w               Toggle summary wrapping",
     "  P               Push all local shadow changes",
     "  h               Show or hide this help",
@@ -280,6 +281,10 @@ def swimlane_label(item: dict[str, Any], swimlane: str | None) -> str | None:
     if mode == "none":
         return None
     if mode == "epic":
+        if is_epic_item(item):
+            epic_key = display_name(item.get("key")).strip()
+            epic_summary = display_name(item.get("summary")).strip()
+            return f"{epic_key} {epic_summary}".rstrip() if epic_key else VIRTUAL_NONE
         parent_key = display_name(item.get("epic")).strip()
         if not parent_key:
             return VIRTUAL_NONE
@@ -297,9 +302,18 @@ def swimlane_sort_key(item: dict[str, Any], swimlane: str | None) -> tuple[Any, 
     lane = swimlane_label(item, mode) or ""
     none_rank = 0 if lane == VIRTUAL_NONE else 1
     if mode == "epic" and lane != VIRTUAL_NONE:
-        lane_key = display_name(item.get("epic"))
-        return (none_rank, issue_key_sort_key(lane_key), issue_key_sort_key(display_name(item.get("key"))))
+        lane_key = display_name(item.get("key") if is_epic_item(item) else item.get("epic"))
+        item_rank = 0 if is_epic_item(item) else 1
+        return (none_rank, issue_key_sort_key(lane_key), item_rank, issue_key_sort_key(display_name(item.get("key"))))
     return (none_rank, lane.lower(), issue_key_sort_key(display_name(item.get("key"))))
+
+
+def is_epic_item(item: dict[str, Any]) -> bool:
+    return display_name(item.get("type")).strip().lower() == "epic"
+
+
+def filter_items_for_swimlane(items: list[dict[str, Any]], swimlane: str | None) -> list[dict[str, Any]]:
+    return items
 
 
 def sort_items_for_swimlane(items: list[dict[str, Any]], swimlane: str | None) -> list[dict[str, Any]]:
@@ -1031,7 +1045,7 @@ def index_prefix(
     )
 
 
-def index_header(width: int = 120, swimlane: str | None = None) -> str:
+def index_header(width: int = 120, swimlane: str | None = None, show_second_row: bool = True) -> str:
     mode = normalize_swimlane(swimlane)
     assignee_width, version_width = metadata_flex_widths(width)
     component_label = "" if mode == "component" else "Component"
@@ -1043,6 +1057,8 @@ def index_header(width: int = 120, swimlane: str | None = None) -> str:
         f"{component_label:<{INDEX_COMPONENT_WIDTH}}  "
         "Summary"
     )
+    if not show_second_row:
+        return line1
     line2 = (
         f"{parent_label:<{INDEX_PARENT_WIDTH}}  "
         f"{'Priority':<{INDEX_STATE_WIDTH}}  "
@@ -1059,16 +1075,21 @@ def index_row_lines(
     wrap: bool,
     modified_keys: set[str] | None = None,
     swimlane: str | None = None,
+    show_second_row: bool = True,
 ) -> list[str]:
     prefix = index_prefix(item, modified_keys, swimlane=swimlane)
     summary_width = max(1, width - len(prefix))
     summary = display_name(item.get("summary"))
     metadata_line = index_metadata_line(item, width=width, swimlane=swimlane)
     if not wrap:
-        return [prefix + truncate_cell(summary, summary_width), metadata_line]
+        lines = [prefix + truncate_cell(summary, summary_width)]
+        if show_second_row:
+            lines.append(metadata_line)
+        return lines
     wrapped = textwrap.wrap(summary, width=summary_width, replace_whitespace=False) or [""]
     lines = [prefix + wrapped[0], *(f"{'':<{len(prefix)}}{line}" for line in wrapped[1:])]
-    lines.append(metadata_line)
+    if show_second_row:
+        lines.append(metadata_line)
     return lines
 
 
@@ -1200,6 +1221,7 @@ def _interactive_view(
     show_help = False
     help_top = 0
     wrap_index = False
+    show_index_second_row = True
     search_query: str | None = None
     message: str | None = None
     show_other_fields = False
@@ -1222,6 +1244,7 @@ def _interactive_view(
             modified_keys=modified_keys,
             modified_only=modified_only,
         )
+        visible_items = filter_items_for_swimlane(visible_items, current_swimlane)
         visible_items = sort_items_for_swimlane(visible_items, current_swimlane)
         if selected >= len(visible_items):
             selected = max(0, len(visible_items) - 1)
@@ -1260,6 +1283,7 @@ def _interactive_view(
                 modified_keys=modified_keys,
                 modified_only=modified_only,
                 swimlane=current_swimlane,
+                show_second_row=show_index_second_row,
                 message=message,
             )
         stdscr.refresh()
@@ -1463,6 +1487,9 @@ def _interactive_view(
                 modified_only = not modified_only
                 selected = 0
                 top = 0
+            elif key == ord("s"):
+                show_index_second_row = not show_index_second_row
+                top = selected
             elif key == ord("S"):
                 current_swimlane = cycle_swimlane(current_swimlane)
                 selected = 0
@@ -1476,14 +1503,17 @@ def _interactive_view(
                 items = load_manifest_items(jira_dir, component_field)
                 stale_index_keys.clear()
                 refreshed_visible_items = sort_items_for_swimlane(
-                    filter_items(
-                        items,
-                        component=current_component,
-                        pattern=current_filter,
-                        fix_version=current_fix_version,
-                        active=active_only,
-                        modified_keys=modified_issue_keys(jira_dir),
-                        modified_only=modified_only,
+                    filter_items_for_swimlane(
+                        filter_items(
+                            items,
+                            component=current_component,
+                            pattern=current_filter,
+                            fix_version=current_fix_version,
+                            active=active_only,
+                            modified_keys=modified_issue_keys(jira_dir),
+                            modified_only=modified_only,
+                        ),
+                        current_swimlane,
                     ),
                     current_swimlane,
                 )
@@ -1631,16 +1661,17 @@ def draw_index(
     modified_keys: set[str] | None = None,
     modified_only: bool = False,
     swimlane: str | None = None,
+    show_second_row: bool = True,
     message: str | None = None,
 ) -> tuple[int, int]:
-    header_lines = index_header(width - 1, swimlane=swimlane).splitlines()
+    header_lines = index_header(width - 1, swimlane=swimlane, show_second_row=show_second_row).splitlines()
     message_height = 1 if message else 0
     visible_height = max(1, height - 2 - len(header_lines) - message_height)
     if selected < top:
         top = selected
 
     while top < selected and not index_selection_fits(
-        items, selected, top, visible_height, width, wrap, modified_keys, swimlane
+        items, selected, top, visible_height, width, wrap, modified_keys, swimlane, show_second_row
     ):
         top += 1
 
@@ -1657,6 +1688,8 @@ def draw_index(
         filters.append("wrap")
     if modified_only:
         filters.append("modified")
+    if not show_second_row:
+        filters.append("single-row")
     if normalize_swimlane(swimlane) != "none":
         filters.append(f"swimlane={normalize_swimlane(swimlane)}")
     title = index_title(len(items), filters, width)
@@ -1668,20 +1701,27 @@ def draw_index(
     for index, item in enumerate(items[top:], start=top):
         lane_lines: list[str] = []
         lane = swimlane_label(item, swimlane)
+        epic_lane_only = normalize_swimlane(swimlane) == "epic" and is_epic_item(item)
         if lane is not None and lane != previous_lane:
             lane_lines = [swimlane_header(lane, swimlane)]
             previous_lane = lane
-        lines = index_row_lines(
-            item,
-            width=width - 1,
-            wrap=wrap,
-            modified_keys=modified_keys,
-            swimlane=swimlane,
+        lines = (
+            []
+            if epic_lane_only
+            else index_row_lines(
+                item,
+                width=width - 1,
+                wrap=wrap,
+                modified_keys=modified_keys,
+                swimlane=swimlane,
+                show_second_row=show_second_row,
+            )
         )
         if row + len(lane_lines) + len(lines) > height - message_height:
             break
         for line in lane_lines:
-            stdscr.addnstr(row, 0, line, width - 1, curses.A_BOLD)
+            lane_attr = curses.A_REVERSE if epic_lane_only and index == selected else curses.A_BOLD
+            stdscr.addnstr(row, 0, line, width - 1, lane_attr)
             row += 1
         attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
         for line in lines:
@@ -1736,6 +1776,7 @@ def index_selection_fits(
     wrap: bool,
     modified_keys: set[str] | None = None,
     swimlane: str | None = None,
+    show_second_row: bool = True,
 ) -> bool:
     row_count = 0
     previous_lane: str | None = None
@@ -1744,6 +1785,12 @@ def index_selection_fits(
         if lane is not None and lane != previous_lane:
             row_count += 1
             previous_lane = lane
+        if normalize_swimlane(swimlane) == "epic" and is_epic_item(item):
+            if row_count > visible_height:
+                return False
+            if index == selected:
+                return True
+            continue
         row_count += len(
             index_row_lines(
                 item,
@@ -1751,6 +1798,7 @@ def index_selection_fits(
                 wrap=wrap,
                 modified_keys=modified_keys,
                 swimlane=swimlane,
+                show_second_row=show_second_row,
             )
         )
         if row_count > visible_height:
