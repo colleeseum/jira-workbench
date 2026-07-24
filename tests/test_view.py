@@ -54,7 +54,7 @@ from jira_workbench.view import (
     text_from_adf,
     version_options,
 )
-from test_sync import FakeRunner
+from test_sync import FakeJiraClient
 
 
 class FakeWindow:
@@ -84,7 +84,7 @@ class FakeWindow:
 def synced_jira_dir(tmp_path: Path) -> Path:
     sync_project(
         SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
-        FakeRunner(),
+        FakeJiraClient(),
         progress=None,
     )
     return tmp_path

@@ -15,7 +15,7 @@ from jira_workbench.shadow import (
     shadow_status,
 )
 from jira_workbench.sync import SyncConfig, read_json, sync_project, write_json
-from test_sync import FakeRunner
+from test_sync import FakeJiraClient
 
 
 class PushJiraClient:
@@ -90,7 +90,7 @@ class FailingRefreshJiraClient(PushJiraClient):
 def synced_jira_dir(tmp_path: Path) -> Path:
     sync_project(
         SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
-        FakeRunner(),
+        FakeJiraClient(),
         progress=None,
     )
     return tmp_path

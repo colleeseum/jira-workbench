@@ -4,13 +4,13 @@ from pathlib import Path
 
 from jira_workbench.server import render_index
 from jira_workbench.sync import SyncConfig, sync_project
-from test_sync import FakeRunner
+from test_sync import FakeJiraClient
 
 
 def test_render_index_filters_manifest(tmp_path: Path) -> None:
     sync_project(
         SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
-        FakeRunner(),
+        FakeJiraClient(),
         progress=None,
     )
 

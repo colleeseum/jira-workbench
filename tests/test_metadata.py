@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from jira_workbench.metadata import (
     DoctorCheck,
@@ -12,7 +11,6 @@ from jira_workbench.metadata import (
     add_version_api,
     archive_version_api,
     cache_is_fresh,
-    check_acli_config,
     check_jira_api_config,
     delete_version_api,
     ensure_versions,
@@ -32,27 +30,9 @@ from jira_workbench.metadata import (
     rename_version_api,
     refresh_components_api,
     refresh_versions_api,
-    refresh_versions,
     resolve_version_id,
 )
 from jira_workbench.sync import write_json
-
-
-class VersionRunner:
-    def __init__(self, payload: Any | None = None, error: Exception | None = None) -> None:
-        self.payload = payload if payload is not None else [{"name": "helm-chart-sa 3.4.0"}]
-        self.error = error
-        self.calls: list[list[str]] = []
-
-    def json(self, args: list[str], *, allow_failure: bool = False) -> Any:
-        self.calls.append(args)
-        if self.error is not None:
-            raise self.error
-        return self.payload
-
-    def run(self, args: list[str], *, allow_failure: bool = False) -> str:
-        self.calls.append(args)
-        return "✓ Authenticated\n  Site: example.atlassian.net"
 
 
 class ApiClient:
@@ -172,17 +152,6 @@ def test_normalize_components_accepts_common_shapes() -> None:
     assert normalize_components({"components": [{"name": "helm-chart"}]}) == [{"name": "helm-chart"}]
 
 
-def test_refresh_versions_writes_cache(tmp_path: Path) -> None:
-    runner = VersionRunner({"versions": [{"name": "helm-chart-sa 3.4.0", "released": False}]})
-
-    cache = refresh_versions(tmp_path, "SAT", runner)
-
-    assert cache["project"] == "SAT"
-    assert cache["versions"][0]["name"] == "helm-chart-sa 3.4.0"
-    assert (tmp_path / "meta/versions.json").exists()
-    assert runner.calls == [["jira", "project", "view", "--key", "SAT", "--json"]]
-
-
 def test_refresh_versions_api_writes_cache(tmp_path: Path) -> None:
     client = ApiClient()
 
@@ -222,17 +191,6 @@ def test_check_jira_api_config_detects_wrong_project() -> None:
     )
 
     assert any(check.name == "jira api project" and not check.ok for check in checks)
-
-
-def test_check_acli_config_checks_project() -> None:
-    class Runner(VersionRunner):
-        def json(self, args: list[str], *, allow_failure: bool = False) -> Any:
-            self.calls.append(args)
-            return {"key": "SAT"}
-
-    checks = check_acli_config("SAT", Runner())
-
-    assert all(check.ok for check in checks)
 
 
 def test_format_doctor_checks() -> None:
@@ -399,13 +357,13 @@ def test_ensure_versions_uses_fresh_cache(tmp_path: Path) -> None:
             "versions": [{"name": "cached"}],
         },
     )
-    runner = VersionRunner()
+    client = ApiClient()
 
-    result = ensure_versions(tmp_path, "SAT", runner, max_age_seconds=999999999)
+    result = ensure_versions(tmp_path, "SAT", client, max_age_seconds=999999999)
 
     assert not result.refreshed
     assert result.cache["versions"][0]["name"] == "cached"
-    assert runner.calls == []
+    assert client.calls == []
 
 
 def test_ensure_versions_falls_back_to_stale_cache(tmp_path: Path) -> None:
@@ -417,9 +375,9 @@ def test_ensure_versions_falls_back_to_stale_cache(tmp_path: Path) -> None:
             "versions": [{"name": "cached"}],
         },
     )
-    runner = VersionRunner(error=RuntimeError("offline"))
+    client = FailingApiClient()
 
-    result = ensure_versions(tmp_path, "SAT", runner, max_age_seconds=1)
+    result = ensure_versions(tmp_path, "SAT", client, max_age_seconds=1)
 
     assert result.stale
     assert result.error is not None

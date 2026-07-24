@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .acli import AcliError, AcliRunner
 from .config import DEFAULT_CONFIG_PATH, ConfigError, choose, load_config
 from .metadata import (
     DEFAULT_METADATA_TTL_SECONDS,
@@ -96,7 +95,6 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--project", default=os.environ.get("JIRA_PROJECT"))
     sync_parser.add_argument("--component-field", default=os.environ.get("JIRA_COMPONENT_FIELD"))
     sync_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
-    sync_parser.add_argument("--acli", default=os.environ.get("ACLI"))
     sync_parser.add_argument("--jira-url", default=os.environ.get("JIRA_URL"))
     sync_parser.add_argument("--jira-email", default=os.environ.get("JIRA_EMAIL"))
     sync_parser.add_argument("--jira-api-token", default=os.environ.get("JIRA_API_TOKEN"))
@@ -160,7 +158,6 @@ def build_parser() -> argparse.ArgumentParser:
     meta_parser = subparsers.add_parser("meta", help="Manage cached Jira project metadata")
     meta_parser.add_argument("--project", default=os.environ.get("JIRA_PROJECT"))
     meta_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
-    meta_parser.add_argument("--acli", default=os.environ.get("ACLI"))
     meta_parser.add_argument("--jira-url", default=os.environ.get("JIRA_URL"))
     meta_parser.add_argument("--jira-email", default=os.environ.get("JIRA_EMAIL"))
     meta_parser.add_argument("--jira-api-token", default=os.environ.get("JIRA_API_TOKEN"))
@@ -319,7 +316,6 @@ def main(argv: list[str] | None = None) -> int:
         project = choose(args.project, config.project)
         component_field = choose(args.component_field, config.component_field) or "components"
         jira_dir = choose(args.jira_dir, config.jira_dir)
-        acli = choose(args.acli, config.acli)
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
@@ -328,7 +324,6 @@ def main(argv: list[str] | None = None) -> int:
             for name, value in (
                 ("project", project),
                 ("jira_dir", jira_dir),
-                ("acli", acli),
             )
             if value is None
         ]
@@ -339,32 +334,21 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        api_client = None
-        if jira_url and jira_email and jira_api_token:
-            try:
-                api_client = jira_api_client(
-                    JiraApiConfig(
-                        url=str(jira_url),
-                        email=str(jira_email),
-                        api_token=str(jira_api_token),
-                    )
-                )
-            except MetadataError as exc:
-                print(f"warning: Jira API index disabled: {exc}", file=sys.stderr)
+        try:
+            api_project, api_client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+        except MetadataError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         try:
             result = sync_project(
                 SyncConfig(
-                    project=str(project),
+                    project=api_project,
                     component_field=str(component_field),
                     jira_dir=Path(str(jira_dir)),
                 ),
-                AcliRunner(str(acli)),
+                api_client,
                 progress=sync_progress_printer(sys.stderr),
-                api_client=api_client,
             )
-        except AcliError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
         except SyncError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -507,9 +491,6 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             return run_shadow(args, Path(str(jira_dir)), config)
-        except AcliError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
         except MetadataError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -520,7 +501,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "meta":
         jira_dir = choose(args.jira_dir, config.jira_dir)
         project = choose(args.project, config.project)
-        acli = choose(args.acli, config.acli)
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
@@ -539,7 +519,6 @@ def main(argv: list[str] | None = None) -> int:
                     args,
                     Path(str(jira_dir)),
                     project,
-                    acli,
                     jira_url,
                     jira_email,
                     jira_api_token,
@@ -549,9 +528,6 @@ def main(argv: list[str] | None = None) -> int:
             except KeyboardInterrupt:
                 print()
                 return 130
-        except AcliError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
         except MetadataError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -741,7 +717,6 @@ def run_meta(
     args: argparse.Namespace,
     jira_dir: Path,
     project: object | None,
-    acli: object | None,
     jira_url: object | None,
     jira_email: object | None,
     jira_api_token: object | None,
@@ -752,7 +727,6 @@ def run_meta(
         return interactive_meta(
             jira_dir,
             project,
-            acli,
             jira_url,
             jira_email,
             jira_api_token,
@@ -952,7 +926,6 @@ MetaAction = Callable[[], str]
 def meta_versions_output(
     jira_dir: Path,
     project: object | None,
-    acli: object | None,
     jira_url: object | None,
     jira_email: object | None,
     jira_api_token: object | None,
@@ -1450,7 +1423,6 @@ def render_meta_screen(
 def interactive_meta(
     jira_dir: Path,
     project: object | None,
-    acli: object | None,
     jira_url: object | None,
     jira_email: object | None,
     jira_api_token: object | None,

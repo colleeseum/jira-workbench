@@ -30,7 +30,7 @@ def test_cli_version(capsys) -> None:
     except SystemExit as exc:
         assert exc.code == 0
     captured = capsys.readouterr()
-    assert "jira-wb 0.1.0" in captured.out
+    assert "jira-wb 0.2.0" in captured.out
 
 
 def test_shadow_without_subcommand_shows_help_without_requiring_config(tmp_path: Path, capsys) -> None:
@@ -43,7 +43,7 @@ def test_shadow_without_subcommand_shows_help_without_requiring_config(tmp_path:
     assert "missing required configuration" not in captured.err
 
 
-def test_sync_missing_acli_prints_friendly_error(tmp_path: Path, capsys) -> None:
+def test_sync_missing_api_config_prints_friendly_error(tmp_path: Path, capsys) -> None:
     code = main(
         [
             "--config",
@@ -55,14 +55,13 @@ def test_sync_missing_acli_prints_friendly_error(tmp_path: Path, capsys) -> None
             "customfield_10071",
             "--jira-dir",
             str(tmp_path / "jira"),
-            "--acli",
-            "definitely-missing-acli",
         ]
     )
 
     captured = capsys.readouterr()
-    assert code == 1
-    assert "error: Atlassian CLI executable 'definitely-missing-acli' was not found" in captured.err
+    assert code == 2
+    assert "error: missing required configuration for Jira API" in captured.err
+    assert "jira_url, jira_email, jira_api_token" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -71,7 +70,7 @@ def test_sync_requires_config_or_flags(tmp_path: Path, capsys) -> None:
 
     captured = capsys.readouterr()
     assert code == 2
-    assert "missing required configuration: project, jira_dir, acli" in captured.err
+    assert "missing required configuration: project, jira_dir" in captured.err
 
 
 def test_sync_progress_printer_rewrites_issue_progress_on_tty() -> None:
@@ -100,7 +99,26 @@ def test_sync_progress_printer_rewrites_issue_progress_on_tty() -> None:
     assert "\n[4/5] Building manifest...\n" in stream.output
 
 
-def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys) -> None:
+def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys, monkeypatch) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.jqls: list[str] = []
+
+        def get_project_versions(self, key: str) -> object:
+            return []
+
+        def enhanced_jql_get_list_of_tickets(
+            self,
+            jql: str,
+            fields: str | list[str] = "*all",
+            limit: int | None = None,
+            expand: str | None = None,
+        ) -> list[dict[str, object]]:
+            self.jqls.append(jql)
+            return []
+
+    client = Client()
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: client)
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
         "\n".join(
@@ -108,7 +126,9 @@ def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys) -> No
                 'project = "CFG"',
                 'component_field = "customfield_cfg"',
                 f'jira_dir = "{tmp_path / "jira"}"',
-                'acli = "definitely-missing-acli"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
             ]
         )
         + "\n"
@@ -117,9 +137,9 @@ def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys) -> No
     code = main(["--config", str(config_path), "sync", "--project", "FLAG"])
 
     captured = capsys.readouterr()
-    assert code == 1
-    assert "Atlassian CLI executable 'definitely-missing-acli' was not found" in captured.err
-    assert "missing required configuration" not in captured.err
+    assert code == 0
+    assert client.jqls == ["project=FLAG ORDER BY key"]
+    assert "Synced 0 work items" in captured.out
 
 
 def test_shadow_diff_can_export_to_file(tmp_path: Path, capsys) -> None:
@@ -613,7 +633,6 @@ def test_meta_versions_output_uses_cached_versions(tmp_path: Path) -> None:
     output = meta_versions_output(
         jira_dir,
         "SAT",
-        None,
         "https://example.atlassian.net",
         "user@example.com",
         "bad-token",

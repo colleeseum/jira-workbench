@@ -18,7 +18,6 @@ class WorkbenchConfig:
     project: str | None = None
     component_field: str | None = None
     jira_dir: str | None = None
-    acli: str | None = None
     jira_url: str | None = None
     jira_email: str | None = None
     jira_api_token: str | None = None
@@ -61,7 +60,6 @@ def load_config(path: Path) -> WorkbenchConfig:
         project=optional_string(data, "project", expanded),
         component_field=optional_string(data, "component_field", expanded),
         jira_dir=optional_string(data, "jira_dir", expanded),
-        acli=optional_string(data, "acli", expanded),
         jira_url=optional_string(data, "jira_url", expanded),
         jira_email=optional_string(data, "jira_email", expanded),
         jira_api_token=optional_string(data, "jira_api_token", expanded),

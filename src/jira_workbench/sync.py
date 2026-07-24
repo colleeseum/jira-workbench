@@ -10,21 +10,33 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
-class JsonRunner(Protocol):
-    def json(self, args: list[str], *, allow_failure: bool = False) -> Any:
-        pass
-
-
-class JiraSearchClient(Protocol):
-    def jql(
+class JiraSyncClient(Protocol):
+    def enhanced_jql_get_list_of_tickets(
         self,
         jql: str,
         fields: str | list[str] = "*all",
-        start: int = 0,
         limit: int | None = None,
         expand: str | None = None,
-        validate_query: str | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
+        pass
+
+    def get_issue(
+        self,
+        issue_id_or_key: str,
+        fields: str | list | tuple | set | None = None,
+        properties: str | None = None,
+        update_history: bool = True,
+        expand: str | None = None,
+    ) -> Any:
+        pass
+
+    def issue_get_comments(self, issue_id: str) -> Any:
+        pass
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        pass
+
+    def resource_url(self, resource: str, api_root: str = "rest/api", api_version: str | int = "latest") -> str:
         pass
 
 
@@ -77,8 +89,8 @@ def normalize_issue(payload: Any, key: str) -> dict[str, Any]:
     else:
         shape = type(payload).__name__
     raise SyncError(
-        f"Jira work item {key} returned unexpected JSON from acli view ({shape}). "
-        f"Check: acli jira workitem view {key} --fields '*all' --json"
+        f"Jira work item {key} returned unexpected JSON from the Jira API ({shape}). "
+        "Expected a single issue object."
     )
 
 
@@ -149,51 +161,40 @@ def find_existing_issue(components_dir: Path, key: str) -> Path | None:
     return None
 
 
-def fetch_work_item_index_acli(config: SyncConfig, runner: JsonRunner) -> list[dict[str, Any]]:
-    index_payload = runner.json(
-        [
-            "jira",
-            "workitem",
-            "search",
-            "--jql",
-            f"project={config.project} ORDER BY key",
-            "--fields",
-            "issuetype,key,updated",
-            "--paginate",
-            "--json",
-        ]
+def fetch_work_item_index(project: str, client: JiraSyncClient) -> list[dict[str, Any]]:
+    payload = client.enhanced_jql_get_list_of_tickets(
+        f"project={project} ORDER BY key",
+        fields=["issuetype", "key", "updated"],
     )
-    return normalize_work_items(index_payload)
+    return normalize_work_items(payload)
 
 
-def fetch_work_item_index_api(project: str, client: JiraSearchClient) -> list[dict[str, Any]]:
-    work_items: list[dict[str, Any]] = []
-    start = 0
-    limit = 100
-    while True:
-        payload = client.jql(
-            f"project={project} ORDER BY key",
-            fields=["issuetype", "key", "updated"],
-            start=start,
-            limit=limit,
-        )
-        if not isinstance(payload, dict):
-            raise SyncError(f"Jira API search for {project} returned unexpected JSON")
-        page_items = normalize_work_items(payload)
-        work_items.extend(page_items)
+def issue_attachments(issue: dict[str, Any]) -> Any:
+    fields = issue.get("fields")
+    if isinstance(fields, dict) and isinstance(fields.get("attachment"), list):
+        return fields["attachment"]
+    return []
 
-        total = payload.get("total")
-        start_at = payload.get("startAt")
-        max_results = payload.get("maxResults")
-        if not isinstance(total, int) or not isinstance(start_at, int) or not isinstance(max_results, int):
-            if len(page_items) < limit:
+
+def fetch_issue_comments(client: JiraSyncClient, key: str) -> Any:
+    payload = client.issue_get_comments(key)
+    if not isinstance(payload, dict):
+        return payload
+    comments = list(payload.get("comments") or [])
+    total = payload.get("total")
+    max_results = payload.get("maxResults")
+    start_at = payload.get("startAt")
+    if isinstance(total, int) and isinstance(max_results, int) and isinstance(start_at, int) and max_results > 0:
+        next_start = start_at + max_results
+        comment_url = f"{client.resource_url('issue')}/{key}/comment"
+        while next_start < total:
+            page = client.get(comment_url, params={"startAt": next_start, "maxResults": max_results})
+            page_comments = page.get("comments") if isinstance(page, dict) else None
+            if not page_comments:
                 break
-            start += len(page_items)
-            continue
-        start = start_at + max_results
-        if start >= total or not page_items:
-            break
-    return work_items
+            comments.extend(page_comments)
+            next_start += len(page_comments)
+    return {**payload, "comments": comments}
 
 
 def issue_summary(component: str, key: str, issue_path: Path, base_dir: Path) -> dict[str, str | None]:
@@ -257,10 +258,9 @@ def build_manifest(jira_dir: Path) -> dict[str, Any]:
 
 def sync_project(
     config: SyncConfig,
-    runner: JsonRunner,
+    client: JiraSyncClient,
     *,
     progress: Progress | None = print,
-    api_client: JiraSearchClient | None = None,
 ) -> SyncResult:
     jira_dir = config.jira_dir
     components_dir = jira_dir / "components"
@@ -268,11 +268,11 @@ def sync_project(
 
     if progress:
         progress("[1/5] Refreshing project metadata...")
-    from .metadata import refresh_versions
+    from .metadata import refresh_versions_api
 
     version_count = 0
     try:
-        version_cache = refresh_versions(jira_dir, config.project, runner, allow_failure=True)
+        version_cache = refresh_versions_api(jira_dir, config.project, client)
         versions = version_cache.get("versions")
         version_count = len(versions) if isinstance(versions, list) else 0
     except Exception as exc:
@@ -281,15 +281,7 @@ def sync_project(
 
     if progress:
         progress("[2/5] Refreshing project index...")
-    if api_client is not None:
-        try:
-            work_items = fetch_work_item_index_api(config.project, api_client)
-        except Exception as exc:
-            if progress:
-                progress(f"API project index failed, falling back to acli: {exc}")
-            work_items = fetch_work_item_index_acli(config, runner)
-    else:
-        work_items = fetch_work_item_index_acli(config, runner)
+    work_items = fetch_work_item_index(config.project, client)
     write_json(jira_dir / "project.json", work_items)
 
     if progress:
@@ -316,10 +308,7 @@ def sync_project(
                 skipped += 1
                 continue
 
-        issue = normalize_issue(
-            runner.json(["jira", "workitem", "view", key, "--fields", "*all", "--json"]),
-            key,
-        )
+        issue = normalize_issue(client.get_issue(key, fields="*all"), key)
 
         if existing is not None:
             existing_issue = read_json(existing)
@@ -340,20 +329,8 @@ def sync_project(
             shutil.rmtree(dest)
         dest.mkdir(parents=True)
         write_json(dest / "issue.json", issue)
-        write_json(
-            dest / "comments.json",
-            runner.json(
-                ["jira", "workitem", "comment", "list", "--key", key, "--paginate", "--json"],
-                allow_failure=True,
-            ),
-        )
-        write_json(
-            dest / "attachments.json",
-            runner.json(
-                ["jira", "workitem", "attachment", "list", "--key", key, "--json"],
-                allow_failure=True,
-            ),
-        )
+        write_json(dest / "comments.json", fetch_issue_comments(client, key))
+        write_json(dest / "attachments.json", issue_attachments(issue))
         write_json(dest / "sync.json", {"key": key, "component": component, "syncedAt": utc_now()})
         if shadow is not None:
             write_json(dest / "shadow.json", shadow)

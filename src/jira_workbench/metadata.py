@@ -8,16 +8,6 @@ from typing import Any, Protocol
 from .sync import read_json, utc_now, write_json
 
 
-class JsonRunner(Protocol):
-    def json(self, args: list[str], *, allow_failure: bool = False) -> Any:
-        pass
-
-
-class CommandRunner(JsonRunner, Protocol):
-    def run(self, args: list[str], *, allow_failure: bool = False) -> str:
-        pass
-
-
 DEFAULT_METADATA_TTL_SECONDS = 3600
 DONE_STATUSES = {"close", "closed", "done", "resolved"}
 
@@ -151,33 +141,6 @@ def check_jira_api_config(
     return checks
 
 
-def check_acli_config(
-    project: str | None,
-    runner: CommandRunner | None,
-) -> list[DoctorCheck]:
-    if runner is None:
-        return [DoctorCheck("acli config", False, "acli is missing")]
-    checks = []
-    try:
-        status = runner.run(["auth", "status"])
-        first_line = status.splitlines()[0] if status else "authenticated"
-        checks.append(DoctorCheck("acli auth", True, first_line))
-    except Exception as exc:
-        checks.append(DoctorCheck("acli auth", False, str(exc) or type(exc).__name__))
-        return checks
-
-    if project is None:
-        checks.append(DoctorCheck("acli project", False, "project is missing"))
-        return checks
-    try:
-        payload = runner.json(["jira", "project", "view", "--key", project, "--json"])
-        project_key = payload.get("key") if isinstance(payload, dict) else None
-        checks.append(DoctorCheck("acli project", project_key == project, f"project={project_key}"))
-    except Exception as exc:
-        checks.append(DoctorCheck("acli project", False, str(exc) or type(exc).__name__))
-    return checks
-
-
 def redacted_token(token: str) -> str:
     stripped = token.strip()
     return f"<set, length {len(stripped)}>" if stripped else "<missing>"
@@ -281,26 +244,6 @@ def load_component_field_options(jira_dir: Path, field_id: str) -> dict[str, Any
         return None
     value = read_json(path)
     return value if isinstance(value, dict) else None
-
-
-def refresh_versions(
-    jira_dir: Path,
-    project: str,
-    runner: JsonRunner,
-    *,
-    allow_failure: bool = False,
-) -> dict[str, Any]:
-    payload = runner.json(
-        ["jira", "project", "view", "--key", project, "--json"],
-        allow_failure=allow_failure,
-    )
-    cache = {
-        "project": project,
-        "fetchedAt": utc_now(),
-        "versions": sort_versions(normalize_versions(payload)),
-    }
-    write_json(versions_path(jira_dir), cache)
-    return cache
 
 
 def refresh_versions_api(
@@ -629,7 +572,7 @@ def cache_is_fresh(cache: dict[str, Any], project: str, max_age_seconds: int) ->
 def ensure_versions(
     jira_dir: Path,
     project: str,
-    runner: JsonRunner,
+    client: ProjectMetadataClient,
     *,
     max_age_seconds: int = DEFAULT_METADATA_TTL_SECONDS,
 ) -> MetadataResult:
@@ -637,7 +580,7 @@ def ensure_versions(
     if cache is not None and cache_is_fresh(cache, project, max_age_seconds):
         return MetadataResult(cache=cache, refreshed=False)
     try:
-        return MetadataResult(cache=refresh_versions(jira_dir, project, runner), refreshed=True)
+        return MetadataResult(cache=refresh_versions_api(jira_dir, project, client), refreshed=True)
     except Exception as exc:
         if cache is not None:
             return MetadataResult(cache=cache, refreshed=False, stale=True, error=exc)

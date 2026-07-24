@@ -17,115 +17,83 @@ from jira_workbench.sync import (
 )
 
 
-class FakeRunner:
+class FakeJiraClient:
     def __init__(self) -> None:
-        self.calls: list[list[str]] = []
+        self.calls: list[tuple[Any, ...]] = []
 
-    def json(self, args: list[str], *, allow_failure: bool = False) -> Any:
-        self.calls.append(args)
-        if args[:4] == ["jira", "project", "view", "--key"]:
-            return {
-                "key": args[4],
-                "versions": [
-                    {"id": "10001", "name": "helm-chart-sa 3.3.0", "released": True},
-                    {"id": "10002", "name": "helm-chart-sa 3.4.0", "released": False},
-                ]
-            }
-        if args[:3] == ["jira", "workitem", "search"]:
-            return {
-                "issues": [
-                    {
-                        "key": "SAT-1",
-                        "fields": {"updated": "2026-07-20T00:00:01.000+0000"},
-                    },
-                    {
-                        "key": "SAT-2",
-                        "fields": {"updated": "2026-07-20T00:00:02.000+0000"},
-                    },
-                ]
-            }
-        if args[:3] == ["jira", "workitem", "view"]:
-            key = args[3]
-            component = "API Team" if key == "SAT-1" else None
-            return {
-                "key": key,
-                "fields": {
-                    "summary": f"Summary for {key}",
-                    "status": {"name": "Open"},
-                    "priority": {"name": "Medium"},
-                    "assignee": {"displayName": "Serge Colle"},
-                    "issuetype": {"name": "Task"},
-                    "updated": f"2026-07-20T00:00:0{key[-1]}.000+0000",
-                    "fixVersions": [{"name": "helm-chart-sa 3.4.4"}] if key == "SAT-1" else [],
-                    "parent": {
-                        "key": "SAT-100",
-                        "fields": {"summary": "Feature Epic"},
-                    }
-                    if key == "SAT-1"
-                    else None,
-                    "customfield_10071": {"value": component} if component else None,
-                },
-            }
-        if args[:4] == ["jira", "workitem", "comment", "list"]:
-            return [{"body": "comment"}]
-        if args[:4] == ["jira", "workitem", "attachment", "list"]:
-            return []
-        raise AssertionError(args)
+    def get_project_versions(self, key: str) -> Any:
+        self.calls.append(("get_project_versions", key))
+        return [
+            {"id": "10001", "name": "helm-chart-sa 3.3.0", "released": True},
+            {"id": "10002", "name": "helm-chart-sa 3.4.0", "released": False},
+        ]
 
-
-class FakeRunnerWithoutIndexUpdated(FakeRunner):
-    def json(self, args: list[str], *, allow_failure: bool = False) -> Any:
-        if args[:3] == ["jira", "workitem", "search"]:
-            self.calls.append(args)
-            return {"issues": [{"key": "SAT-1"}, {"key": "SAT-2"}]}
-        return super().json(args, allow_failure=allow_failure)
-
-
-class FakeApiIndexClient:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    def jql(
+    def enhanced_jql_get_list_of_tickets(
         self,
         jql: str,
         fields: str | list[str] = "*all",
-        start: int = 0,
         limit: int | None = None,
         expand: str | None = None,
-        validate_query: str | None = None,
-    ) -> dict[str, Any]:
-        self.calls.append({"jql": jql, "fields": fields, "start": start, "limit": limit})
+    ) -> list[dict[str, Any]]:
+        self.calls.append(("enhanced_jql_get_list_of_tickets", jql, fields, limit))
+        return [
+            {"key": "SAT-1", "fields": {"updated": "2026-07-20T00:00:01.000+0000"}},
+            {"key": "SAT-2", "fields": {"updated": "2026-07-20T00:00:02.000+0000"}},
+        ]
+
+    def get_issue(
+        self,
+        issue_id_or_key: str,
+        fields: str | list | tuple | set | None = None,
+        properties: str | None = None,
+        update_history: bool = True,
+        expand: str | None = None,
+    ) -> Any:
+        self.calls.append(("get_issue", issue_id_or_key, fields))
+        key = issue_id_or_key
+        component = "API Team" if key == "SAT-1" else None
         return {
-            "startAt": 0,
-            "maxResults": 100,
-            "total": 2,
-            "issues": [
-                {
-                    "key": "SAT-1",
-                    "fields": {"updated": "2026-07-20T00:00:01.000+0000"},
-                },
-                {
-                    "key": "SAT-2",
-                    "fields": {"updated": "2026-07-20T00:00:02.000+0000"},
-                },
-            ],
+            "key": key,
+            "fields": {
+                "summary": f"Summary for {key}",
+                "status": {"name": "Open"},
+                "priority": {"name": "Medium"},
+                "assignee": {"displayName": "Serge Colle"},
+                "issuetype": {"name": "Task"},
+                "updated": f"2026-07-20T00:00:0{key[-1]}.000+0000",
+                "fixVersions": [{"name": "helm-chart-sa 3.4.4"}] if key == "SAT-1" else [],
+                "parent": (
+                    {"key": "SAT-100", "fields": {"summary": "Feature Epic"}} if key == "SAT-1" else None
+                ),
+                "customfield_10071": {"value": component} if component else None,
+                "attachment": [{"filename": "notes.txt"}] if key == "SAT-1" else [],
+            },
         }
 
+    def issue_get_comments(self, issue_id: str) -> Any:
+        self.calls.append(("issue_get_comments", issue_id))
+        return {"comments": [{"body": "comment"}]} if issue_id == "SAT-1" else {"comments": []}
 
-class FailingApiIndexClient(FakeApiIndexClient):
-    def jql(
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        raise AssertionError("comment pagination should not be exercised by these tests")
+
+    def resource_url(self, resource: str, api_root: str = "rest/api", api_version: str | int = "latest") -> str:
+        return f"https://example.atlassian.net/rest/api/3/{resource}"
+
+
+class FakeJiraClientWithoutIndexUpdated(FakeJiraClient):
+    def enhanced_jql_get_list_of_tickets(
         self,
         jql: str,
         fields: str | list[str] = "*all",
-        start: int = 0,
         limit: int | None = None,
         expand: str | None = None,
-        validate_query: str | None = None,
-    ) -> dict[str, Any]:
-        raise RuntimeError("api unavailable")
+    ) -> list[dict[str, Any]]:
+        self.calls.append(("enhanced_jql_get_list_of_tickets", jql, fields, limit))
+        return [{"key": "SAT-1"}, {"key": "SAT-2"}]
 
 
-def test_normalize_work_items_accepts_common_acli_shapes() -> None:
+def test_normalize_work_items_accepts_common_shapes() -> None:
     assert normalize_work_items([{"key": "A-1"}]) == [{"key": "A-1"}]
     assert normalize_work_items({"values": [{"key": "A-1"}]}) == [{"key": "A-1"}]
     assert normalize_work_items({"issues": [{"key": "A-1"}]}) == [{"key": "A-1"}]
@@ -161,11 +129,11 @@ def test_issue_key_sort_key_sorts_by_numeric_suffix() -> None:
 
 
 def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> None:
-    runner = FakeRunner()
+    client = FakeJiraClient()
     progress: list[str] = []
     result = sync_project(
         SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
-        runner,
+        client,
         progress=progress.append,
     )
 
@@ -173,22 +141,14 @@ def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> No
     assert result.changed_count == 2
     assert result.skipped_count == 0
     assert result.version_count == 2
-    assert ["jira", "project", "view", "--key", "SAT", "--json"] in runner.calls
-    assert [
-        "jira",
-        "workitem",
-        "search",
-        "--jql",
-        "project=SAT ORDER BY key",
-        "--fields",
-        "issuetype,key,updated",
-        "--paginate",
-        "--json",
-    ] in runner.calls
-    assert ["jira", "workitem", "view", "SAT-1", "--fields", "*all", "--json"] in runner.calls
+    assert ("get_project_versions", "SAT") in client.calls
+    assert ("enhanced_jql_get_list_of_tickets", "project=SAT ORDER BY key", ["issuetype", "key", "updated"], None) in client.calls
+    assert ("get_issue", "SAT-1", "*all") in client.calls
     assert (tmp_path / "meta/versions.json").exists()
     assert (tmp_path / "components/api-team/SAT-1/issue.json").exists()
     assert (tmp_path / "components/_unassigned/SAT-2/issue.json").exists()
+    assert read_json(tmp_path / "components/api-team/SAT-1/attachments.json") == [{"filename": "notes.txt"}]
+    assert read_json(tmp_path / "components/api-team/SAT-1/comments.json") == {"comments": [{"body": "comment"}]}
     assert (tmp_path / "manifest.json").exists()
     manifest = read_json(tmp_path / "manifest.json")
     assert manifest["workItems"][0]["fixVersion"] == "helm-chart-sa 3.4.4"
@@ -200,65 +160,36 @@ def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> No
 
 
 def test_sync_project_skips_unchanged_items(tmp_path: Path) -> None:
-    runner = FakeRunner()
+    client = FakeJiraClient()
     config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path)
-    sync_project(config, runner, progress=None)
+    sync_project(config, client, progress=None)
 
-    runner.calls = []
-    second = sync_project(config, runner, progress=None)
+    client.calls = []
+    second = sync_project(config, client, progress=None)
 
     assert second.changed_count == 0
     assert second.skipped_count == 2
-    assert not any(call[:3] == ["jira", "workitem", "view"] for call in runner.calls)
+    assert not any(call[0] == "get_issue" for call in client.calls)
 
 
 def test_sync_project_falls_back_to_view_when_index_has_no_updated(tmp_path: Path) -> None:
-    runner = FakeRunnerWithoutIndexUpdated()
+    client = FakeJiraClientWithoutIndexUpdated()
     config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path)
-    sync_project(config, runner, progress=None)
+    sync_project(config, client, progress=None)
 
-    runner.calls = []
-    second = sync_project(config, runner, progress=None)
+    client.calls = []
+    second = sync_project(config, client, progress=None)
 
     assert second.changed_count == 0
     assert second.skipped_count == 2
-    assert ["jira", "workitem", "view", "SAT-1", "--fields", "*all", "--json"] in runner.calls
-    assert ["jira", "workitem", "view", "SAT-2", "--fields", "*all", "--json"] in runner.calls
-
-
-def test_sync_project_uses_api_for_project_index(tmp_path: Path) -> None:
-    runner = FakeRunner()
-    api_client = FakeApiIndexClient()
-    config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path)
-
-    sync_project(config, runner, progress=None, api_client=api_client)
-
-    assert api_client.calls == [
-        {
-            "jql": "project=SAT ORDER BY key",
-            "fields": ["issuetype", "key", "updated"],
-            "start": 0,
-            "limit": 100,
-        }
-    ]
-    assert not any(call[:3] == ["jira", "workitem", "search"] for call in runner.calls)
-
-
-def test_sync_project_falls_back_to_acli_index_when_api_index_fails(tmp_path: Path) -> None:
-    runner = FakeRunner()
-    progress: list[str] = []
-    config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path)
-
-    sync_project(config, runner, progress=progress.append, api_client=FailingApiIndexClient())
-
-    assert any(call[:3] == ["jira", "workitem", "search"] for call in runner.calls)
-    assert "API project index failed, falling back to acli: api unavailable" in progress
+    assert ("get_issue", "SAT-1", "*all") in client.calls
+    assert ("get_issue", "SAT-2", "*all") in client.calls
 
 
 def test_sync_project_preserves_shadow_when_refreshing_changed_issue(tmp_path: Path) -> None:
-    runner = FakeRunner()
+    client = FakeJiraClient()
     config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path)
-    sync_project(config, runner, progress=None)
+    sync_project(config, client, progress=None)
     issue_path = tmp_path / "components/api-team/SAT-1/issue.json"
     issue = read_json(issue_path)
     issue["fields"]["updated"] = "2026-07-19T00:00:01.000+0000"
@@ -272,17 +203,17 @@ def test_sync_project_preserves_shadow_when_refreshing_changed_issue(tmp_path: P
     }
     write_json(tmp_path / "components/api-team/SAT-1/shadow.json", shadow)
 
-    result = sync_project(config, runner, progress=None)
+    result = sync_project(config, client, progress=None)
 
     assert result.changed_count == 1
     assert read_json(tmp_path / "components/api-team/SAT-1/shadow.json") == shadow
 
 
 def test_build_manifest_reads_existing_issue_layout(tmp_path: Path) -> None:
-    runner = FakeRunner()
+    client = FakeJiraClient()
     sync_project(
         SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
-        runner,
+        client,
         progress=None,
     )
 

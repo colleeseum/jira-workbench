@@ -2,11 +2,11 @@
 
 Jira Workbench syncs a Jira project into a local JSON directory and serves a small local web UI for browsing and searching the synced work items.
 
-The first implementation is a Python refactor of the original `jira-sync` shell script. It still uses Atlassian CLI (`acli`) for Jira access, but the local data layout and manifest generation are now testable Python code.
+Jira Workbench talks to Jira exclusively through the REST API (via `atlassian-python-api`) — no external CLI dependency.
 
 ## Features
 
-- Incremental project sync using `acli jira workitem`
+- Incremental project sync using the Jira Cloud REST API
 - Local component-oriented storage under `jira/components/<component>/<key>/`
 - Per-work-item `issue.json`, `comments.json`, `attachments.json`, and `sync.json`
 - Local shadow edits for fields and comments before pushing to Jira
@@ -17,8 +17,7 @@ The first implementation is a Python refactor of the original `jira-sync` shell 
 ## Requirements
 
 - Python 3.11 or newer
-- `acli` authenticated against your Jira site
-- Jira API token credentials for project metadata admin commands
+- Jira API token credentials (a Jira Cloud API token plus your account email and site URL)
 
 ## Installation
 
@@ -39,7 +38,6 @@ Create `~/.jira-wb.conf`:
 ```toml
 project = "SAT"
 jira_dir = "jira"
-acli = "acli"
 jira_url = "https://example.atlassian.net"
 jira_email = "you@example.com"
 jira_api_token = "..."
@@ -68,7 +66,8 @@ jira-wb sync
 Or pass the sync values explicitly:
 
 ```bash
-jira-wb sync --project SAT --component-field customfield_10071 --jira-dir jira --acli acli
+jira-wb sync --project SAT --component-field customfield_10071 --jira-dir jira \
+  --jira-url https://example.atlassian.net --jira-email you@example.com --jira-api-token "..."
 ```
 
 Serve the local browser:
@@ -109,7 +108,7 @@ jira-wb meta version-delete "old-version" --move-fix-to "new-version"
 jira-wb meta component-add "helm-chart"
 ```
 
-Project fix versions are cached under `jira/meta/versions.json`. Project components are cached under `jira/meta/components.json`. `jira-wb sync` refreshes the version cache. `jira-wb meta` commands use the Jira API credentials, not `acli`; use `--cached` for offline inspection.
+Project fix versions are cached under `jira/meta/versions.json`. Project components are cached under `jira/meta/components.json`. `jira-wb sync` refreshes the version cache. `jira-wb meta` commands use the Jira API credentials; use `--cached` for offline inspection.
 
 `jira-wb meta version-add` and `jira-wb meta component-add` write directly to Jira through the Python API and then refresh the corresponding local cache. These project metadata operations do not use the issue shadow workflow.
 
@@ -185,7 +184,7 @@ jira-wb shadow push SAT-1
 
 Before pushing a work item, Jira Workbench fetches the remote `updated` value and compares it to the value captured when the first local shadow edit was created. If the work item changed remotely, that item is skipped and not pushed.
 
-Current push support is intentionally narrow because it uses verified `acli workitem edit` flags:
+Current push support is intentionally narrow to the Jira REST API fields Jira Workbench has verified update behavior for:
 
 - `description`
 - `summary`
