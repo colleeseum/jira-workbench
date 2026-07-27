@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,22 @@ class WorkbenchConfig:
     versions_filter: str | None = None
     host: str | None = None
     port: int | None = None
+
+
+def secure_config_permissions(path: Path) -> bool:
+    """Tighten an overly permissive config file to 0600 -- it may hold a Jira API token.
+
+    Returns True if permissions were changed, False if they were already
+    restrictive enough (or on non-POSIX platforms, where this is a no-op --
+    Windows doesn't use these permission bits).
+    """
+    if os.name != "posix":
+        return False
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        path.chmod(0o600)
+        return True
+    return False
 
 
 def load_config(path: Path) -> WorkbenchConfig:

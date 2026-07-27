@@ -101,14 +101,14 @@ class DetailScreen(Screen[None]):
         if shadow is not None and has_shadow_changes(shadow):
             header_lines.append("")
             header_lines.extend(shadow_change_summary(shadow, jira_dir, self.key))
-        self.query_one("#detail-header", Static).update("\n".join(header_lines))
+        self.query_one("#detail-header", Static).update(Text("\n".join(header_lines)))
 
         diff_widget = self.query_one("#detail-diff", Static)
         table = self.query_one(DataTable)
         if self.mode == "diff":
             table.display = False
             diff_widget.display = True
-            diff_widget.update(render_diff(jira_dir, self.key))
+            diff_widget.update(Text(render_diff(jira_dir, self.key)))
             return
         table.display = True
         diff_widget.display = False

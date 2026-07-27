@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
+
+import pytest
 
 import jira_workbench.cli
 from jira_workbench.cli import (
@@ -30,6 +34,20 @@ def test_cli_version(capsys) -> None:
         assert exc.code == 0
     captured = capsys.readouterr()
     assert "jira-wb 0.5.0" in captured.out
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file permission bits are POSIX-specific")
+def test_main_tightens_overly_permissive_config_file(tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text('project = "SAT"\n')
+    config_path.chmod(0o644)
+
+    code = main(["--config", str(config_path), "meta", "--jira-dir", str(tmp_path / "jira"), "doctor"])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert f"note: tightened permissions on {config_path} to 0600" in captured.err
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
 
 
 def test_shadow_without_subcommand_shows_help_without_requiring_config(tmp_path: Path, capsys) -> None:

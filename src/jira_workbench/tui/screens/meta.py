@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -86,7 +87,7 @@ class MetaScreen(Screen[None]):
             )
         except MetadataError as exc:
             text = f"error: {exc}"
-        output_widget.update(text)
+        output_widget.update(Text(text))
 
     @work
     async def action_add_selected(self) -> None:
@@ -131,7 +132,7 @@ class MetaScreen(Screen[None]):
                 )
         except MetadataError as exc:
             message = f"error: {exc}"
-        output_widget.update(message)
+        output_widget.update(Text(message))
 
     def action_close(self) -> None:
         if self.standalone:

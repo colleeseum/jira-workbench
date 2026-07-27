@@ -106,7 +106,7 @@ jira-wb meta version-release "helm-chart-sa 3.5.1" --release-date 2026-07-21
 jira-wb meta version-archive "helm-chart-sa 3.5.1"
 jira-wb meta version-delete "helm-chart-sa 3.5.1"
 jira-wb meta version-delete "old-version" --move-fix-to "new-version"
-jira-wb meta component-add "helm-chart"
+jira-wb meta native-component-add "helm-chart"
 ```
 
 Project fix versions are cached under `jira/meta/versions.json`. Project components are cached under `jira/meta/components.json`. `jira-wb sync` refreshes the version cache. `jira-wb meta` commands use the Jira API credentials; use `--cached` for offline inspection.
@@ -212,8 +212,7 @@ Other fields, such as `fix_version`, can be stored locally and diffed, but push 
 ## Development
 
 ```bash
-python -m pip install -e .
-python -m pip install pytest ruff build
+python -m pip install -e ".[test,lint]" build
 python -m compileall -q src
 ruff check .
 pytest

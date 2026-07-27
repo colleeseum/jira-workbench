@@ -380,7 +380,10 @@ def unsupported_fields(shadow: dict[str, Any]) -> list[str]:
 
 
 def remote_updated(client: JiraClient, key: str) -> str | None:
-    payload = client.get_issue(key, fields="updated")
+    try:
+        payload = client.get_issue(key, fields="updated")
+    except Exception as exc:
+        raise ShadowError(f"could not read remote updated value for {key}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ShadowError(f"could not read remote updated value for {key}")
     return updated_at(payload)
@@ -672,7 +675,10 @@ def push_key(
     if isinstance(fields, dict) and fields:
         status = fields.get("status")
         if status:
-            jira_client.issue_transition(key, str(status))
+            try:
+                jira_client.issue_transition(key, str(status))
+            except Exception as exc:
+                raise ShadowError(f"{key}: could not transition to status {status}: {exc}") from exc
             status_change = shadow.get("statusChange", {})
             resolution = status_change.get("resolution") if isinstance(status_change, dict) else None
             if resolution:
@@ -707,7 +713,10 @@ def push_key(
     if isinstance(comments, list):
         for comment in comments:
             if isinstance(comment, dict) and comment.get("state") != "pushed":
-                jira_client.issue_add_comment(key, str(comment.get("body", "")))
+                try:
+                    jira_client.issue_add_comment(key, str(comment.get("body", "")))
+                except Exception as exc:
+                    raise ShadowError(f"{key}: could not add comment: {exc}") from exc
 
     comment_edits = shadow.get("commentEdits", {})
     if isinstance(comment_edits, dict):

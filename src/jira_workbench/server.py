@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+ISSUE_KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 
 
 def load_json(path: Path) -> object:
@@ -71,6 +74,8 @@ def render_index(jira_dir: Path, query: str = "") -> str:
 
 
 def render_issue(jira_dir: Path, key: str) -> tuple[int, str]:
+    if not ISSUE_KEY_PATTERN.match(key):
+        return HTTPStatus.NOT_FOUND, page(f"<h1>{html.escape(key)}</h1><p>Issue not found.</p>")
     matches = list((jira_dir / "components").glob(f"*/{key}/issue.json"))
     if not matches:
         return HTTPStatus.NOT_FOUND, page(f"<h1>{html.escape(key)}</h1><p>Issue not found.</p>")
@@ -130,7 +135,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query).get("q", [""])[0]
             content = render_index(self.jira_dir, query)
         elif parsed.path == "/api/manifest":
-            self.send_json(load_json(self.jira_dir / "manifest.json"))
+            try:
+                manifest = load_json(self.jira_dir / "manifest.json")
+            except FileNotFoundError:
+                self.send_json({"error": "no manifest found; run jira-wb sync"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self.send_json(manifest)
             return
         elif parsed.path.startswith("/issue/"):
             key = unquote(parsed.path.removeprefix("/issue/"))
@@ -146,9 +156,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def send_json(self, value: object) -> None:
+    def send_json(self, value: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        self.send_response(HTTPStatus.OK)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()

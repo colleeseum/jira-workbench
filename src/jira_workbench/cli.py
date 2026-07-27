@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, ConfigError, choose, load_config
+from .config import DEFAULT_CONFIG_PATH, ConfigError, choose, load_config, secure_config_permissions
 from .metadata import (
     DEFAULT_METADATA_TTL_SECONDS,
     JiraApiConfig,
@@ -343,6 +343,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     config_path = Path(args.config) if args.config is not None else DEFAULT_CONFIG_PATH
+    expanded_config_path = config_path.expanduser()
+    if expanded_config_path.exists() and secure_config_permissions(expanded_config_path):
+        print(
+            f"note: tightened permissions on {expanded_config_path} to 0600 (it may contain a Jira API token)",
+            file=sys.stderr,
+        )
     try:
         config = load_config(config_path)
     except ConfigError as exc:

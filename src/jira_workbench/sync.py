@@ -44,6 +44,8 @@ class SyncError(RuntimeError):
     pass
 
 
+ISSUE_KEY_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*-\d+")
+
 Progress = Callable[[str], None]
 
 
@@ -128,7 +130,9 @@ def component_slug(issue: dict[str, Any], field_name: str) -> str:
     if not value:
         value = "_unassigned"
     slug = re.sub(r"[^a-z0-9._-]", "-", str(value).lower())
-    return slug or "_unassigned"
+    if not slug or set(slug) <= {"."}:
+        return "_unassigned"
+    return slug
 
 
 def field_value_name(value: Any) -> str:
@@ -291,7 +295,7 @@ def sync_project(
     total = len(work_items)
     for index, work_item in enumerate(work_items, start=1):
         key = work_item.get("key")
-        if not isinstance(key, str) or not key:
+        if not isinstance(key, str) or not ISSUE_KEY_PATTERN.fullmatch(key):
             continue
 
         if progress:
