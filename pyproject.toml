@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jira-workbench"
-version = "0.2.0"
+version = "0.5.0"
 description = "Local-first Jira sync, search, and browsing workbench"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,12 @@ classifiers = [
 ]
 dependencies = [
   "atlassian-python-api>=4.0.0",
+  "textual>=8.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest-asyncio>=1.0.0",
 ]
 
 [project.urls]
@@ -38,6 +44,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

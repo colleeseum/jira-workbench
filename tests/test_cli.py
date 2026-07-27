@@ -11,7 +11,6 @@ from jira_workbench.cli import (
     meta_versions_output,
     sync_progress_printer,
     version_identifier,
-    version_row,
 )
 from jira_workbench.config import load_config
 from jira_workbench.shadow import load_shadow
@@ -30,7 +29,7 @@ def test_cli_version(capsys) -> None:
     except SystemExit as exc:
         assert exc.code == 0
     captured = capsys.readouterr()
-    assert "jira-wb 0.2.0" in captured.out
+    assert "jira-wb 0.5.0" in captured.out
 
 
 def test_shadow_without_subcommand_shows_help_without_requiring_config(tmp_path: Path, capsys) -> None:
@@ -315,16 +314,17 @@ def test_view_reads_default_component_and_filter_from_config(tmp_path: Path, mon
                 'component = "helm-chart"',
                 'filter = "prometheus"',
                 'swimlane = "epic"',
+                "preview_lines = 20",
             ]
         )
         + "\n"
     )
     calls = []
 
-    def fake_interactive_view(*args, **kwargs) -> None:
+    def fake_open_interactive_view(*args, **kwargs) -> None:
         calls.append((args, kwargs))
 
-    monkeypatch.setattr(jira_workbench.cli, "interactive_view", fake_interactive_view)
+    monkeypatch.setattr(jira_workbench.cli, "open_interactive_view", fake_open_interactive_view)
 
     code = main(["--config", str(config_path), "view"])
 
@@ -334,6 +334,7 @@ def test_view_reads_default_component_and_filter_from_config(tmp_path: Path, mon
     assert calls[0][1]["component"] == "helm-chart"
     assert calls[0][1]["pattern"] == "prometheus"
     assert calls[0][1]["swimlane"] == "epic"
+    assert calls[0][1]["preview_lines"] == 20
 
 
 def test_view_flags_override_config_defaults(tmp_path: Path, monkeypatch) -> None:
@@ -353,10 +354,10 @@ def test_view_flags_override_config_defaults(tmp_path: Path, monkeypatch) -> Non
     )
     calls = []
 
-    def fake_interactive_view(*args, **kwargs) -> None:
+    def fake_open_interactive_view(*args, **kwargs) -> None:
         calls.append((args, kwargs))
 
-    monkeypatch.setattr(jira_workbench.cli, "interactive_view", fake_interactive_view)
+    monkeypatch.setattr(jira_workbench.cli, "open_interactive_view", fake_open_interactive_view)
 
     code = main(
         [
@@ -769,14 +770,10 @@ def test_meta_components_output_uses_component_field_options_when_configured(tmp
     assert "total" in output
 
 
-def test_version_list_helpers_prefer_id_and_show_state() -> None:
+def test_version_identifier_prefers_id() -> None:
     version = {"id": "10000", "name": "helm-chart-sa 3.5.0", "released": True, "archived": True}
 
     assert version_identifier(version) == "10000"
-    row = version_row(version)
-    assert "helm-chart-sa 3.5.0" in row
-    assert "released" in row
-    assert "archived" in row
 
 
 def test_meta_doctor_reports_missing_config(tmp_path: Path, capsys) -> None:
@@ -840,3 +837,4 @@ def test_meta_ctrl_c_exits_without_traceback(tmp_path: Path, monkeypatch, capsys
     captured = capsys.readouterr()
     assert code == 130
     assert "Traceback" not in captured.err
+

@@ -1,26 +1,16 @@
 from __future__ import annotations
 
-import curses
-import curses.textpad
 import copy
+import difflib
 import json
 import re
 import textwrap
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 
-from .metadata import JiraApiConfig, MetadataError, jira_api_client, load_versions, version_name
-from .shadow import (
-    ShadowError,
-    add_comment,
-    delete_shadow,
-    load_shadow,
-    push_key,
-    push_shadows,
-    render_diff,
-    set_field,
-    set_status_change,
-)
+from .metadata import load_versions, version_name
+from .shadow import load_shadow, render_diff
 from .sync import find_existing_issue, issue_key_sort_key, issue_path_sort_key, read_json
 
 
@@ -30,23 +20,9 @@ class ViewError(RuntimeError):
 
 DONE_STATUSES = {"close", "closed", "done", "resolved"}
 DEFAULT_RESOLUTIONS = ["Done", "Won't Do", "Duplicate", "Cannot Reproduce"]
-INDEX_KEY_WIDTH = 9
-INDEX_STATE_WIDTH = 12
-INDEX_COMPONENT_WIDTH = 14
-INDEX_PARENT_WIDTH = 12
 VIRTUAL_NONE = "(none)"
+FILTER_ANY = "(any)"  # UI-only "no filter on this dimension" sentinel; never stored
 SWIMLANE_MODES = ("none", "epic", "version", "component")
-DESCRIPTION_PREVIEW_LINES = 8
-COMMENTS_PREVIEW_LINES = 6
-INLINE_REPORT_FIELDS = {
-    "assignee",
-    "fixVersions",
-    "parent",
-    "priority",
-    "resolution",
-    "status",
-    "type",
-}
 REPORT_FIELD_LABELS = {
     "assignee": "assignee",
     "fixVersions": "version",
@@ -56,11 +32,7 @@ REPORT_FIELD_LABELS = {
     "status": "status",
     "type": "type",
 }
-CTRL_P = 16
-CTRL_V = 22
-IGNORED_CONTROL_KEYS = {CTRL_P, CTRL_V}
-DetailSegment = tuple[str, int]
-DetailLine = list[DetailSegment]
+
 
 BASE_EDITABLE_FIELDS = [
     ("Summary", "summary"),
@@ -75,72 +47,27 @@ BASE_EDITABLE_FIELDS = [
     ("Parent", "parent"),
 ]
 
-HELP_LINES = [
-    "Jira Workbench Help",
-    "",
-    "Index",
-    "  j/k, arrows     Move selection",
-    "  Enter           Open selected work item",
-    "  v               View a work item by key",
-    "  V               Open selected item's parent",
-    "  g               Go to matching row",
-    "  /               Search rows",
-    "  n / N           Repeat search forward/backward",
-    "  a               Toggle active-only filter",
-    "  [ and ]         Cycle component filter",
-    "  c               Type component filter",
-    "  C               Clear component filter",
-    "  f               Type text filter",
-    "  F               Select fixVersion filter",
-    "  < and >         Cycle fixVersion filter",
-    "  x               Clear fixVersion filter",
-    "  S               Cycle swimlane grouping",
-    "  R               Reload local list",
-    "  \\               Clear text filter",
-    "  m               Toggle modified-only filter",
-    "  s               Toggle item second row",
-    "  w               Toggle summary wrapping",
-    "  P               Push all local shadow changes",
-    "  h               Show or hide this help",
-    "  q or Esc        Quit",
-    "",
-    "Issue",
-    "  Tab / Shift-Tab Cycle editable fields",
-    "  s               Show local shadow view",
-    "  o               Show original synced Jira issue",
-    "  d               Show local shadow diff",
-    "  e               Edit a field into local shadow",
-    "  Enter           Edit highlighted field",
-    "  c               Add a local shadow comment",
-    "  r               Revert this item's local shadow",
-    "  p               Push this item's shadow to Jira",
-    "  O               Toggle Other fields",
-    "  x               Expand or collapse selected text block",
-    "  j/k, arrows     Scroll",
-    "  Space           Page down",
-    "  b               Page up",
-    "  h               Show or hide this help",
-    "  v               View a work item by key",
-    "  V               Open this item's parent",
-    "  Esc             Back to index",
-    "  q               Quit",
-    "",
-    "Filters",
-    "  Active hides statuses: Close, Closed, Done, Resolved",
-    "  --components lists component names before entering curses",
-    "  --component starts with a component filter",
-    "  --all starts with inactive items included",
-]
-
 
 def is_active_item(item: dict[str, Any]) -> bool:
     return display_name(item.get("status")).strip().lower() not in DONE_STATUSES
 
 
-def matches_component(item: dict[str, Any], component: str | None) -> bool:
-    if not component:
+def field_value(item: dict[str, Any], field: str) -> str:
+    """Generic display-value extraction for an equality-filterable field.
+
+    Works for "component", "fixVersion", "assignee", and any future field
+    whose name matches an item dict key -- no per-field special-casing.
+    """
+    return display_name(item.get(field)).strip()
+
+
+def matches_field(item: dict[str, Any], field: str, value: str | None) -> bool:
+    if not value:
         return True
-    return display_name(item.get("component")).strip().lower() == component.strip().lower()
+    actual = field_value(item, field)
+    if value == VIRTUAL_NONE:
+        return not actual
+    return actual.lower() == value.strip().lower()
 
 
 def matches_filter(item: dict[str, Any], pattern: str | None) -> bool:
@@ -155,35 +82,30 @@ def matches_filter(item: dict[str, Any], pattern: str | None) -> bool:
 
 
 def item_fix_version(item: dict[str, Any]) -> str:
-    return display_name(item.get("fixVersion")).strip()
-
-
-def matches_fix_version(item: dict[str, Any], fix_version: str | None) -> bool:
-    if not fix_version:
-        return True
-    value = item_fix_version(item)
-    if fix_version == "(none)":
-        return not value
-    return value.lower() == fix_version.strip().lower()
+    return field_value(item, "fixVersion")
 
 
 def filter_items(
     items: list[dict[str, Any]],
     *,
-    component: str | None = None,
+    field_filters: dict[str, str] | None = None,
     pattern: str | None = None,
     active: bool = True,
     modified_keys: set[str] | None = None,
     modified_only: bool = False,
-    fix_version: str | None = None,
 ) -> list[dict[str, Any]]:
+    field_filters = field_filters or {}
     modified_keys = modified_keys or set()
+    # Modified combines with the other filters like any of them: picking a
+    # specific component while Modified is on narrows to that component's
+    # modified items; leaving component at "(any)" (an empty field_filters
+    # entry) shows every modified item, since matches_field is a no-op for
+    # an unset filter.
     return [
         item
         for item in items
-        if matches_component(item, component)
+        if all(matches_field(item, field, value) for field, value in field_filters.items())
         and matches_filter(item, pattern)
-        and matches_fix_version(item, fix_version)
         and (not active or is_active_item(item))
         and (not modified_only or display_name(item.get("key")) in modified_keys)
     ]
@@ -221,12 +143,21 @@ def find_next_item_index(
     return None
 
 
-def component_counts(items: list[dict[str, Any]]) -> list[tuple[str, int]]:
+def distinct_field_values(
+    items: list[dict[str, Any]], field: str, *, empty_bucket: str = VIRTUAL_NONE
+) -> list[tuple[str, int]]:
     counts: dict[str, int] = {}
     for item in items:
-        component = display_name(item.get("component")) or "_unassigned"
-        counts[component] = counts.get(component, 0) + 1
+        value = field_value(item, field) or empty_bucket
+        counts[value] = counts.get(value, 0) + 1
     return sorted(counts.items(), key=lambda row: row[0].lower())
+
+
+def component_counts(items: list[dict[str, Any]]) -> list[tuple[str, int]]:
+    # "_unassigned" is a real directory/component name from sync (see
+    # sync.py), not just a display artifact -- preserved as the default
+    # empty-bucket label here instead of the generic VIRTUAL_NONE.
+    return distinct_field_values(items, "component", empty_bucket="_unassigned")
 
 
 def format_components(jira_dir: Path) -> str:
@@ -297,29 +228,115 @@ def swimlane_label(item: dict[str, Any], swimlane: str | None) -> str | None:
     return None
 
 
-def swimlane_sort_key(item: dict[str, Any], swimlane: str | None) -> tuple[Any, ...]:
+PRIORITY_RANK: dict[str, int] = {"highest": 0, "high": 1, "medium": 2, "low": 3, "lowest": 4}
+
+# Column header -> item dict field, for click-to-sort in the index table.
+SORT_FIELDS: dict[str, str] = {
+    "Key": "key",
+    "State": "status",
+    "Component": "component",
+    "Summary": "summary",
+    "Priority": "priority",
+    "Assignee": "assignee",
+    "Version": "fixVersion",
+}
+
+
+class _ReverseSortValue:
+    """Wraps a sort key to invert its ordering within an otherwise-ascending tuple."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __lt__(self, other: "_ReverseSortValue") -> bool:
+        return other.value < self.value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ReverseSortValue) and self.value == other.value
+
+
+def sort_field_value(item: dict[str, Any], field: str) -> Any:
+    if field == "key":
+        return issue_key_sort_key(display_name(item.get("key")))
+    if field == "priority":
+        name = display_name(item.get("priority")).strip().lower()
+        return PRIORITY_RANK.get(name, len(PRIORITY_RANK))
+    return field_value(item, field).lower()
+
+
+def swimlane_sort_key(
+    item: dict[str, Any], swimlane: str | None, *, sort_field: str | None = None, reverse: bool = False
+) -> tuple[Any, ...]:
     mode = normalize_swimlane(swimlane)
     lane = swimlane_label(item, mode) or ""
     none_rank = 0 if lane == VIRTUAL_NONE else 1
+    sort_tail: tuple[Any, ...] = ()
+    if sort_field is not None:
+        value = sort_field_value(item, sort_field)
+        sort_tail = (_ReverseSortValue(value) if reverse else value,)
     if mode == "epic" and lane != VIRTUAL_NONE:
         lane_key = display_name(item.get("key") if is_epic_item(item) else item.get("epic"))
         item_rank = 0 if is_epic_item(item) else 1
-        return (none_rank, issue_key_sort_key(lane_key), item_rank, issue_key_sort_key(display_name(item.get("key"))))
-    return (none_rank, lane.lower(), issue_key_sort_key(display_name(item.get("key"))))
+        return (
+            none_rank,
+            issue_key_sort_key(lane_key),
+            item_rank,
+            *sort_tail,
+            issue_key_sort_key(display_name(item.get("key"))),
+        )
+    return (none_rank, lane.lower(), *sort_tail, issue_key_sort_key(display_name(item.get("key"))))
 
 
 def is_epic_item(item: dict[str, Any]) -> bool:
     return display_name(item.get("type")).strip().lower() == "epic"
 
 
+TYPE_ICONS: dict[str, tuple[str, str]] = {
+    "epic": ("◆", "purple"),  # diamond
+    "story": ("●", "green"),  # circle
+    "task": ("■", "blue"),  # square
+    "bug": ("▲", "red"),  # triangle
+    "sub-task": ("▪", "cyan"),  # small square
+    "subtask": ("▪", "cyan"),
+}
+DEFAULT_TYPE_ICON: tuple[str, str] = ("○", "dim")  # white circle
+
+
+def type_icon(type_name: Any) -> tuple[str, str]:
+    """Glyph + Rich color for an issue type, echoing Jira's web icon colors.
+
+    Plain geometric shapes rather than emoji, so it stays single-width and
+    renders consistently across terminals/fonts.
+    """
+    return TYPE_ICONS.get(display_name(type_name).strip().lower(), DEFAULT_TYPE_ICON)
+
+
+PRIORITY_COLORS: dict[str, str] = {
+    "highest": "red",
+    "high": "yellow",
+    "low": "cyan",
+    "lowest": "green",
+}
+
+
+def priority_color(priority_name: Any) -> str | None:
+    """Color for priority, red (highest) to green (lowest); Medium stays
+    plain since it's the baseline, not worth calling out."""
+    return PRIORITY_COLORS.get(display_name(priority_name).strip().lower())
+
+
 def filter_items_for_swimlane(items: list[dict[str, Any]], swimlane: str | None) -> list[dict[str, Any]]:
     return items
 
 
-def sort_items_for_swimlane(items: list[dict[str, Any]], swimlane: str | None) -> list[dict[str, Any]]:
-    if normalize_swimlane(swimlane) == "none":
+def sort_items_for_swimlane(
+    items: list[dict[str, Any]], swimlane: str | None, *, sort_field: str | None = None, reverse: bool = False
+) -> list[dict[str, Any]]:
+    if normalize_swimlane(swimlane) == "none" and sort_field is None:
         return items
-    return sorted(items, key=lambda item: swimlane_sort_key(item, swimlane))
+    return sorted(items, key=lambda item: swimlane_sort_key(item, swimlane, sort_field=sort_field, reverse=reverse))
 
 
 def item_index_by_key(items: list[dict[str, Any]], key: str | None) -> int | None:
@@ -340,11 +357,31 @@ def as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+SMART_LINK_RE = re.compile(r"\[(?:([^|\[\]]*)\|)?([^|\[\]]+)\|smart-link\]")
+
+
+def simplify_smart_links(text: str) -> str:
+    """Collapse Jira's `[label|url|smart-link]` wiki markup down to plain text.
+
+    Jira's REST API renders inline "smart chip" links as this raw wiki
+    markup rather than resolving them, and label/url are usually identical
+    -- shown as-is that's `[https://...|https://...|smart-link]` twice over.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        label, url = match.group(1), match.group(2)
+        if label and label != url:
+            return f"{label} ({url})"
+        return url
+
+    return SMART_LINK_RE.sub(replace, text)
+
+
 def text_from_adf(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value
+        return simplify_smart_links(value)
     if isinstance(value, list):
         return "\n".join(part for item in value if (part := text_from_adf(item)))
     if not isinstance(value, dict):
@@ -839,7 +876,67 @@ def comment_body_text(comment: dict[str, Any]) -> str:
     body = comment.get("body")
     if isinstance(body, dict):
         return text_from_adf(body)
-    return display_name(body)
+    return simplify_smart_links(display_name(body))
+
+
+def list_comments(jira_dir: Path, key: str, shadow: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """One row per comment (not a single blob), each tagged with its local shadow state.
+
+    Row "state" is one of: synced, edited, pending-delete, local-new. "id" is
+    the remote comment id for synced/edited/pending-delete rows, or the
+    "local-<uuid>" id assigned by add_comment for local-new rows -- callers
+    use it to address a specific comment for edit_comment/delete_comment.
+    """
+    edits = as_dict(shadow.get("commentEdits")) if shadow is not None else {}
+    deletes = {str(value) for value in as_list(shadow.get("commentDeletes"))} if shadow is not None else set()
+    local_new = as_list(shadow.get("comments")) if shadow is not None else []
+
+    comments_path = issue_dir_path(jira_dir, key) / "comments.json"
+    remote_raw: list[Any] = []
+    if comments_path.exists():
+        payload = read_json(comments_path)
+        remote_raw = as_list(as_dict(payload).get("comments")) if isinstance(payload, dict) else as_list(payload)
+
+    rows: list[dict[str, str]] = []
+    for comment in remote_raw:
+        if not isinstance(comment, dict):
+            continue
+        comment_id = str(comment.get("id") or "")
+        original_body = comment_body_text(comment).strip()
+        if comment_id in deletes:
+            state = "pending-delete"
+            body = original_body
+        elif comment_id in edits:
+            state = "edited"
+            body = str(edits[comment_id])
+        else:
+            state = "synced"
+            body = original_body
+        rows.append(
+            {
+                "id": comment_id,
+                "author": display_name(as_dict(comment.get("author")).get("displayName")),
+                "created": display_name(comment.get("created")),
+                "body": body,
+                "state": state,
+            }
+        )
+
+    for comment in local_new:
+        if not isinstance(comment, dict):
+            continue
+        rows.append(
+            {
+                "id": display_name(comment.get("id")),
+                "author": "(you, unpushed)",
+                "created": display_name(comment.get("createdAt")),
+                "body": display_name(comment.get("body")),
+                "state": "local-new",
+            }
+        )
+
+    rows.sort(key=lambda row: row["created"], reverse=True)
+    return rows
 
 
 def other_field_rows(issue: dict[str, Any], component_field: str | None) -> list[tuple[str, str]]:
@@ -935,6 +1032,123 @@ def format_issue(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def effective_comments_text(jira_dir: Path, key: str, shadow: dict[str, Any] | None) -> str:
+    """Comments as they'll read once pushed: edits applied, deletions removed,
+    new ones included -- unlike comments_text() (kept as-is for the CLI's
+    existing plain-text report), which only ever prepends new local
+    comments and never reflects an edit or delete of an existing one.
+    """
+    rows = list_comments(jira_dir, key, shadow=shadow)
+    parts: list[tuple[str, str]] = []
+    for row in rows:
+        if row["state"] == "pending-delete":
+            continue
+        prefix = " ".join(part for part in (row["created"], row["author"]) if part)
+        text = f"{prefix}: {row['body']}" if prefix else row["body"]
+        if row["state"] == "local-new":
+            text = f"[local new] {text}"
+        elif row["state"] == "edited":
+            text = f"[local edited] {text}"
+        parts.append((row["created"], text))
+    parts.sort(key=lambda part: part[0], reverse=True)
+    return "\n\n".join(text for _, text in parts)
+
+
+def diffable_issue_text(
+    issue: dict[str, Any],
+    jira_dir: Path,
+    key: str,
+    component_field: str | None,
+    shadow: dict[str, Any] | None,
+) -> str:
+    """Renders one side (before or after) of a full item diff: fields,
+    description, and comments -- pass shadow=None for the original/remote
+    side, or the loaded shadow for the effective/local side.
+    """
+    effective = apply_shadow(issue, shadow) if shadow is not None else issue
+    fields = as_dict(effective.get("fields"))
+    summary = display_name(fields.get("summary"))
+    description = text_from_adf(fields.get("description")).strip()
+
+    lines = [f"{key}  {summary}".rstrip(), ""]
+    lines.extend(field_section(fields, component_field))
+    lines.append("")
+    lines.append("Description")
+    lines.append("-----------")
+    lines.append(description or "(empty)")
+
+    comments = comments_text(jira_dir, key, None) if shadow is None else effective_comments_text(jira_dir, key, shadow)
+    if comments:
+        lines.append("")
+        lines.append("Comments")
+        lines.append("--------")
+        lines.append(comments)
+    return "\n".join(lines)
+
+
+def full_diff_texts(jira_dir: Path, key: str, component_field: str | None = None) -> tuple[str, str]:
+    """Full before/after text for a single item's local shadow changes, for
+    a vimdiff-style side-by-side comparison. Includes fields, description,
+    and comments (correctly reflecting comment edits/deletes, unlike the
+    plain-text comments_text()-based CLI report).
+    """
+    issue = load_issue(jira_dir, key)
+    shadow = load_shadow(jira_dir, key)
+    before = diffable_issue_text(issue, jira_dir, key, component_field, None)
+    after = diffable_issue_text(issue, jira_dir, key, component_field, shadow)
+    return before, after
+
+
+def wrap_preview_lines(value: str, width: int) -> list[str]:
+    """Split into display lines, word-wrapping any paragraph longer than `width`.
+
+    A single-paragraph description has no "\\n" at all, so splitting on
+    newlines alone always yields one giant line -- capping line *count*
+    then does nothing to show more of it. Wrapping each paragraph to
+    `width` first is what actually lets a taller preview show more text.
+
+    break_long_words/break_on_hyphens are off so a URL (or any other single
+    long token) stays intact on one line instead of getting chopped -- or
+    split at a hyphen -- mid-word.
+    """
+    if not value:
+        return [""]
+    lines: list[str] = []
+    for paragraph in value.splitlines():
+        if not paragraph:
+            lines.append("")
+            continue
+        wrapped = textwrap.wrap(paragraph, width=width, break_long_words=False, break_on_hyphens=False)
+        lines.extend(wrapped or [""])
+    return lines or [""]
+
+
+def side_by_side_diff_lines(before_text: str, after_text: str) -> list[tuple[str, str, str]]:
+    """Vimdiff-style line-aligned diff: one (tag, left_line, right_line) per
+    row, where tag is "equal"/"changed"/"removed"/"added" -- removed-only
+    lines leave the right side blank, added-only lines leave the left side
+    blank, so the two columns stay vertically aligned line-for-line.
+    """
+    before_lines = before_text.splitlines()
+    after_lines = after_text.splitlines()
+    matcher = difflib.SequenceMatcher(None, before_lines, after_lines, autojunk=False)
+    rows: list[tuple[str, str, str]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for before_line, after_line in zip(before_lines[i1:i2], after_lines[j1:j2]):
+                rows.append(("equal", before_line, after_line))
+        elif tag == "replace":
+            left = before_lines[i1:i2]
+            right = after_lines[j1:j2]
+            for before_line, after_line in zip_longest(left, right, fillvalue=""):
+                rows.append(("changed", before_line, after_line))
+        elif tag == "delete":
+            rows.extend(("removed", before_line, "") for before_line in before_lines[i1:i2])
+        elif tag == "insert":
+            rows.extend(("added", "", after_line) for after_line in after_lines[j1:j2])
+    return rows
+
+
 def apply_shadow(issue: dict[str, Any], shadow: dict[str, Any]) -> dict[str, Any]:
     effective = copy.deepcopy(issue)
     fields = effective.setdefault("fields", {})
@@ -962,15 +1176,23 @@ def has_shadow_changes(shadow: dict[str, Any] | None) -> bool:
         return False
     fields = as_dict(shadow.get("fields"))
     comments = as_list(shadow.get("comments"))
+    comment_edits = as_dict(shadow.get("commentEdits"))
+    comment_deletes = as_list(shadow.get("commentDeletes"))
     status_change = as_dict(shadow.get("statusChange"))
-    return bool(fields or comments or status_change)
+    return bool(fields or comments or comment_edits or comment_deletes or status_change)
 
 
 def format_shadow_summary(shadow: dict[str, Any]) -> list[str]:
     fields = shadow.get("fields", {})
     comments = shadow.get("comments", [])
+    comment_edits = shadow.get("commentEdits", {})
+    comment_deletes = shadow.get("commentDeletes", [])
     field_count = len(fields) if isinstance(fields, dict) else 0
-    comment_count = len(comments) if isinstance(comments, list) else 0
+    comment_count = (
+        (len(comments) if isinstance(comments, list) else 0)
+        + (len(comment_edits) if isinstance(comment_edits, dict) else 0)
+        + (len(comment_deletes) if isinstance(comment_deletes, list) else 0)
+    )
     lines = [
         "Local shadow",
         "------------",
@@ -984,6 +1206,50 @@ def format_shadow_summary(shadow: dict[str, Any]) -> list[str]:
     if resolution:
         lines.append(f"Resolution: {resolution}")
     return lines
+
+
+def shadow_change_summary(shadow: dict[str, Any], jira_dir: Path, key: str) -> list[str]:
+    """Compact, accurate "what's pending" line for the TUI detail header.
+
+    Unlike format_shadow_summary (kept as-is for the plain-text CLI report),
+    this names the changed fields and breaks comments down by what actually
+    happened to each one, since a bare count can't tell an added comment
+    from an edited or deleted one -- and skips the shadow "state" marker,
+    which only means something after the CLI-only `shadow commit` step that
+    the TUI never uses.
+    """
+    parts: list[str] = []
+
+    fields = as_dict(shadow.get("fields"))
+    if fields:
+        names = ", ".join(sorted(fields))
+        parts.append(f"{len(fields)} field{'s' if len(fields) != 1 else ''} ({names})")
+
+    rows = list_comments(jira_dir, key, shadow=shadow)
+    counts = {"local-new": 0, "edited": 0, "pending-delete": 0}
+    for row in rows:
+        if row["state"] in counts:
+            counts[row["state"]] += 1
+    for state, label in (("local-new", "added"), ("edited", "edited"), ("pending-delete", "deleted")):
+        count = counts[state]
+        if count:
+            parts.append(f"{count} comment{'s' if count != 1 else ''} {label}")
+
+    status_change = as_dict(shadow.get("statusChange"))
+    resolution = display_name(status_change.get("resolution"))
+    if resolution:
+        parts.append(f"resolution: {resolution}")
+
+    state = display_name(shadow.get("state"))
+    if state and state != "working":
+        parts.append(f"shadow state: {state}")
+
+    if not parts:
+        return []
+    return [
+        f"Local changes: {'; '.join(parts)}",
+        f"Base updated: {display_name(shadow.get('baseUpdated')) or '(unknown)'}",
+    ]
 
 
 def format_work_item(
@@ -1014,1331 +1280,9 @@ def modified_issue_keys(jira_dir: Path) -> set[str]:
     return {path.parent.name for path in components_dir.glob("*/*/shadow.json")}
 
 
-def item_label(item: dict[str, Any]) -> str:
-    return index_row_lines(item, width=120, wrap=False)[0]
-
-
-def truncate_cell(value: str, width: int) -> str:
-    if len(value) <= width:
-        return value
-    if width <= 1:
-        return value[:width]
-    return value[: width - 1] + ">"
-
-
-def index_prefix(
-    item: dict[str, Any],
-    modified_keys: set[str] | None = None,
-    *,
-    swimlane: str | None = None,
-) -> str:
-    modified_keys = modified_keys or set()
-    key_value = display_name(item.get("key"))
-    key = truncate_cell(f"{key_value}*" if key_value in modified_keys else key_value, INDEX_KEY_WIDTH)
-    state = truncate_cell(display_name(item.get("status")), INDEX_STATE_WIDTH)
-    component_value = "" if normalize_swimlane(swimlane) == "component" else display_name(item.get("component"))
-    component = truncate_cell(component_value, INDEX_COMPONENT_WIDTH)
-    return (
-        f"{key:<{INDEX_KEY_WIDTH}}  "
-        f"{state:<{INDEX_STATE_WIDTH}}  "
-        f"{component:<{INDEX_COMPONENT_WIDTH}}  "
-    )
-
-
-def index_header(width: int = 120, swimlane: str | None = None, show_second_row: bool = True) -> str:
-    mode = normalize_swimlane(swimlane)
-    assignee_width, version_width = metadata_flex_widths(width)
-    component_label = "" if mode == "component" else "Component"
-    parent_label = "" if mode == "epic" else "Parent"
-    version_label = "" if mode == "version" else "Version"
-    line1 = (
-        f"{'ID':<{INDEX_KEY_WIDTH}}  "
-        f"{'State':<{INDEX_STATE_WIDTH}}  "
-        f"{component_label:<{INDEX_COMPONENT_WIDTH}}  "
-        "Summary"
-    )
-    if not show_second_row:
-        return line1
-    line2 = (
-        f"{parent_label:<{INDEX_PARENT_WIDTH}}  "
-        f"{'Priority':<{INDEX_STATE_WIDTH}}  "
-        f"{'Assignee':<{assignee_width}}  "
-        f"{version_label:<{version_width}}"
-    )
-    return f"{line1}\n{line2}"
-
-
-def index_row_lines(
-    item: dict[str, Any],
-    *,
-    width: int,
-    wrap: bool,
-    modified_keys: set[str] | None = None,
-    swimlane: str | None = None,
-    show_second_row: bool = True,
-) -> list[str]:
-    prefix = index_prefix(item, modified_keys, swimlane=swimlane)
-    summary_width = max(1, width - len(prefix))
-    summary = display_name(item.get("summary"))
-    metadata_line = index_metadata_line(item, width=width, swimlane=swimlane)
-    if not wrap:
-        lines = [prefix + truncate_cell(summary, summary_width)]
-        if show_second_row:
-            lines.append(metadata_line)
-        return lines
-    wrapped = textwrap.wrap(summary, width=summary_width, replace_whitespace=False) or [""]
-    lines = [prefix + wrapped[0], *(f"{'':<{len(prefix)}}{line}" for line in wrapped[1:])]
-    if show_second_row:
-        lines.append(metadata_line)
-    return lines
-
-
-def index_metadata_line(item: dict[str, Any], *, width: int, swimlane: str | None = None) -> str:
-    mode = normalize_swimlane(swimlane)
-    parent_key = "" if mode == "epic" else display_name(item.get("epic"))
-    parent = truncate_cell(f"-> {parent_key}" if parent_key else "", INDEX_PARENT_WIDTH)
-    priority = truncate_cell(display_name(item.get("priority")), INDEX_STATE_WIDTH)
-    assignee_width, version_width = metadata_flex_widths(width)
-    assignee = truncate_cell(display_name(item.get("assignee")), assignee_width)
-    version_value = "" if mode == "version" else display_name(item.get("fixVersion"))
-    version = truncate_cell(version_value, version_width)
-    prefix = (
-        f"{parent:<{INDEX_PARENT_WIDTH}}  "
-        f"{priority:<{INDEX_STATE_WIDTH}}  "
-        f"{assignee:<{assignee_width}}  "
-    )
-    return prefix + version
-
-
-def metadata_flex_widths(width: int) -> tuple[int, int]:
-    fixed = INDEX_PARENT_WIDTH + 2 + INDEX_STATE_WIDTH + 2
-    remaining = max(2, width - fixed)
-    assignee_width = max(1, remaining // 2)
-    version_width = max(1, remaining - assignee_width - 2)
-    return assignee_width, version_width
-
-
-def wrap_lines(lines: list[str], width: int) -> list[str]:
-    if width <= 0:
-        return lines
-    wrapped: list[str] = []
-    for line in lines:
-        if not line:
-            wrapped.append("")
-        else:
-            wrapped.extend(textwrap.wrap(line, width=width, replace_whitespace=False) or [""])
-    return wrapped
-
-
-def wrap_push_lines(lines: list[str], width: int) -> list[str]:
-    if width <= 0:
-        return lines
-    wrapped: list[str] = []
-    for line in lines:
-        if not line:
-            wrapped.append("")
-            continue
-        chunks = textwrap.wrap(
-            line,
-            width=width,
-            subsequent_indent="  ",
-            replace_whitespace=False,
-        )
-        wrapped.extend(chunks or [""])
-    return wrapped
-
-
-def is_push_all_key(key: int) -> bool:
-    return key == ord("P")
-
-
-def is_open_parent_key(key: int) -> bool:
-    return key == ord("V")
-
-
-def interactive_view(
-    jira_dir: Path,
-    *,
-    component_field: str | None = None,
-    component: str | None = None,
-    pattern: str | None = None,
-    active: bool = True,
-    jira_url: str | None = None,
-    jira_email: str | None = None,
-    jira_api_token: str | None = None,
-    initial_key: str | None = None,
-    initial_mode: str = "shadow",
-    swimlane: str | None = None,
-) -> None:
-    items = load_manifest_items(jira_dir, component_field)
-    curses.wrapper(
-        _interactive_view,
-        jira_dir,
-        items,
-        component_field,
-        component,
-        pattern,
-        active,
-        jira_url,
-        jira_email,
-        jira_api_token,
-        initial_key,
-        initial_mode,
-        normalize_swimlane(swimlane),
-    )
-
-
-def _interactive_view(
-    stdscr: Any,
-    jira_dir: Path,
-    items: list[dict[str, Any]],
-    component_field: str | None,
-    component: str | None,
-    pattern: str | None,
-    active: bool,
-    jira_url: str | None,
-    jira_email: str | None,
-    jira_api_token: str | None,
-    initial_key: str | None = None,
-    initial_mode: str = "shadow",
-    swimlane: str | None = None,
-) -> None:
-    curses.curs_set(0)
-    stdscr.keypad(True)
-    try:
-        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-    except curses.error:
-        pass
-    selected = 0
-    top = 0
-    detail_key: str | None = normalized_initial_key(jira_dir, initial_key)
-    detail_top = 0
-    detail_selected = 0
-    detail_mode = initial_mode if initial_mode in {"shadow", "original", "diff"} else "shadow"
-    current_component = component
-    current_filter = pattern
-    active_only = active
-    show_help = False
-    help_top = 0
-    wrap_index = False
-    show_index_second_row = True
-    search_query: str | None = None
-    message: str | None = None
-    show_other_fields = False
-    expanded_text_fields: set[str] = set()
-    modified_only = False
-    current_fix_version: str | None = None
-    current_swimlane = normalize_swimlane(swimlane)
-    stale_index_keys: set[str] = set()
-
-    while True:
-        if not detail_key and stale_index_keys:
-            refresh_stale_index_items(jira_dir, items, stale_index_keys, component_field)
-        modified_keys = modified_issue_keys(jira_dir)
-        visible_items = filter_items(
-            items,
-            component=current_component,
-            pattern=current_filter,
-            fix_version=current_fix_version,
-            active=active_only,
-            modified_keys=modified_keys,
-            modified_only=modified_only,
-        )
-        visible_items = filter_items_for_swimlane(visible_items, current_swimlane)
-        visible_items = sort_items_for_swimlane(visible_items, current_swimlane)
-        if selected >= len(visible_items):
-            selected = max(0, len(visible_items) - 1)
-        height, width = stdscr.getmaxyx()
-        stdscr.erase()
-        if show_help:
-            help_top = draw_help(stdscr, help_top, height, width)
-        elif detail_key:
-            detail_top = draw_detail(
-                stdscr,
-                jira_dir,
-                detail_key,
-                component_field,
-                detail_mode,
-                detail_top,
-                detail_selected,
-                height,
-                width,
-                message,
-                show_other_fields,
-                expanded_text_fields,
-            )
-        else:
-            selected, top = draw_index(
-                stdscr,
-                visible_items,
-                selected,
-                top,
-                height,
-                width,
-                component=current_component,
-                pattern=current_filter,
-                fix_version=current_fix_version,
-                active=active_only,
-                wrap=wrap_index,
-                modified_keys=modified_keys,
-                modified_only=modified_only,
-                swimlane=current_swimlane,
-                show_second_row=show_index_second_row,
-                message=message,
-            )
-        stdscr.refresh()
-
-        key = stdscr.getch()
-        message = None
-        if key == ord("q"):
-            return
-        if show_help:
-            if key in (ord("h"), 27):
-                show_help = False
-                help_top = 0
-            elif key in (curses.KEY_UP, ord("k")):
-                help_top = max(0, help_top - 1)
-            elif key in (curses.KEY_DOWN, ord("j")):
-                help_top += 1
-            elif key in (curses.KEY_NPAGE, ord(" ")):
-                help_top += max(1, height - 2)
-            elif key in (curses.KEY_PPAGE, ord("b")):
-                help_top = max(0, help_top - max(1, height - 2))
-        elif key in IGNORED_CONTROL_KEYS:
-            message = "ignored control key; use V for parent, Shift-P for push all"
-        elif key == ord("h"):
-            show_help = True
-            help_top = 0
-        elif key == ord("v"):
-            chosen_key = prompt_work_item_key(stdscr, detail_key)
-            if chosen_key:
-                try:
-                    issue = load_issue(jira_dir, chosen_key)
-                except ViewError:
-                    pass
-                else:
-                    detail_key = display_name(issue.get("key")) or chosen_key
-                    detail_mode = "shadow"
-                    detail_top = 0
-                    detail_selected = 0
-        elif key == ord("g") and not detail_key:
-            query = prompt_goto(stdscr)
-            if query:
-                match = find_item_index(visible_items, query)
-                if match is not None:
-                    selected = match
-                    top = selected
-                    search_query = query
-        elif key == 27:
-            if detail_key:
-                stale_index_keys.add(detail_key)
-                detail_key = None
-                detail_top = 0
-                detail_selected = 0
-            else:
-                return
-        elif detail_key:
-            detail_issue = load_issue(jira_dir, detail_key)
-            detail_shadow = None if detail_mode == "original" else load_shadow(jira_dir, detail_key)
-            detail_effective = apply_shadow(detail_issue, detail_shadow) if detail_shadow is not None else detail_issue
-            field_rows = detail_field_rows(
-                detail_effective,
-                component_field,
-                comments_text(jira_dir, detail_key, detail_shadow),
-            )
-            editable_fields = editable_detail_fields(component_field)
-            selectable_rows = [index for index, (_, field, _) in enumerate(field_rows) if field in editable_fields]
-            if detail_selected >= len(field_rows):
-                detail_selected = max(0, len(field_rows) - 1)
-            selected_field = field_rows[detail_selected][1] if 0 <= detail_selected < len(field_rows) else ""
-            if key == curses.KEY_MOUSE:
-                direction = mouse_scroll_direction()
-                if direction < 0:
-                    detail_top = max(0, detail_top - 3)
-                elif direction > 0:
-                    detail_top += 3
-            elif key == curses.KEY_UP and selected_field in expanded_text_fields:
-                detail_top = max(0, detail_top - 1)
-            elif key == curses.KEY_DOWN and selected_field in expanded_text_fields:
-                detail_top += 1
-            elif key in (curses.KEY_UP, ord("k"), curses.KEY_BTAB):
-                detail_selected = previous_selectable_index(selectable_rows, detail_selected)
-                detail_top = 0
-            elif key in (curses.KEY_DOWN, ord("j"), 9):
-                detail_selected = next_selectable_index(selectable_rows, detail_selected)
-                detail_top = 0
-            elif key in (curses.KEY_NPAGE, ord(" ")):
-                detail_top += max(1, height - 2)
-            elif key in (curses.KEY_PPAGE, ord("b")):
-                detail_top = max(0, detail_top - max(1, height - 2))
-            elif key == ord("x"):
-                if 0 <= detail_selected < len(field_rows):
-                    field = field_rows[detail_selected][1]
-                    if field in {"description", "comments"}:
-                        if field in expanded_text_fields:
-                            expanded_text_fields.remove(field)
-                            message = f"{field} collapsed"
-                        else:
-                            expanded_text_fields.add(field)
-                            message = f"{field} expanded"
-                    else:
-                        message = "select Description or Comments to expand"
-            elif key == ord("d"):
-                detail_mode = "diff"
-                detail_top = 0
-            elif key == ord("o"):
-                detail_mode = "original"
-                detail_top = 0
-            elif key == ord("s"):
-                detail_mode = "shadow"
-                detail_top = 0
-            elif is_open_parent_key(key):
-                parent_key = issue_parent_key(detail_effective)
-                if not parent_key:
-                    message = "no parent on this item"
-                else:
-                    try:
-                        parent_issue = load_issue(jira_dir, parent_key)
-                    except ViewError as exc:
-                        message = str(exc)
-                    else:
-                        detail_key = display_name(parent_issue.get("key")) or parent_key
-                        detail_mode = "shadow"
-                        detail_top = 0
-                        detail_selected = 0
-                        show_other_fields = False
-                        expanded_text_fields.clear()
-            elif key in (ord("e"), 10, 13, curses.KEY_ENTER):
-                changed_field = edit_selected_issue_field(
-                    stdscr,
-                    jira_dir,
-                    detail_key,
-                    component_field,
-                    detail_selected,
-                    jira_url,
-                    jira_email,
-                    jira_api_token,
-                )
-                if changed_field:
-                    refresh_index_item(jira_dir, items, detail_key, component_field)
-                    stale_index_keys.add(detail_key)
-                    detail_mode = "shadow"
-                    detail_top = 0
-                    message = f"shadow updated: {changed_field}"
-            elif key == ord("c"):
-                comment = prompt_textbox(stdscr, "Comment", "")
-                if comment:
-                    add_comment(jira_dir, detail_key, comment)
-                    refresh_index_item(jira_dir, items, detail_key, component_field)
-                    stale_index_keys.add(detail_key)
-                    detail_mode = "shadow"
-                    detail_top = 0
-                    message = "comment added to shadow"
-            elif key == ord("r"):
-                if confirm_simple(stdscr, f"Revert local shadow for {detail_key}?"):
-                    delete_shadow(jira_dir, detail_key)
-                    refresh_index_item(jira_dir, items, detail_key, component_field)
-                    stale_index_keys.add(detail_key)
-                    detail_mode = "shadow"
-                    detail_top = 0
-                    message = "local shadow reverted"
-            elif key == ord("p"):
-                if not (jira_url and jira_email and jira_api_token):
-                    message = "cannot push: missing Jira API configuration"
-                elif confirm_simple(stdscr, f"Push shadow for {detail_key} to Jira?"):
-                    try:
-                        api_client = jira_api_client(JiraApiConfig(jira_url, jira_email, jira_api_token))
-                        result = push_key(
-                            jira_dir,
-                            detail_key,
-                            api_client,
-                            progress=None,
-                            component_field=component_field or "components",
-                        )
-                    except (MetadataError, ShadowError) as exc:
-                        message = f"push failed: {exc}"
-                    else:
-                        refresh_index_item(jira_dir, items, detail_key, component_field)
-                        stale_index_keys.add(detail_key)
-                        detail_mode = "shadow"
-                        detail_top = 0
-                        message = f"push result: {result}"
-            elif key == ord("O"):
-                show_other_fields = not show_other_fields
-                message = "Other fields expanded" if show_other_fields else "Other fields collapsed"
-        else:
-            max_selected = max(0, len(visible_items) - 1)
-            if key in (curses.KEY_UP, ord("k")):
-                selected = max(0, selected - 1)
-            elif key in (curses.KEY_DOWN, ord("j")):
-                selected = min(max_selected, selected + 1)
-            elif key in (curses.KEY_NPAGE, ord(" ")):
-                selected = min(max_selected, selected + max(1, height - 2))
-            elif key in (curses.KEY_PPAGE, ord("b")):
-                selected = max(0, selected - max(1, height - 2))
-            elif key == ord("a"):
-                active_only = not active_only
-                selected = 0
-                top = 0
-            elif key == ord("w"):
-                wrap_index = not wrap_index
-                top = selected
-            elif key == ord("m"):
-                modified_only = not modified_only
-                selected = 0
-                top = 0
-            elif key == ord("s"):
-                show_index_second_row = not show_index_second_row
-                top = selected
-            elif key == ord("S"):
-                current_swimlane = cycle_swimlane(current_swimlane)
-                selected = 0
-                top = 0
-            elif key == ord("R"):
-                selected_key = (
-                    display_name(visible_items[selected].get("key"))
-                    if visible_items and 0 <= selected < len(visible_items)
-                    else None
-                )
-                items = load_manifest_items(jira_dir, component_field)
-                stale_index_keys.clear()
-                refreshed_visible_items = sort_items_for_swimlane(
-                    filter_items_for_swimlane(
-                        filter_items(
-                            items,
-                            component=current_component,
-                            pattern=current_filter,
-                            fix_version=current_fix_version,
-                            active=active_only,
-                            modified_keys=modified_issue_keys(jira_dir),
-                            modified_only=modified_only,
-                        ),
-                        current_swimlane,
-                    ),
-                    current_swimlane,
-                )
-                selected = item_index_by_key(refreshed_visible_items, selected_key) or 0
-                top = selected
-                message = f"reloaded {len(items)} items"
-            elif is_push_all_key(key):
-                keys = sorted(modified_issue_keys(jira_dir), key=issue_key_sort_key)
-                if not keys:
-                    message = "no local shadow changes"
-                elif not (jira_url and jira_email and jira_api_token):
-                    message = "cannot push: missing Jira API configuration"
-                elif confirm_push_all(stdscr, jira_dir, keys):
-                    progress_lines: list[str] = []
-
-                    def push_progress(line: str) -> None:
-                        progress_lines.append(line)
-                        draw_push_all_progress(stdscr, progress_lines)
-
-                    try:
-                        draw_push_all_progress(stdscr, ["Preparing Jira API client..."])
-                        api_client = jira_api_client(JiraApiConfig(jira_url, jira_email, jira_api_token))
-                        push_progress(f"Starting push for {len(keys)} item{'s' if len(keys) != 1 else ''}...")
-                        result = push_shadows(
-                            jira_dir,
-                            keys,
-                            api_client,
-                            progress=push_progress,
-                            component_field=component_field or "components",
-                        )
-                    except (MetadataError, ShadowError) as exc:
-                        message = f"push all failed: {exc}"
-                        show_push_all_result(
-                            stdscr,
-                            "Push All Failed",
-                            [*progress_lines, "", message],
-                        )
-                    else:
-                        for changed_key in keys:
-                            refresh_index_item(jira_dir, items, changed_key, component_field)
-                        message = (
-                            f"push all: pushed={result.pushed} "
-                            f"blocked={result.blocked} failed={result.failed} skipped={result.skipped}"
-                        )
-                        show_push_all_result(
-                            stdscr,
-                            "Push All Complete" if result.failed == 0 else "Push All Completed With Errors",
-                            [*progress_lines, "", message],
-                        )
-            elif key == ord("c"):
-                current_component = prompt_component(stdscr, current_component)
-                selected = 0
-                top = 0
-            elif key == ord("/"):
-                query = prompt_search(stdscr, search_query)
-                if query:
-                    search_query = query
-                    match = find_next_item_index(visible_items, query, selected - 1)
-                    if match is not None:
-                        selected = match
-                        top = selected
-            elif key == ord("n"):
-                if search_query:
-                    match = find_next_item_index(visible_items, search_query, selected)
-                    if match is not None:
-                        selected = match
-                        top = selected
-            elif key == ord("N"):
-                if search_query:
-                    match = find_next_item_index(visible_items, search_query, selected, direction=-1)
-                    if match is not None:
-                        selected = match
-                        top = selected
-            elif key == ord("f"):
-                current_filter = prompt_filter(stdscr, current_filter)
-                selected = 0
-                top = 0
-            elif key == ord("F"):
-                current_fix_version = select_fix_version_filter(stdscr, jira_dir, current_fix_version)
-                selected = 0
-                top = 0
-            elif key == ord(">"):
-                current_fix_version = cycle_fix_version(items, current_fix_version, 1)
-                selected = 0
-                top = 0
-            elif key == ord("<"):
-                current_fix_version = cycle_fix_version(items, current_fix_version, -1)
-                selected = 0
-                top = 0
-            elif key == ord("x"):
-                current_fix_version = None
-                selected = 0
-                top = 0
-            elif key == ord("\\"):
-                current_filter = None
-                selected = 0
-                top = 0
-            elif key == ord("C"):
-                current_component = None
-                selected = 0
-                top = 0
-            elif key == ord("]"):
-                current_component = cycle_component(items, current_component, 1)
-                selected = 0
-                top = 0
-            elif key == ord("["):
-                current_component = cycle_component(items, current_component, -1)
-                selected = 0
-                top = 0
-            elif is_open_parent_key(key) and visible_items:
-                parent_key = index_item_parent_key(visible_items[selected])
-                if not parent_key:
-                    message = "selected item has no parent"
-                else:
-                    try:
-                        parent_issue = load_issue(jira_dir, parent_key)
-                    except ViewError as exc:
-                        message = str(exc)
-                    else:
-                        detail_key = display_name(parent_issue.get("key")) or parent_key
-                        detail_mode = "shadow"
-                        detail_top = 0
-                        detail_selected = 0
-                        show_other_fields = False
-            elif key in (10, 13, curses.KEY_ENTER) and visible_items:
-                detail_key = display_name(visible_items[selected].get("key"))
-                detail_mode = "shadow"
-                detail_top = 0
-                detail_selected = 0
-
-
-def draw_index(
-    stdscr: Any,
-    items: list[dict[str, Any]],
-    selected: int,
-    top: int,
-    height: int,
-    width: int,
-    *,
-    component: str | None,
-    pattern: str | None,
-    fix_version: str | None,
-    active: bool,
-    wrap: bool,
-    modified_keys: set[str] | None = None,
-    modified_only: bool = False,
-    swimlane: str | None = None,
-    show_second_row: bool = True,
-    message: str | None = None,
-) -> tuple[int, int]:
-    header_lines = index_header(width - 1, swimlane=swimlane, show_second_row=show_second_row).splitlines()
-    message_height = 1 if message else 0
-    visible_height = max(1, height - 2 - len(header_lines) - message_height)
-    if selected < top:
-        top = selected
-
-    while top < selected and not index_selection_fits(
-        items, selected, top, visible_height, width, wrap, modified_keys, swimlane, show_second_row
-    ):
-        top += 1
-
-    filters = []
-    if component:
-        filters.append(f"component={component}")
-    if pattern:
-        filters.append(f"filter={pattern}")
-    if fix_version:
-        filters.append(f"fixVersion={fix_version}")
-    if active:
-        filters.append("active")
-    if wrap:
-        filters.append("wrap")
-    if modified_only:
-        filters.append("modified")
-    if not show_second_row:
-        filters.append("single-row")
-    if normalize_swimlane(swimlane) != "none":
-        filters.append(f"swimlane={normalize_swimlane(swimlane)}")
-    title = index_title(len(items), filters, width)
-    stdscr.addnstr(0, 0, title, width - 1, curses.A_BOLD | curses.A_UNDERLINE)
-    for header_row, line in enumerate(header_lines, start=1):
-        stdscr.addnstr(header_row, 0, line, width - 1, curses.A_BOLD)
-    row = 1 + len(header_lines)
-    previous_lane: str | None = None
-    for index, item in enumerate(items[top:], start=top):
-        lane_lines: list[str] = []
-        lane = swimlane_label(item, swimlane)
-        epic_lane_only = normalize_swimlane(swimlane) == "epic" and is_epic_item(item)
-        if lane is not None and lane != previous_lane:
-            lane_lines = [swimlane_header(lane, swimlane)]
-            previous_lane = lane
-        lines = (
-            []
-            if epic_lane_only
-            else index_row_lines(
-                item,
-                width=width - 1,
-                wrap=wrap,
-                modified_keys=modified_keys,
-                swimlane=swimlane,
-                show_second_row=show_second_row,
-            )
-        )
-        if row + len(lane_lines) + len(lines) > height - message_height:
-            break
-        for line in lane_lines:
-            lane_attr = curses.A_REVERSE if epic_lane_only and index == selected else curses.A_BOLD
-            stdscr.addnstr(row, 0, line, width - 1, lane_attr)
-            row += 1
-        attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-        for line in lines:
-            stdscr.addnstr(row, 0, line, width - 1, attr)
-            row += 1
-    if message:
-        stdscr.addnstr(height - 1, 0, message, width - 1, curses.A_REVERSE)
-    return selected, top
-
-
-def index_title(item_count: int, filters: list[str], width: int) -> str:
-    available = max(1, width - 1)
-    base_prefix = f"Jira Workbench: {item_count}"
-    base = base_prefix
-    if filters:
-        filter_text = f" [{' '.join(filters)}]"
-        reserved = len("  (h help)")
-        filter_width = max(0, available - len(base_prefix) - reserved)
-        base += truncate_cell(filter_text, filter_width) if filter_width else ""
-    hints = [
-        "h help",
-        "P push all",
-        "Enter open",
-        "/ search",
-    ]
-    title = base
-    visible_hints = []
-    for hint in hints:
-        candidate_hints = "  ".join([*visible_hints, hint])
-        candidate = f"{base}  ({candidate_hints})"
-        if len(candidate) <= available:
-            visible_hints.append(hint)
-            title = candidate
-        elif not visible_hints and len(base) + 4 <= available:
-            title = f"{base}  (h)"
-            break
-    return truncate_cell(title, available)
-
-
-def swimlane_header(lane: str, swimlane: str | None) -> str:
-    labels = {"epic": "Epic", "version": "Version", "component": "Component"}
-    label = labels.get(normalize_swimlane(swimlane), "Swimlane")
-    return f"== {label}: {lane} =="
-
-
-def index_selection_fits(
-    items: list[dict[str, Any]],
-    selected: int,
-    top: int,
-    visible_height: int,
-    width: int,
-    wrap: bool,
-    modified_keys: set[str] | None = None,
-    swimlane: str | None = None,
-    show_second_row: bool = True,
-) -> bool:
-    row_count = 0
-    previous_lane: str | None = None
-    for index, item in enumerate(items[top : selected + 1], start=top):
-        lane = swimlane_label(item, swimlane)
-        if lane is not None and lane != previous_lane:
-            row_count += 1
-            previous_lane = lane
-        if normalize_swimlane(swimlane) == "epic" and is_epic_item(item):
-            if row_count > visible_height:
-                return False
-            if index == selected:
-                return True
-            continue
-        row_count += len(
-            index_row_lines(
-                item,
-                width=width - 1,
-                wrap=wrap,
-                modified_keys=modified_keys,
-                swimlane=swimlane,
-                show_second_row=show_second_row,
-            )
-        )
-        if row_count > visible_height:
-            return False
-        if index == selected:
-            return True
-    return False
-
-
-def prompt_component(stdscr: Any, current: str | None) -> str | None:
-    height, width = stdscr.getmaxyx()
-    prompt = f"Component [{current or 'all'}]: "
-    curses.echo()
-    try:
-        stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-        stdscr.addnstr(height - 1, 0, prompt, width - 1, curses.A_REVERSE)
-        value = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(0, width - len(prompt) - 1))
-    finally:
-        curses.noecho()
-    decoded = value.decode(errors="ignore").strip()
-    return decoded or current
-
-
-def prompt_work_item_key(stdscr: Any, current: str | None) -> str | None:
-    height, width = stdscr.getmaxyx()
-    prompt = f"View [{current or ''}]: "
-    curses.echo()
-    try:
-        stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-        stdscr.addnstr(height - 1, 0, prompt, width - 1, curses.A_REVERSE)
-        value = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(0, width - len(prompt) - 1))
-    finally:
-        curses.noecho()
-    decoded = value.decode(errors="ignore").strip()
-    return decoded or current
-
-
-def prompt_goto(stdscr: Any) -> str | None:
-    height, width = stdscr.getmaxyx()
-    prompt = "Go to: "
-    curses.echo()
-    try:
-        stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-        stdscr.addnstr(height - 1, 0, prompt, width - 1, curses.A_REVERSE)
-        value = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(0, width - len(prompt) - 1))
-    finally:
-        curses.noecho()
-    decoded = value.decode(errors="ignore").strip()
-    return decoded or None
-
-
-def prompt_search(stdscr: Any, current: str | None) -> str | None:
-    height, width = stdscr.getmaxyx()
-    prompt = f"/{current or ''}"
-    curses.echo()
-    try:
-        stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-        stdscr.addnstr(height - 1, 0, prompt, width - 1, curses.A_REVERSE)
-        value = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(0, width - len(prompt) - 1))
-    finally:
-        curses.noecho()
-    decoded = value.decode(errors="ignore").strip()
-    return decoded or current
-
-
-def prompt_filter(stdscr: Any, current: str | None) -> str | None:
-    height, width = stdscr.getmaxyx()
-    prompt = f"Filter [{current or 'none'}]: "
-    curses.echo()
-    try:
-        stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-        stdscr.addnstr(height - 1, 0, prompt, width - 1, curses.A_REVERSE)
-        value = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(0, width - len(prompt) - 1))
-    finally:
-        curses.noecho()
-    decoded = value.decode(errors="ignore").strip()
-    return decoded or current
-
-
-def select_fix_version_filter(stdscr: Any, jira_dir: Path, current: str | None) -> str | None:
-    options = version_options(jira_dir, include_inactive=True)
-    if "(none)" not in options:
-        options.insert(0, "(none)")
-    selected = select_field_value(stdscr, "Fix version filter", current or "", options)
-    return selected or current
-
-
-def previous_selectable_index(selectable_rows: list[int], current: int) -> int:
-    previous = [index for index in selectable_rows if index < current]
-    if previous:
-        return previous[-1]
-    return selectable_rows[-1] if selectable_rows else current
-
-
-def next_selectable_index(selectable_rows: list[int], current: int) -> int:
-    following = [index for index in selectable_rows if index > current]
-    if following:
-        return following[0]
-    return selectable_rows[0] if selectable_rows else current
-
-
-def mouse_scroll_direction() -> int:
-    try:
-        _id, _x, _y, _z, button_state = curses.getmouse()
-    except curses.error:
-        return 0
-    if button_state & getattr(curses, "BUTTON4_PRESSED", 0):
-        return -1
-    if button_state & getattr(curses, "BUTTON5_PRESSED", 0):
-        return 1
-    return 0
-
-
-def edit_selected_issue_field(
-    stdscr: Any,
-    jira_dir: Path,
-    key: str,
-    component_field: str | None,
-    selected: int,
-    jira_url: str | None = None,
-    jira_email: str | None = None,
-    jira_api_token: str | None = None,
-) -> str | None:
-    issue = load_issue(jira_dir, key)
-    shadow = load_shadow(jira_dir, key)
-    effective = apply_shadow(issue, shadow) if shadow is not None else issue
-    rows = detail_field_rows(effective, component_field, comments_text(jira_dir, key, shadow))
-    editable_fields = editable_detail_fields(component_field)
-    if selected >= len(rows):
-        return None
-    label, field, _ = rows[selected]
-    if field not in editable_fields:
-        return None
-    current = editable_field_value(effective, field)
-    if field == "description":
-        new_value = prompt_textbox(stdscr, label, current)
-    elif field == "parent":
-        options = selectable_field_options(jira_dir, field, component_field, current_issue=effective)
-        all_options = selectable_field_options(
-            jira_dir,
-            field,
-            component_field,
-            current_issue=effective,
-            include_inactive_parents=True,
-        )
-        new_value = select_field_value(
-            stdscr,
-            label,
-            current,
-            options,
-            all_options=all_options,
-            all_label="inactive",
-        )
-    else:
-        options = selectable_field_options(jira_dir, field, component_field)
-        if options:
-            new_value = select_field_value(stdscr, label, current, options)
-        else:
-            new_value = prompt_field_value(stdscr, label, current)
-    if new_value is None:
-        return None
-    status_change: tuple[str | None, str | None] | None = None
-    if field == "status" and new_value != current:
-        if is_done_status(new_value):
-            status_change = prompt_status_change(stdscr, new_value)
-            if status_change is None:
-                return None
-        else:
-            comment = prompt_optional_status_comment(stdscr)
-            status_change = (None, comment)
-    set_field(
-        jira_dir,
-        key,
-        field,
-        encode_edit_value(field, new_value, component_field=component_field),
-    )
-    if status_change is not None:
-        resolution, comment = status_change
-        set_status_change(jira_dir, key, resolution=resolution)
-        if comment:
-            add_comment(jira_dir, key, comment)
-    return label
-
-
-def is_done_status(value: str) -> bool:
-    return value.strip().lower() in DONE_STATUSES
-
-
-def select_status_resolution(
-    stdscr: Any,
-    jira_url: str | None,
-    jira_email: str | None,
-    jira_api_token: str | None,
-) -> str | None:
-    options = resolution_options(jira_url, jira_email, jira_api_token)
-    return select_field_value(stdscr, "Resolution", "Done", options)
-
-
-def resolution_options(
-    jira_url: str | None,
-    jira_email: str | None,
-    jira_api_token: str | None,
-) -> list[str]:
-    return DEFAULT_RESOLUTIONS
-
-
-def prompt_status_change(stdscr: Any, status: str) -> tuple[str, str | None] | None:
-    options = resolution_options(None, None, None)
-    selected = option_index(options, "Done")
-    comment = ""
-    focus = "comment"
-
-    try:
-        curses.curs_set(1)
-        while True:
-            height, width = stdscr.getmaxyx()
-            stdscr.erase()
-            stdscr.addnstr(
-                0,
-                0,
-                "Close status  (Tab focus, Ctrl-G save, Esc cancel)",
-                width - 1,
-                curses.A_REVERSE,
-            )
-            stdscr.addnstr(2, 2, f"Status:     {status}", width - 3)
-            prompt_row = 4
-            comment_label = "Comment (optional):"
-            comment_attr = curses.A_REVERSE if focus == "comment" else curses.A_NORMAL
-            stdscr.addnstr(prompt_row, 2, comment_label, width - 3, comment_attr)
-            comment_start = min(22, max(0, width - 2))
-            comment_width = max(1, width - comment_start - 1)
-            visible_comment = comment[-comment_width:]
-            stdscr.addnstr(prompt_row, comment_start, visible_comment, comment_width, comment_attr)
-
-            stdscr.addnstr(6, 2, "Resolution:", width - 3)
-            for index, option in enumerate(options):
-                row = 7 + index
-                if row >= height - 2:
-                    break
-                prefix = ">" if index == selected else " "
-                attr = curses.A_REVERSE if focus == "resolution" and index == selected else curses.A_NORMAL
-                stdscr.addnstr(row, 4, f"{prefix} {option}", width - 5, attr)
-            if focus == "comment":
-                stdscr.move(prompt_row, comment_start + min(len(visible_comment), comment_width - 1))
-            else:
-                cursor_row = min(7 + selected, height - 2)
-                stdscr.move(cursor_row, 6)
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            if key == 27:
-                return None
-            if key == 7:
-                return options[selected], comment.strip() or None
-            if key == 9:
-                focus = "resolution" if focus == "comment" else "comment"
-                continue
-            if key in (10, 13, curses.KEY_ENTER):
-                continue
-            if key in (curses.KEY_UP,) and focus == "resolution":
-                selected = max(0, selected - 1)
-            elif key in (curses.KEY_DOWN,) and focus == "resolution":
-                selected = min(len(options) - 1, selected + 1)
-            elif key in (curses.KEY_BACKSPACE, 8, 127) and focus == "comment":
-                comment = comment[:-1]
-            elif key == curses.KEY_DC:
-                continue
-            elif 32 <= key <= 126 and focus == "comment":
-                comment += chr(key)
-    finally:
-        curses.curs_set(0)
-
-
-def prompt_optional_status_comment(stdscr: Any) -> str | None:
-    comment = prompt_field_value(stdscr, "Comment (optional, blank skips)", "")
-    return comment.strip() if comment else None
-
-
-def select_field_value(
-    stdscr: Any,
-    label: str,
-    current: str,
-    options: list[str],
-    *,
-    all_options: list[str] | None = None,
-    all_label: str = "all",
-) -> str | None:
-    active_options = options
-    selected = option_index(options, current)
-    top = 0
-    filter_text = ""
-    show_all = False
-
-    while True:
-        options = all_options if show_all and all_options is not None else active_options
-        visible = [option for option in options if filter_text.lower() in option.lower()]
-        if not visible:
-            visible = options
-            filter_text = ""
-        if selected >= len(visible):
-            selected = max(0, len(visible) - 1)
-        height, width = stdscr.getmaxyx()
-        visible_height = max(1, height - 4)
-        if selected < top:
-            top = selected
-        if selected >= top + visible_height:
-            top = selected - visible_height + 1
-
-        stdscr.erase()
-        toggle_hint = f", a {'hide' if show_all else 'show'} {all_label}" if all_options is not None else ""
-        title = f"Select {label}  (j/k move, / filter{toggle_hint}, Enter select, q cancel)"
-        stdscr.addnstr(0, 0, title, width - 1, curses.A_REVERSE)
-        if filter_text:
-            stdscr.addnstr(1, 0, f"filter: {filter_text}", width - 1)
-        for row, option in enumerate(visible[top : top + visible_height], start=2):
-            index = top + row - 2
-            marker = "*" if option == current else " "
-            line = f"{marker} {option}"
-            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-            stdscr.addnstr(row, 0, line, width - 1, attr)
-        stdscr.refresh()
-
-        pressed = stdscr.getch()
-        if pressed in (ord("q"), 27):
-            return None
-        if pressed in (curses.KEY_UP, ord("k")):
-            selected = max(0, selected - 1)
-        elif pressed in (curses.KEY_DOWN, ord("j")):
-            selected = min(len(visible) - 1, selected + 1)
-        elif pressed == ord("/"):
-            new_filter = prompt_filter_text(stdscr, filter_text)
-            if new_filter is not None:
-                filter_text = new_filter
-                selected = 0
-                top = 0
-        elif pressed == ord("a") and all_options is not None:
-            show_all = not show_all
-            selected = option_index(all_options if show_all else active_options, current)
-            top = 0
-        elif pressed == ord("\\"):
-            filter_text = ""
-            selected = option_index(options, current)
-            top = 0
-        elif pressed in (10, 13, curses.KEY_ENTER):
-            return visible[selected]
-
-
-def option_index(options: list[str], current: str) -> int:
-    normalized = current.strip().lower()
-    current_key = issue_key_from_text(current)
-    for index, option in enumerate(options):
-        if option.strip().lower() == normalized:
-            return index
-        if current_key and issue_key_from_text(option) == current_key:
-            return index
-    return 0
-
-
 def issue_key_from_text(value: str) -> str | None:
     match = re.search(r"\b[A-Z][A-Z0-9]+-\d+\b", value)
     return match.group(0) if match else None
-
-
-def prompt_filter_text(stdscr: Any, current: str) -> str | None:
-    height, width = stdscr.getmaxyx()
-    prompt = f"Filter [{current or 'none'}]: "
-    curses.echo()
-    try:
-        curses.curs_set(1)
-        stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-        stdscr.addnstr(height - 1, 0, prompt, width - 1, curses.A_REVERSE)
-        value = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(0, width - len(prompt) - 1))
-    finally:
-        curses.noecho()
-        curses.curs_set(0)
-    decoded = value.decode(errors="ignore").strip()
-    return decoded
-
-
-def prompt_field_value(stdscr: Any, label: str, current: str) -> str | None:
-    height, width = stdscr.getmaxyx()
-    prompt = f"{label}: "
-    value = current
-    cursor = len(value)
-    scroll = 0
-    try:
-        curses.curs_set(1)
-        while True:
-            input_x = min(len(prompt), max(0, width - 1))
-            input_width = max(1, width - input_x - 1)
-            if cursor < scroll:
-                scroll = cursor
-            if cursor >= scroll + input_width:
-                scroll = cursor - input_width + 1
-            visible = value[scroll : scroll + input_width]
-            stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-            stdscr.addnstr(height - 1, 0, prompt, width - 1, curses.A_BOLD)
-            stdscr.addnstr(height - 1, input_x, visible, input_width)
-            stdscr.move(height - 1, input_x + min(cursor - scroll, input_width - 1))
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            value, cursor, done = edit_line_value(value, cursor, key)
-            if done == "save":
-                return value
-            if done == "cancel":
-                return None
-    finally:
-        curses.curs_set(0)
-
-
-def edit_line_value(value: str, cursor: int, key: int) -> tuple[str, int, str | None]:
-    cursor = max(0, min(cursor, len(value)))
-    if key == 27:
-        return value, cursor, "cancel"
-    if key in (10, 13, curses.KEY_ENTER):
-        return value, cursor, "save"
-    if key in (curses.KEY_LEFT, 2):
-        return value, max(0, cursor - 1), None
-    if key in (curses.KEY_RIGHT, 6):
-        return value, min(len(value), cursor + 1), None
-    if key in (curses.KEY_HOME, 1):
-        return value, 0, None
-    if key in (curses.KEY_END, 5):
-        return value, len(value), None
-    if key in (curses.KEY_BACKSPACE, 8, 127):
-        if cursor == 0:
-            return value, cursor, None
-        return value[: cursor - 1] + value[cursor:], cursor - 1, None
-    if key == curses.KEY_DC:
-        if cursor >= len(value):
-            return value, cursor, None
-        return value[:cursor] + value[cursor + 1 :], cursor, None
-    if 32 <= key <= 126:
-        return value[:cursor] + chr(key) + value[cursor:], cursor + 1, None
-    return value, cursor, None
-
-
-def prompt_textbox(stdscr: Any, label: str, current: str) -> str | None:
-    height, width = stdscr.getmaxyx()
-    start_y, start_x, box_height, box_width, rectangle_y2, rectangle_x2 = textbox_geometry(height, width)
-    lines = current.splitlines() or [""]
-    cursor_y = 0
-    cursor_x = 0
-    top = 0
-
-    try:
-        curses.curs_set(1)
-        while True:
-            if cursor_y < top:
-                top = cursor_y
-            if cursor_y >= top + box_height:
-                top = cursor_y - box_height + 1
-            stdscr.erase()
-            stdscr.addnstr(0, 0, f"Edit {label}  (Ctrl-G save, Esc cancel)", width - 1, curses.A_REVERSE)
-            stdscr.addnstr(1, 0, "Enter adds a line. Backspace joins lines when at column 0.", width - 1)
-            curses.textpad.rectangle(stdscr, start_y - 1, start_x - 1, rectangle_y2, rectangle_x2)
-            for row, line in enumerate(lines[top : top + box_height], start=start_y):
-                stdscr.addnstr(row, start_x, line, box_width - 1)
-            screen_y = start_y + cursor_y - top
-            screen_x = start_x + min(cursor_x, box_width - 2)
-            stdscr.move(screen_y, screen_x)
-            stdscr.refresh()
-
-            key = stdscr.getch()
-            if key == 7:
-                return "\n".join(lines).rstrip()
-            if key == 27:
-                return None
-            if key == curses.KEY_UP:
-                cursor_y = max(0, cursor_y - 1)
-                cursor_x = min(cursor_x, len(lines[cursor_y]))
-            elif key == curses.KEY_DOWN:
-                cursor_y = min(len(lines) - 1, cursor_y + 1)
-                cursor_x = min(cursor_x, len(lines[cursor_y]))
-            elif key == curses.KEY_LEFT:
-                if cursor_x > 0:
-                    cursor_x -= 1
-                elif cursor_y > 0:
-                    cursor_y -= 1
-                    cursor_x = len(lines[cursor_y])
-            elif key == curses.KEY_RIGHT:
-                if cursor_x < len(lines[cursor_y]):
-                    cursor_x += 1
-                elif cursor_y + 1 < len(lines):
-                    cursor_y += 1
-                    cursor_x = 0
-            elif key in (10, 13, curses.KEY_ENTER):
-                line = lines[cursor_y]
-                lines[cursor_y] = line[:cursor_x]
-                lines.insert(cursor_y + 1, line[cursor_x:])
-                cursor_y += 1
-                cursor_x = 0
-            elif key in (curses.KEY_BACKSPACE, 8, 127):
-                if cursor_x > 0:
-                    line = lines[cursor_y]
-                    lines[cursor_y] = line[: cursor_x - 1] + line[cursor_x:]
-                    cursor_x -= 1
-                elif cursor_y > 0:
-                    previous_length = len(lines[cursor_y - 1])
-                    lines[cursor_y - 1] += lines.pop(cursor_y)
-                    cursor_y -= 1
-                    cursor_x = previous_length
-            elif key == curses.KEY_DC:
-                line = lines[cursor_y]
-                if cursor_x < len(line):
-                    lines[cursor_y] = line[:cursor_x] + line[cursor_x + 1 :]
-                elif cursor_y + 1 < len(lines):
-                    lines[cursor_y] += lines.pop(cursor_y + 1)
-            elif 32 <= key <= 126:
-                line = lines[cursor_y]
-                lines[cursor_y] = line[:cursor_x] + chr(key) + line[cursor_x:]
-                cursor_x += 1
-    finally:
-        curses.curs_set(0)
-
-
-def textbox_geometry(height: int, width: int) -> tuple[int, int, int, int, int, int]:
-    start_y = 2
-    start_x = 2
-    rectangle_y2 = max(start_y + 2, height - 2)
-    rectangle_x2 = max(start_x + 10, width - 2)
-    box_height = max(1, rectangle_y2 - start_y)
-    box_width = max(10, rectangle_x2 - start_x)
-    return start_y, start_x, box_height, box_width, rectangle_y2, rectangle_x2
-
-
-def confirm_simple(stdscr: Any, prompt: str) -> bool:
-    height, width = stdscr.getmaxyx()
-    line = f"{prompt} Type y to confirm: "
-    curses.echo()
-    try:
-        curses.curs_set(1)
-        stdscr.addnstr(height - 1, 0, " " * max(0, width - 1), width - 1)
-        stdscr.addnstr(height - 1, 0, line, width - 1, curses.A_REVERSE)
-        value = stdscr.getstr(height - 1, min(len(line), max(0, width - 1)), 1)
-    finally:
-        curses.noecho()
-        curses.curs_set(0)
-    return value.decode(errors="ignore").strip().lower() == "y"
 
 
 def report_empty_value(field: str) -> str:
@@ -2370,29 +1314,6 @@ def original_report_value(issue: dict[str, Any], field: str) -> str:
 
 def shadow_report_value(field: str, value: Any) -> str:
     return report_value(field, value)
-
-
-def report_change_text(jira_dir: Path, key: str, shadow: dict[str, Any]) -> str:
-    issue = load_issue(jira_dir, key)
-    fields = as_dict(shadow.get("fields"))
-    changes: list[str] = []
-    for field in sorted(fields):
-        label = REPORT_FIELD_LABELS.get(field, field)
-        if field in INLINE_REPORT_FIELDS:
-            before = original_report_value(issue, field)
-            after = shadow_report_value(field, fields[field])
-            changes.append(f"{label}: {before} -> {after}")
-        else:
-            changes.append(label)
-
-    status_change = as_dict(shadow.get("statusChange"))
-    resolution = status_change.get("resolution")
-    if resolution:
-        before = original_report_value(issue, "resolution")
-        after = shadow_report_value("resolution", resolution)
-        changes.append(f"resolution: {before} -> {after}")
-
-    return ", ".join(changes) if changes else "(comments only)"
 
 
 def report_text_block(label: str, value: str) -> list[str]:
@@ -2462,532 +1383,3 @@ def detailed_shadow_report_lines(jira_dir: Path, keys: list[str]) -> list[str]:
     return lines
 
 
-def shadow_report_lines(jira_dir: Path, keys: list[str]) -> list[str]:
-    lines = [
-        f"Local shadow changes: {len(keys)} item{'s' if len(keys) != 1 else ''}",
-        "",
-        "Key       State       Fields  Comments  Changes",
-    ]
-    for key in keys:
-        shadow = load_shadow(jira_dir, key)
-        if shadow is None:
-            continue
-        fields = as_dict(shadow.get("fields"))
-        comments = as_list(shadow.get("comments"))
-        change_text = report_change_text(jira_dir, key, shadow)
-        lines.append(
-            f"{key:<9} {display_name(shadow.get('state')) or 'working':<11} "
-            f"{len(fields):<7} {len(comments):<9} {change_text}"
-        )
-    return lines
-
-
-def push_all_report_lines(jira_dir: Path, keys: list[str]) -> list[str]:
-    lines = shadow_report_lines(jira_dir, keys)
-    lines[0] = f"Push all local shadow changes: {len(keys)} item{'s' if len(keys) != 1 else ''}"
-    lines.extend(
-        [
-            "",
-            "This will push these local shadow changes to live Jira.",
-            "Press y to confirm, q or Esc to cancel.",
-        ]
-    )
-    return lines
-
-
-def confirm_push_all(stdscr: Any, jira_dir: Path, keys: list[str]) -> bool:
-    top = 0
-    lines = push_all_report_lines(jira_dir, keys)
-    while True:
-        height, width = stdscr.getmaxyx()
-        visible_height = max(1, height - 1)
-        top = min(top, max(0, len(lines) - visible_height))
-        stdscr.erase()
-        stdscr.addnstr(0, 0, "Confirm Push All  (y confirm, q/Esc cancel, j/k scroll)", width - 1, curses.A_REVERSE)
-        for row, line in enumerate(lines[top : top + max(1, height - 2)], start=1):
-            stdscr.addnstr(row, 0, line, width - 1)
-        stdscr.refresh()
-        key = stdscr.getch()
-        if key in (ord("y"), ord("Y")):
-            return True
-        if key in (ord("q"), 27):
-            return False
-        if key in (curses.KEY_UP, ord("k")):
-            top = max(0, top - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            top += 1
-        elif key in (curses.KEY_NPAGE, ord(" ")):
-            top += max(1, height - 2)
-        elif key == curses.KEY_PPAGE:
-            top = max(0, top - max(1, height - 2))
-
-
-def draw_push_all_progress(stdscr: Any, lines: list[str]) -> None:
-    height, width = stdscr.getmaxyx()
-    stdscr.erase()
-    stdscr.addnstr(0, 0, "Push All  (working...)", width - 1, curses.A_REVERSE)
-    wrapped = wrap_push_lines(lines, width - 1)
-    visible = wrapped[-max(1, height - 2) :]
-    for row, line in enumerate(visible, start=1):
-        stdscr.addnstr(row, 0, line, width - 1)
-    stdscr.refresh()
-
-
-def draw_push_all_result(stdscr: Any, title: str, lines: list[str], top: int = 0) -> int:
-    height, width = stdscr.getmaxyx()
-    wrapped = wrap_push_lines(lines, width - 1)
-    top = min(top, max(0, len(wrapped) - max(1, height - 2)))
-    stdscr.erase()
-    stdscr.addnstr(0, 0, f"{title}  (q/Esc/Enter close, j/k scroll)", width - 1, curses.A_REVERSE)
-    for row, line in enumerate(wrapped[top : top + max(1, height - 2)], start=1):
-        stdscr.addnstr(row, 0, line, width - 1)
-    stdscr.refresh()
-    return top
-
-
-def show_push_all_result(stdscr: Any, title: str, lines: list[str]) -> None:
-    top = 0
-    while True:
-        top = draw_push_all_result(stdscr, title, lines, top)
-        key = stdscr.getch()
-        if key in (ord("q"), 27, 10, 13):
-            return
-        if key in (curses.KEY_UP, ord("k")):
-            top = max(0, top - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            top += 1
-        elif key in (curses.KEY_NPAGE, ord(" ")):
-            height, _ = stdscr.getmaxyx()
-            top += max(1, height - 2)
-        elif key == curses.KEY_PPAGE:
-            height, _ = stdscr.getmaxyx()
-            top = max(0, top - max(1, height - 2))
-
-
-def draw_help(stdscr: Any, top: int, height: int, width: int) -> int:
-    lines = wrap_lines(HELP_LINES, width - 1)
-    top = min(top, max(0, len(lines) - max(1, height - 2)))
-    title = "Help  (j/k scroll, h/q/Esc back)"
-    stdscr.addnstr(0, 0, title, width - 1, curses.A_BOLD | curses.A_UNDERLINE)
-    for row, line in enumerate(lines[top : top + max(1, height - 2)], start=1):
-        stdscr.addnstr(row, 0, line, width - 1)
-    return top
-
-
-def draw_detail(
-    stdscr: Any,
-    jira_dir: Path,
-    key: str,
-    component_field: str | None,
-    mode: str,
-    top: int,
-    selected: int,
-    height: int,
-    width: int,
-    message: str | None = None,
-    show_other_fields: bool = False,
-    expanded_text_fields: set[str] | None = None,
-) -> int:
-    if mode == "diff":
-        return draw_detail_text(stdscr, jira_dir, key, component_field, mode, top, height, width, message)
-    issue = load_issue(jira_dir, key)
-    shadow = None if mode == "original" else load_shadow(jira_dir, key)
-    effective = apply_shadow(issue, shadow) if shadow is not None else issue
-    rows = detail_field_rows(effective, component_field, comments_text(jira_dir, key, shadow))
-    editable_fields = editable_detail_fields(component_field)
-    modified_fields = shadow_modified_fields(shadow)
-    top = max(0, top)
-
-    fields = as_dict(effective.get("fields"))
-    title_text = f"{display_name(effective.get('key'))}  {display_name(fields.get('summary'))}".rstrip()
-    modified_marker = " modified" if has_shadow_changes(shadow) else ""
-    title = (
-        f"{key} [{mode}{modified_marker}]  "
-        "(Tab fields, Enter edit, x expand, c comment, V parent, O other, r revert, p push, Esc back, q quit)"
-    )
-    stdscr.addnstr(0, 0, title, width - 1, curses.A_BOLD | curses.A_UNDERLINE)
-    row = 2
-    hierarchy = [line for line in hierarchy_section(jira_dir, effective, component_field) if line]
-    summary_attr = curses.A_REVERSE if selected == 0 else curses.A_BOLD
-    if hierarchy:
-        current_key = display_name(effective.get("key"))
-        for line in hierarchy:
-            is_current_line = (
-                line == f"|- {current_key}"
-                or line.startswith(f"|- {current_key} ")
-                or line == f"Epic: {issue_identity(effective)}"
-            )
-            attr = summary_attr if is_current_line else (curses.A_BOLD if row == 1 else curses.A_NORMAL)
-            stdscr.addnstr(row, 0, line, width - 1, attr)
-            row += 1
-    else:
-        stdscr.addnstr(row, 0, title_text, width - 1, summary_attr)
-        row += 1
-    if row < height - 1:
-        row += 1
-    if shadow is not None:
-        summary = format_shadow_summary(shadow)
-        for line in summary[: min(len(summary), 4)]:
-            stdscr.addnstr(row, 0, line, width - 1)
-            row += 1
-    body_lines = detail_body_line_segments(
-        effective,
-        component_field,
-        rows,
-        selected,
-        editable_fields,
-        modified_fields,
-        height,
-        width,
-        show_other_fields,
-        expanded_text_fields or set(),
-    )
-    body_height = max(1, height - row - 1)
-    top = min(top, max(0, len(body_lines) - body_height))
-    for line in body_lines[top : top + body_height]:
-        draw_detail_segment_line(stdscr, row, line, width)
-        row += 1
-    if message:
-        stdscr.addnstr(height - 1, 0, message, width - 1, curses.A_REVERSE)
-    return top
-
-
-def detail_body_lines(
-    issue: dict[str, Any],
-    component_field: str | None,
-    rows: list[tuple[str, str, str]],
-    selected: int,
-    editable_fields: set[str],
-    modified_fields: set[str],
-    height: int,
-    width: int,
-    show_other_fields: bool,
-    expanded_text_fields: set[str] | None = None,
-) -> list[tuple[str, int]]:
-    return flatten_detail_lines(
-        detail_body_line_segments(
-            issue,
-            component_field,
-            rows,
-            selected,
-            editable_fields,
-            modified_fields,
-            height,
-            width,
-            show_other_fields,
-            expanded_text_fields,
-        )
-    )
-
-
-def detail_body_line_segments(
-    issue: dict[str, Any],
-    component_field: str | None,
-    rows: list[tuple[str, str, str]],
-    selected: int,
-    editable_fields: set[str],
-    modified_fields: set[str],
-    height: int,
-    width: int,
-    show_other_fields: bool,
-    expanded_text_fields: set[str] | None = None,
-) -> list[DetailLine]:
-    lines = detail_field_body_lines(
-        rows,
-        0,
-        selected,
-        editable_fields,
-        modified_fields,
-        height,
-        width,
-        expanded_text_fields or set(),
-    )
-    other_rows = other_field_rows(issue, component_field)
-    if other_rows:
-        lines.append([("", curses.A_NORMAL)])
-        suffix = "" if show_other_fields else f" ({len(other_rows)} hidden)"
-        lines.append([(f"Other fields{suffix}", curses.A_BOLD)])
-        if not show_other_fields:
-            lines.append([("  Press O to expand", curses.A_NORMAL)])
-        else:
-            lines.extend([(f"  {field}: {value}", curses.A_NORMAL)] for field, value in other_rows)
-    return lines
-
-
-def detail_field_body_lines(
-    rows: list[tuple[str, str, str]],
-    start_index: int,
-    selected: int,
-    editable_fields: set[str],
-    modified_fields: set[str],
-    height: int,
-    width: int,
-    expanded_text_fields: set[str] | None = None,
-) -> list[DetailLine]:
-    rendered: list[DetailLine] = []
-    visible_rows = [(label, field, value) for label, field, value in rows if field != "summary"]
-    label_width = max(
-        (len(modified_label(label, field, modified_fields)) for label, field, _ in visible_rows),
-        default=12,
-    )
-    pending_cell: tuple[int, str] | None = None
-    cell_width = max(20, (width - 3) // 2)
-    for offset, (label, field, value) in enumerate(rows):
-        if field == "summary":
-            continue
-        index = start_index + offset
-        if field in {"description", "comments"}:
-            if pending_cell is not None:
-                rendered.append(
-                    [
-                        (
-                            truncate_cell(pending_cell[1], max(1, cell_width)),
-                            detail_line_attr(pending_cell[0], selected),
-                        )
-                    ]
-                )
-                pending_cell = None
-            rendered.extend(
-                detail_text_block_lines(
-                    index,
-                    label,
-                    field,
-                    value,
-                    field in editable_fields,
-                    modified_fields,
-                    selected,
-                    width,
-                    height,
-                    field in (expanded_text_fields or set()),
-                )
-            )
-            if offset + 1 < len(rows):
-                rendered.append([("", curses.A_NORMAL)])
-            continue
-
-        cell = (index, detail_cell_text(label, field, value, editable_fields, modified_fields, label_width))
-        if pending_cell is None:
-            pending_cell = cell
-            continue
-        left = truncate_cell(pending_cell[1], max(1, cell_width))
-        right = truncate_cell(cell[1], max(1, cell_width))
-        rendered.append(
-            [
-                (f"{left:<{cell_width}}", detail_line_attr(pending_cell[0], selected)),
-                ("  ", curses.A_NORMAL),
-                (right, detail_line_attr(cell[0], selected)),
-            ]
-        )
-        pending_cell = None
-    if pending_cell is not None:
-        rendered.append(
-            [(truncate_cell(pending_cell[1], max(1, cell_width)), detail_line_attr(pending_cell[0], selected))]
-        )
-    return rendered
-
-
-def detail_line_attr(index: int, selected: int) -> int:
-    return curses.A_REVERSE if index == selected else curses.A_NORMAL
-
-
-def detail_text_block_lines(
-    index: int,
-    label: str,
-    field: str,
-    value: str,
-    editable: bool,
-    modified_fields: set[str],
-    selected: int,
-    width: int,
-    height: int,
-    expanded: bool = False,
-) -> list[DetailLine]:
-    marker = ">" if editable else " "
-    attr = curses.A_REVERSE if index == selected and editable else curses.A_NORMAL
-    rendered = [[(f"{marker} {modified_label(label, field, modified_fields)}", attr)]]
-    lines = wrap_lines(value.splitlines() or ["(empty)"], max(1, width - 5))
-    limit = len(lines) if expanded else text_block_preview_limit(field, height)
-    rendered.extend([(f"    {line}", curses.A_NORMAL)] for line in lines[:limit])
-    remaining = len(lines) - limit
-    if remaining > 0:
-        rendered.append([(f"    ... {remaining} more lines (x expand)", curses.A_DIM)])
-    return rendered
-
-
-def flatten_detail_lines(lines: list[DetailLine]) -> list[tuple[str, int]]:
-    flattened: list[tuple[str, int]] = []
-    for line in lines:
-        text = "".join(segment for segment, _attr in line).rstrip()
-        attr = next((segment_attr for segment, segment_attr in line if segment_attr != curses.A_NORMAL), curses.A_NORMAL)
-        flattened.append((text, attr))
-    return flattened
-
-
-def draw_detail_segment_line(stdscr: Any, row: int, line: DetailLine, width: int) -> None:
-    column = 0
-    limit = max(1, width - 1)
-    for text, attr in line:
-        if column >= limit:
-            break
-        remaining = limit - column
-        visible = truncate_cell(text, remaining)
-        if visible:
-            stdscr.addnstr(row, column, visible, remaining, attr)
-            column += len(visible)
-
-
-def draw_detail_rows(
-    stdscr: Any,
-    rows: list[tuple[str, str, str]],
-    start_index: int,
-    selected: int,
-    editable_fields: set[str],
-    modified_fields: set[str],
-    row: int,
-    height: int,
-    width: int,
-    expanded_text_fields: set[str] | None = None,
-) -> int:
-    visible_rows = [(label, field, value) for label, field, value in rows if field != "summary"]
-    label_width = max(
-        (len(modified_label(label, field, modified_fields)) for label, field, _ in visible_rows),
-        default=12,
-    )
-    pending_cell: tuple[int, str] | None = None
-    cell_width = max(20, (width - 3) // 2)
-    for offset, (label, field, value) in enumerate(rows):
-        if field == "summary":
-            continue
-        index = start_index + offset
-        if row >= height - 1:
-            break
-        if field in {"description", "comments"}:
-            if pending_cell is not None:
-                draw_detail_cell(stdscr, row, 0, cell_width, pending_cell[0], pending_cell[1], selected)
-                pending_cell = None
-                row += 1
-            row = draw_description_block(
-                stdscr,
-                row,
-                height,
-                width,
-                index,
-                label,
-                field,
-                value,
-                field in editable_fields,
-                modified_fields,
-                selected,
-                field in (expanded_text_fields or set()),
-            )
-            if offset + 1 < len(rows) and row < height - 1:
-                row += 1
-            continue
-
-        cell = (index, detail_cell_text(label, field, value, editable_fields, modified_fields, label_width))
-        if pending_cell is None:
-            pending_cell = cell
-            continue
-        draw_detail_cell(stdscr, row, 0, cell_width, pending_cell[0], pending_cell[1], selected)
-        draw_detail_cell(stdscr, row, cell_width + 2, cell_width, cell[0], cell[1], selected)
-        pending_cell = None
-        row += 1
-    if pending_cell is not None and row < height - 1:
-        draw_detail_cell(stdscr, row, 0, cell_width, pending_cell[0], pending_cell[1], selected)
-        row += 1
-    return row
-
-
-def detail_cell_text(
-    label: str,
-    field: str,
-    value: str,
-    editable_fields: set[str],
-    modified_fields: set[str],
-    label_width: int,
-) -> str:
-    marker = ">" if field in editable_fields else " "
-    label = modified_label(label, field, modified_fields)
-    clean_value = value.replace("\n", " ")
-    return f"{marker} {label:<{label_width}}  {clean_value}"
-
-
-def modified_label(label: str, field: str, modified_fields: set[str]) -> str:
-    return f"{label}*" if field in modified_fields else label
-
-
-def draw_detail_cell(
-    stdscr: Any,
-    row: int,
-    column: int,
-    width: int,
-    index: int,
-    text: str,
-    selected: int,
-) -> None:
-    attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-    stdscr.addnstr(row, column, truncate_cell(text, max(1, width)), max(1, width), attr)
-
-
-def draw_description_block(
-    stdscr: Any,
-    row: int,
-    height: int,
-    width: int,
-    index: int,
-    label: str,
-    field: str,
-    value: str,
-    editable: bool,
-    modified_fields: set[str],
-    selected: int,
-    expanded: bool = False,
-) -> int:
-    if row >= height - 1:
-        return row
-    marker = ">" if editable else " "
-    attr = curses.A_REVERSE if index == selected and editable else curses.A_NORMAL
-    stdscr.addnstr(row, 0, f"{marker} {modified_label(label, field, modified_fields)}", width - 1, attr)
-    row += 1
-    lines = wrap_lines(value.splitlines() or ["(empty)"], max(1, width - 5))
-    limit = len(lines) if expanded else text_block_preview_limit(field, height)
-    for line in lines[:limit]:
-        if row >= height - 1:
-            break
-        stdscr.addnstr(row, 4, line, width - 5)
-        row += 1
-    remaining = len(lines) - limit
-    if remaining > 0 and row < height - 1:
-        stdscr.addnstr(row, 4, f"... {remaining} more lines (x expand)", width - 5, curses.A_DIM)
-        row += 1
-    return row
-
-
-def text_block_preview_limit(field: str, height: int) -> int:
-    configured = COMMENTS_PREVIEW_LINES if field == "comments" else DESCRIPTION_PREVIEW_LINES
-    return max(2, min(configured, max(2, height // 3)))
-
-
-def draw_detail_text(
-    stdscr: Any,
-    jira_dir: Path,
-    key: str,
-    component_field: str | None,
-    mode: str,
-    top: int,
-    height: int,
-    width: int,
-    message: str | None = None,
-) -> int:
-    lines = wrap_lines(
-        format_work_item(jira_dir, key, component_field=component_field, mode=mode).splitlines(),
-        width - 1,
-    )
-    top = min(top, max(0, len(lines) - max(1, height - 2)))
-    title = f"{key} [{mode}]  (e edit, r revert, p push, s shadow, o original, d diff, v view, h help, Esc back, q quit)"
-    stdscr.addnstr(0, 0, title, width - 1, curses.A_REVERSE)
-    for row, line in enumerate(lines[top : top + max(1, height - 2)], start=1):
-        stdscr.addnstr(row, 0, line, width - 1)
-    if message:
-        stdscr.addnstr(height - 1, 0, message, width - 1, curses.A_REVERSE)
-    return top

@@ -6,13 +6,17 @@ from typing import Any
 from jira_workbench.shadow import (
     add_comment,
     commit_shadow,
+    delete_comment,
+    edit_comment,
     load_shadow,
     push_shadows,
+    remove_local_comment,
     render_diff,
     set_status_change,
     set_field,
     shadow_path,
     shadow_status,
+    undelete_comment,
 )
 from jira_workbench.sync import SyncConfig, read_json, sync_project, write_json
 from test_sync import FakeJiraClient
@@ -22,6 +26,8 @@ class PushJiraClient:
     def __init__(self, updated: str | dict[str, str]) -> None:
         self.updated = updated
         self.add_comment_calls: list[tuple[str, str]] = []
+        self.edit_comment_calls: list[tuple[str, str, str]] = []
+        self.deleted_paths: list[str] = []
         self.issue_update_calls: list[tuple[str, dict[str, Any], dict[Any, Any] | None, bool | None]] = []
         self.refreshed_comments: dict[str, Any] = {}
         self.refreshed_issues: dict[str, Any] = {}
@@ -71,6 +77,22 @@ class PushJiraClient:
     def issue_add_comment(self, issue_key: str, comment: str, visibility: dict[str, Any] | None = None) -> None:
         self.add_comment_calls.append((issue_key, comment))
 
+    def issue_edit_comment(
+        self,
+        issue_key: str,
+        comment_id: str,
+        comment: str,
+        visibility: dict[str, Any] | None = None,
+        notify_users: bool = True,
+    ) -> None:
+        self.edit_comment_calls.append((issue_key, comment_id, comment))
+
+    def resource_url(self, resource: str, api_root: str = "rest/api", api_version: str | int = "latest") -> str:
+        return f"https://example.atlassian.net/{api_root}/{api_version}/{resource}"
+
+    def delete(self, path: str, params: dict[str, Any] | None = None) -> None:
+        self.deleted_paths.append(path)
+
     def update_issue_field(self, key: str, fields: dict[str, Any], notify_users: bool = True) -> None:
         self.update_calls.append((key, fields, notify_users))
 
@@ -109,6 +131,81 @@ def test_shadow_set_comment_diff_and_commit(tmp_path: Path) -> None:
     assert "+ [working] Local comment" in diff
     assert rows[0]["key"] == "SAT-1"
     assert rows[0]["state"] == "committed"
+
+
+def test_edit_comment_mutates_local_unpushed_comment_in_place(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    add_comment(jira_dir, "SAT-1", "Original")
+    local_id = load_shadow(jira_dir, "SAT-1")["comments"][0]["id"]
+
+    edit_comment(jira_dir, "SAT-1", local_id, "Edited before push")
+
+    shadow = load_shadow(jira_dir, "SAT-1")
+    assert shadow["comments"][0]["body"] == "Edited before push"
+    assert "commentEdits" not in shadow
+
+
+def test_edit_comment_queues_edit_for_already_synced_remote_comment(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+
+    edit_comment(jira_dir, "SAT-1", "10001", "New body")
+
+    shadow = load_shadow(jira_dir, "SAT-1")
+    assert shadow["commentEdits"] == {"10001": "New body"}
+    assert shadow["comments"] == []
+
+
+def test_remove_local_comment_discards_unpushed_comment(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    add_comment(jira_dir, "SAT-1", "Throwaway")
+    local_id = load_shadow(jira_dir, "SAT-1")["comments"][0]["id"]
+
+    remove_local_comment(jira_dir, "SAT-1", local_id)
+
+    assert load_shadow(jira_dir, "SAT-1")["comments"] == []
+
+
+def test_delete_comment_queues_deletion_and_clears_pending_edit(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    edit_comment(jira_dir, "SAT-1", "10001", "edited first")
+
+    delete_comment(jira_dir, "SAT-1", "10001")
+
+    shadow = load_shadow(jira_dir, "SAT-1")
+    assert shadow["commentDeletes"] == ["10001"]
+    assert "10001" not in shadow["commentEdits"]
+
+
+def test_undelete_comment_removes_pending_deletion(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    delete_comment(jira_dir, "SAT-1", "10001")
+
+    undelete_comment(jira_dir, "SAT-1", "10001")
+
+    assert load_shadow(jira_dir, "SAT-1")["commentDeletes"] == []
+
+
+def test_push_applies_comment_edits_and_deletes(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    edit_comment(jira_dir, "SAT-1", "10001", "Edited body")
+    delete_comment(jira_dir, "SAT-1", "10002")
+    commit_shadow(jira_dir, "SAT-1")
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+    client.refreshed_issues["SAT-1"] = {
+        "key": "SAT-1",
+        "fields": {
+            "updated": "2026-07-22T10:30:00.000+0000",
+            "components": [{"name": "api-team"}],
+            "customfield_10071": {"value": "helm-chart"},
+        },
+    }
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    assert client.edit_comment_calls == [("SAT-1", "10001", "Edited body")]
+    assert client.deleted_paths == ["https://example.atlassian.net/rest/api/latest/issue/SAT-1/comment/10002"]
+    assert load_shadow(jira_dir, "SAT-1") is None
 
 
 def test_push_skips_remote_changed_item(tmp_path: Path) -> None:

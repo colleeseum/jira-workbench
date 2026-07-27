@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import curses
 import json
 import os
 import re
@@ -55,7 +54,44 @@ from .shadow import (
     unset_field,
 )
 from .sync import SyncConfig, SyncError, sync_project
-from .view import ViewError, detailed_shadow_report_lines, format_components, format_work_item, interactive_view
+from .view import ViewError, detailed_shadow_report_lines, format_components, format_work_item
+
+
+def open_interactive_view(
+    jira_dir: Path,
+    *,
+    component_field: str | None = None,
+    component: str | None = None,
+    pattern: str | None = None,
+    active: bool = True,
+    jira_url: str | None = None,
+    jira_email: str | None = None,
+    jira_api_token: str | None = None,
+    initial_key: str | None = None,
+    initial_mode: str = "shadow",
+    swimlane: str | None = None,
+    project: str | None = None,
+    versions_filter: str | None = None,
+    preview_lines: int | None = None,
+) -> None:
+    from .tui.app import run_view as run_textual_view
+
+    run_textual_view(
+        jira_dir,
+        component_field=component_field,
+        component=component,
+        pattern=pattern,
+        active=active,
+        swimlane=swimlane,
+        initial_key=initial_key,
+        initial_mode=initial_mode,
+        jira_url=jira_url,
+        jira_email=jira_email,
+        jira_api_token=jira_api_token,
+        project=project,
+        versions_filter=versions_filter,
+        preview_lines=preview_lines,
+    )
 
 
 def sync_progress_printer(stream: object = sys.stderr) -> Callable[[str], None]:
@@ -86,8 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument(
         "--config",
-        default=str(DEFAULT_CONFIG_PATH),
-        help="Configuration file path. Default: ~/.jira-wb.conf",
+        default=None,
+        help="Configuration file path. Default: ~/.config/jira-wb/config.toml",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -124,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-r",
         "--read-only",
         action="store_true",
-        help="Print a work item to stdout instead of opening the curses view",
+        help="Print a work item to stdout instead of opening the interactive view",
     )
     view_parser.add_argument(
         "--all",
@@ -306,8 +342,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    config_path = Path(args.config) if args.config is not None else DEFAULT_CONFIG_PATH
     try:
-        config = load_config(Path(args.config))
+        config = load_config(config_path)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -330,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             print(
                 "error: missing required configuration: "
-                f"{', '.join(missing)}. Set them in ~/.jira-wb.conf or pass flags.",
+                f"{', '.join(missing)}. Set them in ~/.config/jira-wb/config.toml or pass flags.",
                 file=sys.stderr,
             )
             return 2
@@ -371,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             print(
                 "error: missing required configuration: "
-                f"{', '.join(missing)}. Set them in ~/.jira-wb.conf or pass flags.",
+                f"{', '.join(missing)}. Set them in ~/.config/jira-wb/config.toml or pass flags.",
                 file=sys.stderr,
             )
             return 2
@@ -387,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         if jira_dir is None:
             print(
                 "error: missing required configuration: jira_dir. "
-                "Set it in ~/.jira-wb.conf or pass --jira-dir.",
+                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
                 file=sys.stderr,
             )
             return 2
@@ -406,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                 else:
-                    interactive_view(
+                    open_interactive_view(
                         Path(str(jira_dir)),
                         component_field=str(component_field) if component_field else None,
                         component=str(view_component) if view_component else None,
@@ -418,12 +455,15 @@ def main(argv: list[str] | None = None) -> int:
                         initial_key=args.key,
                         initial_mode=mode,
                         swimlane=str(view_swimlane),
+                        project=str(config.project) if config.project else None,
+                        versions_filter=str(config.versions_filter) if config.versions_filter else None,
+                        preview_lines=config.view_preview_lines,
                     )
             else:
                 if args.diff or args.original:
                     print("error: --diff and --original require a work item key", file=sys.stderr)
                     return 2
-                interactive_view(
+                open_interactive_view(
                     Path(str(jira_dir)),
                     component_field=str(component_field) if component_field else None,
                     component=str(view_component) if view_component else None,
@@ -433,6 +473,9 @@ def main(argv: list[str] | None = None) -> int:
                     jira_email=str(config.jira_email) if config.jira_email else None,
                     jira_api_token=str(config.jira_api_token) if config.jira_api_token else None,
                     swimlane=str(view_swimlane),
+                    project=str(config.project) if config.project else None,
+                    versions_filter=str(config.versions_filter) if config.versions_filter else None,
+                    preview_lines=config.view_preview_lines,
                 )
         except ViewError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -456,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         if jira_dir is None:
             print(
                 "error: missing required configuration: jira_dir. "
-                "Set it in ~/.jira-wb.conf or pass --jira-dir.",
+                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
                 file=sys.stderr,
             )
             return 2
@@ -485,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
         if jira_dir is None:
             print(
                 "error: missing required configuration: jira_dir. "
-                "Set it in ~/.jira-wb.conf or pass --jira-dir.",
+                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
                 file=sys.stderr,
             )
             return 2
@@ -509,7 +552,7 @@ def main(argv: list[str] | None = None) -> int:
         if jira_dir is None:
             print(
                 "error: missing required configuration: jira_dir. "
-                "Set it in ~/.jira-wb.conf or pass --jira-dir.",
+                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
                 file=sys.stderr,
             )
             return 2
@@ -555,7 +598,7 @@ def api_client_from_config(
     if missing:
         raise MetadataError(
             "missing required configuration for Jira API: "
-            f"{', '.join(missing)}. Set them in ~/.jira-wb.conf or pass flags."
+            f"{', '.join(missing)}. Set them in ~/.config/jira-wb/config.toml or pass flags."
         )
     return str(project), jira_api_client(
         JiraApiConfig(url=str(jira_url), email=str(jira_email), api_token=str(jira_api_token))
@@ -724,14 +767,16 @@ def run_meta(
     component_field: object | None = None,
 ) -> int:
     if args.meta_command is None:
-        return interactive_meta(
+        from .tui.app import run_meta_app
+
+        return run_meta_app(
             jira_dir,
-            project,
-            jira_url,
-            jira_email,
-            jira_api_token,
-            str(versions_filter) if versions_filter else None,
-            str(component_field) if component_field else None,
+            project=str(project) if project else None,
+            jira_url=str(jira_url) if jira_url else None,
+            jira_email=str(jira_email) if jira_email else None,
+            jira_api_token=str(jira_api_token) if jira_api_token else None,
+            versions_filter=str(versions_filter) if versions_filter else None,
+            component_field=str(component_field) if component_field else None,
         )
 
     if args.meta_command == "refresh":
@@ -1107,35 +1152,6 @@ def delete_meta_version(
     return f"{detail}\nrefreshed {len(cache.get('versions', []))} versions\n"
 
 
-def prompt_text(stdscr: curses.window, prompt: str) -> str | None:
-    height, width = stdscr.getmaxyx()
-    curses.echo()
-    try:
-        stdscr.move(height - 1, 0)
-        stdscr.clrtoeol()
-        stdscr.addnstr(height - 1, 0, prompt, max(1, width - 1))
-        value = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(1, width - len(prompt) - 1))
-    finally:
-        curses.noecho()
-    text = value.decode(errors="replace").strip()
-    return text or None
-
-
-def confirm_text(stdscr: curses.window, lines: list[str], expected: str) -> bool:
-    stdscr.erase()
-    height, width = stdscr.getmaxyx()
-    for offset, line in enumerate(lines[: max(0, height - 2)]):
-        attr = curses.A_BOLD if offset == 0 else curses.A_NORMAL
-        stdscr.addnstr(offset, 0, line, max(1, width - 1), attr)
-    stdscr.refresh()
-    curses.curs_set(1)
-    try:
-        answer = prompt_text(stdscr, f"Type {expected} to confirm: ")
-    finally:
-        curses.curs_set(0)
-    return answer == expected
-
-
 def load_meta_versions(
     jira_dir: Path,
     project: object | None,
@@ -1157,14 +1173,6 @@ def version_identifier(version: dict[str, object]) -> str:
     if isinstance(value, str) and value:
         return value
     return version_name(version)
-
-
-def version_row(version: dict[str, object]) -> str:
-    name = version_name(version)
-    status = "released" if version.get("released") else "unreleased"
-    archived = " archived" if version.get("archived") else ""
-    version_id = str(version.get("id") or "")
-    return f"{name:<38} {status:<10}{archived:<10} {version_id}"
 
 
 def version_filter_text(version: dict[str, object]) -> str:
@@ -1189,334 +1197,6 @@ def filter_versions(
     except re.error as exc:
         return versions, f"invalid regex: {exc}"
     return [version for version in versions if regex.search(version_filter_text(version))], None
-
-
-def render_version_list(
-    stdscr: curses.window,
-    versions: list[dict[str, object]],
-    selected: int,
-    message: str,
-    pattern: str | None,
-) -> None:
-    stdscr.erase()
-    height, width = stdscr.getmaxyx()
-    title = "Versions  (j/k move, / filter, \\ clear, e rename, r release, a archive, d delete, n new, q back)"
-    if pattern:
-        title += f"  [filter={pattern}]"
-    stdscr.addnstr(0, 0, title, max(1, width - 1), curses.A_BOLD)
-    stdscr.addnstr(2, 0, f"{'name':<38} {'state':<10} {'archive':<10} id", max(1, width - 1), curses.A_BOLD)
-    visible_height = max(1, height - 6)
-    start = min(max(0, selected - visible_height + 1), max(0, len(versions) - visible_height))
-    for offset, version in enumerate(versions[start : start + visible_height]):
-        index = start + offset
-        attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-        stdscr.addnstr(offset + 3, 0, version_row(version), max(1, width - 1), attr)
-    if message:
-        stdscr.addnstr(height - 2, 0, message.splitlines()[0], max(1, width - 1))
-    stdscr.refresh()
-
-
-def interactive_versions(
-    stdscr: curses.window,
-    jira_dir: Path,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-    default_filter: str | None = None,
-) -> str:
-    try:
-        versions = load_meta_versions(jira_dir, project, jira_url, jira_email, jira_api_token)
-    except MetadataError as exc:
-        return f"error: {exc}"
-    selected = 0
-    message = ""
-    current_filter = default_filter
-    while True:
-        visible_versions, filter_error = filter_versions(versions, current_filter)
-        if filter_error:
-            message = filter_error
-        if visible_versions:
-            selected = min(selected, len(visible_versions) - 1)
-        else:
-            selected = 0
-        render_version_list(stdscr, visible_versions, selected, message, current_filter)
-        key = stdscr.getch()
-        if key in (ord("q"), 27, 3):
-            return message or "version list closed"
-        if key in (curses.KEY_DOWN, ord("j")) and visible_versions:
-            selected = min(len(visible_versions) - 1, selected + 1)
-            continue
-        if key in (curses.KEY_UP, ord("k")) and visible_versions:
-            selected = max(0, selected - 1)
-            continue
-        if key == ord("/"):
-            curses.curs_set(1)
-            try:
-                value = prompt_text(stdscr, "Version regex filter: ")
-            finally:
-                curses.curs_set(0)
-            current_filter = value
-            selected = 0
-            message = "filter updated" if value else "filter cleared"
-            continue
-        if key == ord("\\"):
-            current_filter = None
-            selected = 0
-            message = "filter cleared"
-            continue
-        if key == ord("n"):
-            curses.curs_set(1)
-            try:
-                name = prompt_text(stdscr, "Add version: ")
-            finally:
-                curses.curs_set(0)
-            if not name:
-                message = "add cancelled"
-                continue
-            try:
-                message = add_meta_version(jira_dir, name, project, jira_url, jira_email, jira_api_token)
-                versions = load_meta_versions(jira_dir, project, jira_url, jira_email, jira_api_token)
-            except MetadataError as exc:
-                message = f"error: {exc}"
-            continue
-        if not visible_versions:
-            message = "no versions found"
-            continue
-        current = visible_versions[selected]
-        identifier = version_identifier(current)
-        current_name = version_name(current)
-        if key == ord("e"):
-            curses.curs_set(1)
-            try:
-                new_name = prompt_text(stdscr, f"Rename {current_name} to: ")
-            finally:
-                curses.curs_set(0)
-            if not new_name:
-                message = "rename cancelled"
-                continue
-            try:
-                message = rename_meta_version(
-                    jira_dir, identifier, new_name, project, jira_url, jira_email, jira_api_token
-                )
-                versions = load_meta_versions(jira_dir, project, jira_url, jira_email, jira_api_token)
-            except MetadataError as exc:
-                message = f"error: {exc}"
-            continue
-        if key == ord("r"):
-            curses.curs_set(1)
-            try:
-                release_date = prompt_text(stdscr, f"Release date for {current_name} (optional): ")
-            finally:
-                curses.curs_set(0)
-            try:
-                message = release_meta_version(
-                    jira_dir, identifier, release_date, project, jira_url, jira_email, jira_api_token
-                )
-                versions = load_meta_versions(jira_dir, project, jira_url, jira_email, jira_api_token)
-            except MetadataError as exc:
-                message = f"error: {exc}"
-            continue
-        if key == ord("a"):
-            confirmed = confirm_text(
-                stdscr,
-                [
-                    "Archive Jira version",
-                    "",
-                    f"Version: {current_name}",
-                    f"ID: {identifier}",
-                    "",
-                    "Archived versions are hidden from normal version selection in Jira.",
-                ],
-                "archive",
-            )
-            if not confirmed:
-                message = "archive cancelled"
-                continue
-            try:
-                message = archive_meta_version(jira_dir, identifier, project, jira_url, jira_email, jira_api_token)
-                versions = load_meta_versions(jira_dir, project, jira_url, jira_email, jira_api_token)
-            except MetadataError as exc:
-                message = f"error: {exc}"
-            continue
-        if key == ord("d"):
-            confirmed = confirm_text(
-                stdscr,
-                [
-                    "Delete Jira version",
-                    "",
-                    f"Version: {current_name}",
-                    f"ID: {identifier}",
-                    "",
-                    "This deletes the version from Jira.",
-                    "Issues using this fixVersion will have it removed unless you choose a move target next.",
-                ],
-                "delete",
-            )
-            if not confirmed:
-                message = "delete cancelled"
-                continue
-            curses.curs_set(1)
-            try:
-                move_fix_to = prompt_text(stdscr, "Move fixVersion to (optional): ")
-            finally:
-                curses.curs_set(0)
-            try:
-                message = delete_meta_version(
-                    jira_dir,
-                    identifier,
-                    move_fix_to,
-                    project,
-                    jira_url,
-                    jira_email,
-                    jira_api_token,
-                )
-                versions = load_meta_versions(jira_dir, project, jira_url, jira_email, jira_api_token)
-            except MetadataError as exc:
-                message = f"error: {exc}"
-            continue
-
-
-def render_meta_screen(
-    stdscr: curses.window,
-    actions: list[tuple[str, str]],
-    selected: int,
-    output: str,
-    show_help: bool,
-) -> None:
-    stdscr.erase()
-    height, width = stdscr.getmaxyx()
-    title = "Jira metadata  (j/k move, Enter open, n new, e edit, r release, a archive, d delete, h help, q quit)"
-    stdscr.addnstr(0, 0, title, max(1, width - 1), curses.A_BOLD)
-
-    if show_help:
-        lines = [
-            "Help",
-            "",
-            "j/k or arrows  Move selection",
-            "Enter          Show selected metadata",
-            "n              Add selected metadata type",
-            "e              Rename selected version",
-            "r              Release selected version",
-            "a              Archive selected version",
-            "d              Delete selected version",
-            "h              Toggle help",
-            "q or Esc       Quit",
-        ]
-    else:
-        lines = []
-        for index, (label, description) in enumerate(actions):
-            prefix = "> " if index == selected else "  "
-            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-            stdscr.addnstr(index + 2, 0, f"{prefix}{label:<12} {description}", max(1, width - 1), attr)
-        start = len(actions) + 3
-        lines = output.splitlines() or ["Press Enter to view metadata."]
-        for offset, line in enumerate(lines[: max(0, height - start - 1)]):
-            stdscr.addnstr(start + offset, 0, line, max(1, width - 1))
-
-    if show_help:
-        for offset, line in enumerate(lines[: max(0, height - 2)]):
-            stdscr.addnstr(offset + 2, 0, line, max(1, width - 1))
-    stdscr.refresh()
-
-
-def interactive_meta(
-    jira_dir: Path,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-    versions_filter: str | None,
-    component_field: str | None,
-) -> int:
-    actions = [
-        ("Versions", "List fix versions"),
-        ("Components", "List effective workbench components"),
-    ]
-
-    def run(stdscr: curses.window) -> int:
-        curses.curs_set(0)
-        selected = 0
-        output = ""
-        show_help = False
-        while True:
-            render_meta_screen(stdscr, actions, selected, output, show_help)
-            key = stdscr.getch()
-            if key in (ord("q"), 27, 3):
-                return 0
-            if key in (ord("h"),):
-                show_help = not show_help
-                continue
-            if key in (curses.KEY_DOWN, ord("j")):
-                selected = min(len(actions) - 1, selected + 1)
-                show_help = False
-                continue
-            if key in (curses.KEY_UP, ord("k")):
-                selected = max(0, selected - 1)
-                show_help = False
-                continue
-            if key in (10, 13, curses.KEY_ENTER):
-                show_help = False
-                try:
-                    if selected == 0:
-                        output = interactive_versions(
-                            stdscr,
-                            jira_dir,
-                            project,
-                            jira_url,
-                            jira_email,
-                            jira_api_token,
-                            versions_filter,
-                        )
-                    else:
-                        output = meta_components_output(
-                            jira_dir, project, component_field, jira_url, jira_email, jira_api_token
-                        )
-                except MetadataError as exc:
-                    output = f"error: {exc}"
-                continue
-            if key == ord("n"):
-                show_help = False
-                label = "version" if selected == 0 else "component"
-                curses.curs_set(1)
-                try:
-                    name = prompt_text(stdscr, f"Add {label}: ")
-                finally:
-                    curses.curs_set(0)
-                if not name:
-                    output = "add cancelled"
-                    continue
-                try:
-                    if selected == 0:
-                        output = add_meta_version(
-                            jira_dir, name, project, jira_url, jira_email, jira_api_token
-                        )
-                    elif component_field and component_field != "components":
-                        curses.curs_set(1)
-                        try:
-                            context_id = prompt_text(stdscr, f"Context id for {component_field}: ")
-                        finally:
-                            curses.curs_set(0)
-                        output = add_meta_component_field_option(
-                            jira_dir,
-                            name,
-                            project,
-                            component_field,
-                            context_id,
-                            jira_url,
-                            jira_email,
-                            jira_api_token,
-                        )
-                    else:
-                        output = add_meta_component(
-                            jira_dir, name, project, jira_url, jira_email, jira_api_token
-                        )
-                except MetadataError as exc:
-                    output = f"error: {exc}"
-                continue
-        return 0
-
-    return curses.wrapper(run)
 
 
 def run_shadow(args: argparse.Namespace, jira_dir: Path, config: object) -> int:
@@ -1598,7 +1278,7 @@ def run_shadow(args: argparse.Namespace, jira_dir: Path, config: object) -> int:
         if not (jira_url and jira_email and jira_api_token):
             print(
                 "error: missing required Jira API configuration: "
-                "jira_url, jira_email, jira_api_token. Set them in ~/.jira-wb.conf.",
+                "jira_url, jira_email, jira_api_token. Set them in ~/.config/jira-wb/config.toml.",
                 file=sys.stderr,
             )
             return 2

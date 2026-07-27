@@ -33,7 +33,7 @@ jira-wb --help
 
 ## Usage
 
-Create `~/.jira-wb.conf`:
+Create `~/.config/jira-wb/config.toml`:
 
 ```toml
 project = "SAT"
@@ -48,6 +48,7 @@ component_field = "customfield_10071"
 [view]
 component = "helm-chart"
 filter = "prometheus"
+preview_lines = 10
 
 [versions]
 filter = "helm-chart-sa 3\\.[45]"
@@ -112,9 +113,9 @@ Project fix versions are cached under `jira/meta/versions.json`. Project compone
 
 `jira-wb meta version-add` and `jira-wb meta component-add` write directly to Jira through the Python API and then refresh the corresponding local cache. These project metadata operations do not use the issue shadow workflow.
 
-Without a subcommand, `jira-wb meta` opens a curses metadata browser where Enter lists versions or components and `a` adds the selected metadata type.
+Without a subcommand, `jira-wb meta` opens an interactive metadata browser (built with [Textual](https://textual.textualize.io/), with full mouse support): Enter opens the fix-versions browser or shows component metadata, `n` adds a version or component. This same screen is also reachable with `M` from inside `jira-wb view`, so you don't need to leave your browsing session to check or edit metadata.
 
-The `[versions].filter` setting applies to the curses version list. It uses Python regular expression syntax, case-insensitive. It is not a full PCRE engine.
+The `[versions].filter` setting applies to the fix-versions browser's `/` filter. It uses Python regular expression syntax, case-insensitive. It is not a full PCRE engine.
 
 View synced work items in the terminal:
 
@@ -129,7 +130,7 @@ jira-wb view SAT-1 --original
 jira-wb view SAT-1 --diff
 ```
 
-Without a work item key, `jira-wb view` opens a curses browser inspired by mail-style index navigation. Active-only filtering is enabled by default; pass `--all` to include closed, done, and resolved items. Configure `[view].component` and `[view].filter` to choose the default interactive subset; pass `--component` or `--filter` to override them for one run. Use `h` for full help, `j`/`k` or arrow keys to move, Enter to open an item, `/` to search rows vi-style such as `SAT-612`, `n`/`N` to repeat search, `g` to go to a matching row, `v` to type and view a work item key, `w` to toggle summary wrapping, `a` to toggle active-only filtering, `[` and `]` to cycle component filters, `c` to type a component filter, `C` to clear the component filter, `f` to type a text filter, `\` to clear the text filter, `s` for the local shadow view, `o` for the original synced Jira issue, `d` for the shadow diff, `r` to revert the current item shadow, `p` to push the current item shadow to Jira, and `q` to go back or quit.
+Without a work item key, `jira-wb view` opens an interactive browser built with [Textual](https://textual.textualize.io/) — mail-style index navigation with full mouse support (click a row to open it, scroll wheel on any list or table). Active-only filtering is enabled by default; pass `--all` to include closed, done, and resolved items. Configure `[view].component` and `[view].filter` to choose the default interactive subset; pass `--component` or `--filter` to override them for one run. `[view].preview_lines` (default 10) controls how many lines of Description and Comments are each previewed in the detail table before opening the full viewer. Click a column header to sort by it (click again to reverse; an arrow marks the active sort). Use `h` for full help, `j`/`k` or arrow keys to move, Enter or click to open an item, `/` to search rows vi-style such as `SAT-612`, `n`/`N` to repeat search, `g` to go to a matching row, `v` to type and view a work item key, `a` to toggle active-only filtering, `m` to toggle modified-only filtering, `f` to open the consolidated Filters screen (component, fix version, assignee, and free-text — each a row you can edit, clear, or clear all at once), `S` to cycle swimlane grouping, `P` to push all local shadow changes (opens a review list first — Enter on an item shows a full side-by-side diff, `p` pushes, `q`/Esc cancels), `M` to open Jira metadata (fix versions, components) without leaving the session, `s`/`o`/`d` for the local shadow view / original synced issue / shadow diff on a work item, `r` to revert the current item shadow, `p` to push the current item shadow to Jira, and `q` to go back or quit.
 
 Work item detail shows local hierarchy when available. Child items show their parent epic above the title; epics show locally synced children below the epic line.
 
@@ -150,6 +151,19 @@ jira/
             ├── sync.json
             └── shadow.json
 ```
+
+## Scoped API tokens (recommended over classic tokens)
+
+`jira_api_token` above accepts either a classic Atlassian API token (long-lived, full account access) or a newer **scoped API token** (fine-grained permissions, 1–365 day expiration). Scoped tokens are a drop-in replacement — same `jira_email` + `jira_api_token` Basic Auth, no code or config shape changes — with two differences:
+
+1. Create one at https://id.atlassian.com/manage-profile/security/api-tokens → "Create API token with scopes", picking a Jira scope set such as `read:jira-work write:jira-work read:jira-user manage:jira-project`, and an expiration (max 365 days — you'll need to regenerate and update your config when it expires).
+2. Point `jira_url` at the cloud-routed endpoint instead of your tenant domain: `https://api.atlassian.com/ex/jira/<cloud_id>`. Find your cloud ID with:
+
+   ```bash
+   curl -s https://your-site.atlassian.net/_edge/tenant_info
+   ```
+
+There's no OAuth app registration, no client secret, and no browser flow involved — it's the same static-credential model as classic tokens, just scoped and time-boxed.
 
 ## Local shadow workflow
 

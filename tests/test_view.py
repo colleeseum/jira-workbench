@@ -3,25 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 
 from jira_workbench.cli import main
-from jira_workbench.shadow import add_comment, load_shadow, set_field, set_status_change
+from jira_workbench.shadow import add_comment, delete_comment, edit_comment, load_shadow, set_field
 from jira_workbench.sync import SyncConfig, sync_project, write_json
 from jira_workbench.view import (
-    HELP_LINES,
+    comment_body_text,
     comments_text,
     component_counts,
     cycle_component,
     cycle_fix_version,
     cycle_swimlane,
     detail_field_rows,
-    draw_detail,
-    detail_body_line_segments,
-    draw_index,
-    detail_body_lines,
-    draw_push_all_progress,
-    draw_push_all_result,
-    edit_line_value,
     editable_field_choices,
     editable_detail_fields,
+    effective_comments_text,
     encode_edit_value,
     filter_items,
     filter_items_for_swimlane,
@@ -29,56 +23,24 @@ from jira_workbench.view import (
     find_next_item_index,
     format_issue,
     format_work_item,
-    index_header,
+    full_diff_texts,
     item_index_by_key,
-    index_row_lines,
-    index_title,
     index_item_parent_key,
-    is_open_parent_key,
-    is_push_all_key,
     load_manifest_items,
     issue_parent_key,
     modified_issue_keys,
-    next_selectable_index,
     parent_options,
-    previous_selectable_index,
-    push_all_report_lines,
     refresh_index_item,
     refresh_stale_index_items,
-    resolution_options,
     selectable_field_options,
+    side_by_side_diff_lines,
     sort_items_for_swimlane,
-    swimlane_header,
     swimlane_label,
-    textbox_geometry,
     text_from_adf,
     version_options,
+    wrap_preview_lines,
 )
 from test_sync import FakeJiraClient
-
-
-class FakeWindow:
-    def __init__(self, *, height: int = 6, width: int = 80) -> None:
-        self.lines: list[str] = []
-        self.height = height
-        self.width = width
-
-    def erase(self) -> None:
-        self.lines = []
-
-    def getmaxyx(self) -> tuple[int, int]:
-        return (self.height, self.width)
-
-    def refresh(self) -> None:
-        pass
-
-    def addnstr(self, row: int, col: int, text: str, _limit: int, *_args: object) -> None:
-        while len(self.lines) <= row:
-            self.lines.append("")
-        current = self.lines[row]
-        if len(current) < col:
-            current += " " * (col - len(current))
-        self.lines[row] = current[:col] + text
 
 
 def synced_jira_dir(tmp_path: Path) -> Path:
@@ -103,21 +65,6 @@ def test_format_work_item_defaults_to_shadow_when_present(tmp_path: Path) -> Non
     assert "[local working] Local comment" in output
 
 
-def test_push_all_key_is_shift_p_only() -> None:
-    assert is_push_all_key(ord("P"))
-    assert not is_push_all_key(ord("p"))
-    assert not is_push_all_key(ord("V"))
-    assert not is_push_all_key(22)
-    assert not is_push_all_key(16)
-
-
-def test_open_parent_key_is_shift_v_only() -> None:
-    assert is_open_parent_key(ord("V"))
-    assert not is_open_parent_key(ord("v"))
-    assert not is_open_parent_key(ord("P"))
-    assert not is_open_parent_key(22)
-
-
 def test_format_work_item_original_ignores_shadow(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     set_field(jira_dir, "SAT-1", "description", "Local description")
@@ -137,6 +84,93 @@ def test_format_work_item_diff_shows_shadow_diff(tmp_path: Path) -> None:
     assert "SAT-1 (working)" in output
     assert "field: description" in output
     assert "+\"Local description\"" in output
+
+
+def test_wrap_preview_lines_keeps_long_urls_intact() -> None:
+    url = "https://knowledge.digicert.com/solution/configure-cert-manager-and-digicert-acme-service-with-kubernetes"
+    lines = wrap_preview_lines(f"See {url} for details.", 100)
+
+    assert url in lines
+
+
+def test_side_by_side_diff_lines_aligns_equal_changed_added_removed() -> None:
+    before = "one\ntwo\nthree\nfour"
+    after = "one\nTWO\nthree\nfive"
+
+    rows = side_by_side_diff_lines(before, after)
+
+    assert ("equal", "one", "one") in rows
+    assert ("equal", "three", "three") in rows
+    assert ("changed", "two", "TWO") in rows
+    assert ("changed", "four", "five") in rows
+
+
+def test_side_by_side_diff_lines_pads_pure_inserts_and_deletes() -> None:
+    before = "keep\nremoved"
+    after = "keep\nadded\nadded again"
+
+    rows = side_by_side_diff_lines(before, after)
+
+    assert ("equal", "keep", "keep") in rows
+    # "removed" and "added"/"added again" don't align 1:1 (2 after lines vs
+    # 1 before line) so difflib treats this block as replace+insert -- the
+    # important invariant is every removed-only line has a blank right side
+    # and every added-only line has a blank left side.
+    tags = {tag for tag, _, _ in rows}
+    assert "changed" in tags or "removed" in tags
+    for tag, left, right in rows:
+        if tag == "removed":
+            assert right == ""
+        if tag == "added":
+            assert left == ""
+
+
+def test_effective_comments_text_reflects_edits_and_deletes(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_json(
+        jira_dir / "components/api-team/SAT-1/comments.json",
+        {
+            "comments": [
+                {"id": "10001", "created": "2026-01-01T00:00:00.000+0000", "body": "original one"},
+                {"id": "10002", "created": "2026-01-02T00:00:00.000+0000", "body": "original two"},
+            ]
+        },
+    )
+
+    edit_comment(jira_dir, "SAT-1", "10001", "edited one")
+    delete_comment(jira_dir, "SAT-1", "10002")
+    add_comment(jira_dir, "SAT-1", "brand new comment")
+
+    shadow = load_shadow(jira_dir, "SAT-1")
+    before = comments_text(jira_dir, "SAT-1", None)
+    after = effective_comments_text(jira_dir, "SAT-1", shadow)
+
+    assert "original one" in before
+    assert "original two" in before
+
+    assert "edited one" in after
+    assert "original one" not in after  # superseded by the edit
+    assert "original two" not in after  # queued for deletion
+    assert "brand new comment" in after
+
+
+def test_full_diff_texts_shows_field_description_and_comment_changes(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_json(
+        jira_dir / "components/api-team/SAT-1/comments.json",
+        {"comments": [{"id": "10001", "created": "2026-01-01T00:00:00.000+0000", "body": "original comment"}]},
+    )
+    set_field(jira_dir, "SAT-1", "description", "New description")
+    edit_comment(jira_dir, "SAT-1", "10001", "edited comment")
+
+    before, after = full_diff_texts(jira_dir, "SAT-1", component_field="customfield_10071")
+
+    assert "original comment" in before
+    assert "edited comment" not in before
+
+    assert "New description" in after
+    assert "edited comment" in after
+    assert "original comment" not in after
 
 
 def test_cli_view_key_uses_local_shadow(tmp_path: Path, capsys) -> None:
@@ -170,7 +204,7 @@ def test_cli_view_key_opens_interactive_detail_by_default(tmp_path: Path, monkey
     def fake_interactive_view(*args, **kwargs) -> None:
         calls.append((args, kwargs))
 
-    monkeypatch.setattr("jira_workbench.cli.interactive_view", fake_interactive_view)
+    monkeypatch.setattr("jira_workbench.cli.open_interactive_view", fake_interactive_view)
 
     code = main(
         [
@@ -198,7 +232,7 @@ def test_cli_view_passes_swimlane(tmp_path: Path, monkeypatch) -> None:
     def fake_interactive_view(*args, **kwargs) -> None:
         calls.append((args, kwargs))
 
-    monkeypatch.setattr("jira_workbench.cli.interactive_view", fake_interactive_view)
+    monkeypatch.setattr("jira_workbench.cli.open_interactive_view", fake_interactive_view)
 
     code = main(
         [
@@ -246,6 +280,22 @@ def test_text_from_adf_keeps_inline_paragraph_text_together() -> None:
     }
 
     assert text_from_adf(value) == "Use sd-stack release"
+
+
+def test_text_from_adf_simplifies_smart_link_wiki_markup() -> None:
+    url = "https://knowledge.digicert.com/solution/configure-cert-manager"
+    assert text_from_adf(f"See [{url}|{url}|smart-link] for details.") == f"See {url} for details."
+    assert text_from_adf(f"See [{url}|smart-link] for details.") == f"See {url} for details."
+    assert (
+        text_from_adf(f"See [the docs|{url}|smart-link] for details.")
+        == f"See the docs ({url}) for details."
+    )
+
+
+def test_comment_body_text_simplifies_smart_link_wiki_markup() -> None:
+    url = "https://knowledge.digicert.com/solution/configure-cert-manager"
+    comment = {"body": f"See [{url}|{url}|smart-link] for details."}
+    assert comment_body_text(comment) == f"See {url} for details."
 
 
 def test_format_issue_uses_native_components_by_default() -> None:
@@ -375,227 +425,11 @@ def test_detail_field_rows_show_parent_none_when_unset() -> None:
     assert ("Parent", "parent", "(none)") in rows
 
 
-def test_selectable_index_navigation_wraps_over_editable_rows() -> None:
-    selectable = [0, 2, 5]
-
-    assert next_selectable_index(selectable, 0) == 2
-    assert next_selectable_index(selectable, 5) == 0
-    assert previous_selectable_index(selectable, 5) == 2
-    assert previous_selectable_index(selectable, 0) == 5
-
-
-def test_edit_line_value_edits_existing_text_in_place() -> None:
-    value, cursor, done = edit_line_value("Azure Blobbackup", 10, ord(" "))
-
-    assert value == "Azure Blob backup"
-    assert cursor == 11
-    assert done is None
-
-
-def test_edit_line_value_handles_navigation_delete_save_and_cancel() -> None:
-    value, cursor, done = edit_line_value("Azure backup", 5, 2)
-    assert (value, cursor, done) == ("Azure backup", 4, None)
-
-    value, cursor, done = edit_line_value("Azure backup", 5, 127)
-    assert (value, cursor, done) == ("Azur backup", 4, None)
-
-    value, cursor, done = edit_line_value("Azure backup", 5, 10)
-    assert (value, cursor, done) == ("Azure backup", 5, "save")
-
-    value, cursor, done = edit_line_value("Azure backup", 5, 27)
-    assert (value, cursor, done) == ("Azure backup", 5, "cancel")
-
-
-def test_draw_detail_keeps_parent_hierarchy_above_editable_fields(tmp_path: Path) -> None:
-    parent = {
-        "key": "SAT-740",
-        "fields": {"summary": "RELEASE_V1.2.0", "issuetype": {"name": "Epic"}},
-    }
-    child = {
-        "key": "SAT-741",
-        "fields": {
-            "summary": "Chainguard Zookeeper",
-            "issuetype": {"name": "Improvement"},
-            "status": {"name": "In Progress"},
-            "parent": {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0"}},
-        },
-    }
-    write_json(tmp_path / "components/helm-chart/SAT-740/issue.json", parent)
-    write_json(tmp_path / "components/helm-chart/SAT-741/issue.json", child)
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-741", None, "original", 0, 0, 20, 100)
-
-    output = "\n".join(window.lines)
-    assert "Epic: SAT-740 RELEASE_V1.2.0" in output
-    assert "|- SAT-741 Chainguard Zookeeper" in output
-    assert "> Summary" not in output
-    assert "Status" in output
-    child_index = window.lines.index("|- SAT-741 Chainguard Zookeeper")
-    assert window.lines[child_index + 1] == ""
-
-
 def test_issue_parent_key_reads_parent_field() -> None:
     issue = {"key": "SAT-741", "fields": {"parent": {"key": "SAT-740"}}}
 
     assert issue_parent_key(issue) == "SAT-740"
     assert issue_parent_key({"key": "SAT-740", "fields": {}}) == ""
-
-
-def test_draw_detail_renders_description_block_and_other_fields(tmp_path: Path) -> None:
-    issue = {
-        "key": "SAT-741",
-        "fields": {
-            "summary": "Chainguard Zookeeper",
-            "description": "First line\nSecond line",
-            "customfield_99999": {"value": "static"},
-        },
-    }
-    write_json(tmp_path / "components/helm-chart/SAT-741/issue.json", issue)
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-741", None, "original", 0, 0, 20, 100)
-
-    output = "\n".join(window.lines)
-    assert "> Description" in output
-    assert "First line" in output
-    assert "Second line" in output
-    assert output.index("> Description") < output.index("Other fields")
-    assert "Other fields (1 hidden)" in output
-    assert "Press O to expand" in output
-    assert "customfield_99999: static" not in output
-    other_index = window.lines.index("Other fields (1 hidden)")
-    assert window.lines[other_index - 1] == ""
-
-    expanded_window = FakeWindow()
-    draw_detail(expanded_window, tmp_path, "SAT-741", None, "original", 0, 0, 20, 100, show_other_fields=True)
-    expanded_output = "\n".join(expanded_window.lines)
-    assert "Other fields" in expanded_output
-    assert "customfield_99999: static" in expanded_output
-    assert window.lines[other_index - 1] == ""
-
-
-def test_draw_detail_truncates_long_description_before_fields(tmp_path: Path) -> None:
-    issue = {
-        "key": "SAT-68",
-        "fields": {
-            "summary": "Document and validate OpenShift support",
-            "description": "\n".join(f"Line {index}" for index in range(1, 25)),
-            "issuetype": {"name": "Improvement"},
-            "status": {"name": "To Do"},
-        },
-    }
-    write_json(tmp_path / "components/helm-chart/SAT-68/issue.json", issue)
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-68", None, "shadow", 0, 0, 20, 100)
-
-    output = "\n".join(window.lines)
-    assert "... " in output
-    assert "more lines" in output
-    assert "> Type" in output
-    assert "> Status" in output
-
-
-def test_draw_detail_can_expand_long_description(tmp_path: Path) -> None:
-    issue = {
-        "key": "SAT-68",
-        "fields": {
-            "summary": "Document and validate OpenShift support",
-            "description": "\n".join(f"Line {index}" for index in range(1, 13)),
-            "issuetype": {"name": "Improvement"},
-        },
-    }
-    write_json(tmp_path / "components/helm-chart/SAT-68/issue.json", issue)
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-68", None, "shadow", 0, 0, 30, 100, expanded_text_fields={"description"})
-
-    output = "\n".join(window.lines)
-    assert "Line 12" in output
-    assert "more lines" not in output
-
-
-def test_draw_detail_scrolls_expanded_description_by_rendered_lines(tmp_path: Path) -> None:
-    issue = {
-        "key": "SAT-68",
-        "fields": {
-            "summary": "Document and validate OpenShift support",
-            "description": "\n".join(f"Line {index}" for index in range(1, 25)),
-            "issuetype": {"name": "Improvement"},
-        },
-    }
-    write_json(tmp_path / "components/helm-chart/SAT-68/issue.json", issue)
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-68", None, "shadow", 10, 1, 12, 100, expanded_text_fields={"description"})
-
-    output = "\n".join(window.lines)
-    assert "    Line 1" not in window.lines
-    assert "Line 10" in output
-
-
-def test_detail_body_lines_include_full_expanded_description() -> None:
-    issue = {
-        "key": "SAT-68",
-        "fields": {
-            "summary": "Document and validate OpenShift support",
-            "description": "\n".join(f"Line {index}" for index in range(1, 25)),
-            "issuetype": {"name": "Improvement"},
-        },
-    }
-    rows = detail_field_rows(issue, None)
-
-    lines = detail_body_lines(
-        issue,
-        None,
-        rows,
-        1,
-        editable_detail_fields(None),
-        set(),
-        12,
-        100,
-        False,
-        {"description"},
-    )
-
-    text = "\n".join(line for line, _attr in lines)
-    assert "Line 24" in text
-    assert "more lines" not in text
-
-
-def test_detail_body_segments_highlight_only_selected_two_column_cell() -> None:
-    issue = {
-        "key": "SAT-1",
-        "fields": {
-            "summary": "Example",
-            "issuetype": {"name": "Story"},
-            "status": {"name": "To Do"},
-            "priority": {"name": "Medium"},
-        },
-    }
-    rows = detail_field_rows(issue, None)
-    status_index = next(index for index, (_label, field, _value) in enumerate(rows) if field == "status")
-
-    lines = detail_body_line_segments(
-        issue,
-        None,
-        rows,
-        status_index,
-        editable_detail_fields(None),
-        set(),
-        20,
-        100,
-        False,
-    )
-
-    selected_lines = [line for line in lines if any(attr for _text, attr in line)]
-    assert len(selected_lines) == 1
-    selected_line = selected_lines[0]
-    assert len(selected_line) == 3
-    assert selected_line[0][1] == 0
-    assert selected_line[1][1] == 0
-    assert selected_line[2][1] != 0
 
 
 def test_comments_text_shows_shadow_then_latest_synced_comments(tmp_path: Path) -> None:
@@ -621,80 +455,6 @@ def test_comments_text_shows_shadow_then_latest_synced_comments(tmp_path: Path) 
 
     assert text.index("[local working] local") < text.index("newer")
     assert text.index("newer") < text.index("older")
-
-
-def test_draw_detail_renders_comments_as_main_block(tmp_path: Path) -> None:
-    write_json(
-        tmp_path / "components/helm-chart/SAT-741/issue.json",
-        {"key": "SAT-741", "fields": {"summary": "Chainguard Zookeeper"}},
-    )
-    write_json(
-        tmp_path / "components/helm-chart/SAT-741/comments.json",
-        [{"created": "2026-02-01T00:00:00.000+0000", "body": "synced comment"}],
-    )
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-741", None, "original", 0, 0, 20, 100)
-
-    output = "\n".join(window.lines)
-    assert "Comments" in output
-    assert "synced comment" in output
-
-
-def test_draw_detail_uses_two_columns_for_compact_fields(tmp_path: Path) -> None:
-    issue = {
-        "key": "SAT-741",
-        "fields": {
-            "summary": "Chainguard Zookeeper",
-            "issuetype": {"name": "Improvement"},
-            "status": {"name": "In Progress"},
-            "assignee": {"displayName": "Serge Colle"},
-        },
-    }
-    write_json(tmp_path / "components/helm-chart/SAT-741/issue.json", issue)
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-741", None, "original", 0, 0, 20, 120)
-
-    assert any("Type" in line and "Status" in line for line in window.lines)
-    description_index = window.lines.index("> Description")
-    assert window.lines[description_index + 2] == ""
-    assert "Type" in window.lines[description_index + 3]
-
-
-def test_draw_detail_marks_shadow_modified_fields(tmp_path: Path) -> None:
-    issue = {
-        "key": "SAT-741",
-        "fields": {
-            "summary": "Chainguard Zookeeper",
-            "description": "Original",
-            "status": {"name": "In Progress"},
-        },
-    }
-    write_json(tmp_path / "components/helm-chart/SAT-741/issue.json", issue)
-    set_field(tmp_path, "SAT-741", "description", "Changed")
-    set_field(tmp_path, "SAT-741", "status", "Done")
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-741", None, "shadow", 0, 0, 20, 120)
-
-    output = "\n".join(window.lines)
-    assert "SAT-741 [shadow modified]" in output
-    assert "> Description*" in output
-    assert "> Status*" in output
-
-
-def test_draw_detail_title_mentions_open_parent_action(tmp_path: Path) -> None:
-    write_json(
-        tmp_path / "components/helm-chart/SAT-741/issue.json",
-        {"key": "SAT-741", "fields": {"summary": "Chainguard Zookeeper"}},
-    )
-    window = FakeWindow()
-
-    draw_detail(window, tmp_path, "SAT-741", None, "shadow", 0, 0, 20, 120)
-
-    assert "V parent" in window.lines[0]
-    assert "x expand" in window.lines[0]
 
 
 def test_encode_edit_value_preserves_structured_jira_fields() -> None:
@@ -762,15 +522,6 @@ def test_fix_version_options_use_cached_versions(tmp_path: Path) -> None:
         "helm-chart-sa 3.4.2",
         "helm-chart-sa 3.4.4",
         "helm-chart-sa 3.5.0",
-    ]
-
-
-def test_resolution_options_are_local_and_immediate() -> None:
-    assert resolution_options("https://example.atlassian.net", "user@example.com", "token") == [
-        "Done",
-        "Won't Do",
-        "Duplicate",
-        "Cannot Reproduce",
     ]
 
 
@@ -1048,7 +799,7 @@ def test_filter_items_filters_component_and_active_status() -> None:
         {"key": "SAT-5", "component": "helm-chart", "status": "Close"},
     ]
 
-    filtered = filter_items(items, component="helm-chart")
+    filtered = filter_items(items, field_filters={"component": "helm-chart"})
 
     assert [item["key"] for item in filtered] == ["SAT-1"]
 
@@ -1059,7 +810,7 @@ def test_filter_items_can_include_closed_items() -> None:
         {"key": "SAT-2", "component": "helm-chart", "status": "Done"},
     ]
 
-    filtered = filter_items(items, component="helm-chart", active=False)
+    filtered = filter_items(items, field_filters={"component": "helm-chart"}, active=False)
 
     assert [item["key"] for item in filtered] == ["SAT-1", "SAT-2"]
 
@@ -1071,7 +822,7 @@ def test_filter_items_matches_text_pattern() -> None:
         {"key": "SAT-3", "summary": "Gateway docs", "component": "helm-chart", "status": "Done"},
     ]
 
-    filtered = filter_items(items, component="helm-chart", pattern="prom")
+    filtered = filter_items(items, field_filters={"component": "helm-chart"}, pattern="prom")
 
     assert [item["key"] for item in filtered] == ["SAT-1"]
 
@@ -1083,8 +834,49 @@ def test_filter_items_matches_fix_version_including_none() -> None:
         {"key": "SAT-3", "status": "Open"},
     ]
 
-    assert [item["key"] for item in filter_items(items, fix_version="helm-chart-sa 3.4.4")] == ["SAT-1"]
-    assert [item["key"] for item in filter_items(items, fix_version="(none)")] == ["SAT-2", "SAT-3"]
+    assert [item["key"] for item in filter_items(items, field_filters={"fixVersion": "helm-chart-sa 3.4.4"})] == [
+        "SAT-1"
+    ]
+    assert [item["key"] for item in filter_items(items, field_filters={"fixVersion": "(none)"})] == [
+        "SAT-2",
+        "SAT-3",
+    ]
+
+
+def test_matches_field_and_field_value_work_generically() -> None:
+    from jira_workbench.view import field_value, matches_field
+
+    item_with_assignee = {"assignee": "Jane Doe"}
+    item_unassigned = {"assignee": ""}
+
+    assert field_value(item_with_assignee, "assignee") == "Jane Doe"
+    assert matches_field(item_with_assignee, "assignee", "jane doe") is True
+    assert matches_field(item_with_assignee, "assignee", "Someone Else") is False
+    assert matches_field(item_with_assignee, "assignee", None) is True
+    assert matches_field(item_unassigned, "assignee", "(none)") is True
+    assert matches_field(item_with_assignee, "assignee", "(none)") is False
+
+
+def test_distinct_field_values_counts_and_buckets_missing() -> None:
+    from jira_workbench.view import distinct_field_values
+
+    items = [
+        {"assignee": "Jane Doe"},
+        {"assignee": "Jane Doe"},
+        {"assignee": ""},
+        {"assignee": "Bob Roe"},
+    ]
+
+    assert distinct_field_values(items, "assignee") == [
+        ("(none)", 1),
+        ("Bob Roe", 1),
+        ("Jane Doe", 2),
+    ]
+    assert distinct_field_values(items, "assignee", empty_bucket="_unassigned") == [
+        ("_unassigned", 1),
+        ("Bob Roe", 1),
+        ("Jane Doe", 2),
+    ]
 
 
 def test_filter_items_can_show_only_modified_items() -> None:
@@ -1096,6 +888,27 @@ def test_filter_items_can_show_only_modified_items() -> None:
     filtered = filter_items(items, modified_keys={"SAT-1"}, modified_only=True)
 
     assert [item["key"] for item in filtered] == ["SAT-1"]
+
+
+def test_filter_items_modified_only_combines_with_component_filter() -> None:
+    # Modified is just another filter dimension: picking a specific
+    # component while Modified is on narrows to that component's modified
+    # items; an empty/"(any)" component filter (no entry in field_filters)
+    # shows every modified item, since matches_field is a no-op when unset.
+    items = [
+        {"key": "SAT-1", "component": "helm-chart", "status": "Open"},
+        {"key": "SAT-2", "component": "terraform", "status": "Open"},
+        {"key": "SAT-3", "component": "helm-chart", "status": "Open"},
+    ]
+    modified_keys = {"SAT-1", "SAT-2"}
+
+    narrowed = filter_items(
+        items, field_filters={"component": "helm-chart"}, modified_keys=modified_keys, modified_only=True
+    )
+    assert [item["key"] for item in narrowed] == ["SAT-1"]
+
+    unfiltered = filter_items(items, field_filters={}, modified_keys=modified_keys, modified_only=True)
+    assert [item["key"] for item in unfiltered] == ["SAT-1", "SAT-2"]
 
 
 def test_find_item_index_prefers_exact_key_then_text_match() -> None:
@@ -1183,6 +996,37 @@ def test_sort_items_for_swimlane_groups_virtual_none_first() -> None:
     assert [item["key"] for item in ordered] == ["SAT-2", "SAT-11", "SAT-12"]
 
 
+def test_sort_items_for_swimlane_by_column_click_when_ungrouped() -> None:
+    items = [
+        {"key": "SAT-1", "priority": "Medium", "assignee": "Bob"},
+        {"key": "SAT-2", "priority": "Highest", "assignee": "Alice"},
+        {"key": "SAT-3", "priority": "Lowest", "assignee": "Carol"},
+    ]
+
+    by_priority = sort_items_for_swimlane(items, "none", sort_field="priority")
+    assert [item["key"] for item in by_priority] == ["SAT-2", "SAT-1", "SAT-3"]
+
+    by_priority_reversed = sort_items_for_swimlane(items, "none", sort_field="priority", reverse=True)
+    assert [item["key"] for item in by_priority_reversed] == ["SAT-3", "SAT-1", "SAT-2"]
+
+    by_assignee = sort_items_for_swimlane(items, "none", sort_field="assignee")
+    assert [item["key"] for item in by_assignee] == ["SAT-2", "SAT-1", "SAT-3"]
+
+
+def test_sort_items_for_swimlane_by_column_click_within_epic_lane() -> None:
+    # Sorting by a column must not scatter the epic-swimlane grouping --
+    # the epic itself still heads its lane, only its children reorder.
+    items = [
+        {"key": "SAT-100", "type": "Epic", "summary": "Epic"},
+        {"key": "SAT-1", "type": "Task", "epic": "SAT-100", "priority": "Low"},
+        {"key": "SAT-2", "type": "Task", "epic": "SAT-100", "priority": "Highest"},
+    ]
+
+    ordered = sort_items_for_swimlane(items, "epic", sort_field="priority")
+
+    assert [item["key"] for item in ordered] == ["SAT-100", "SAT-2", "SAT-1"]
+
+
 def test_epic_swimlane_keeps_epic_items_as_lane_headers() -> None:
     items = [
         {"key": "SAT-742", "type": "Epic", "summary": "FluxCD Starter Foundation"},
@@ -1208,130 +1052,6 @@ def test_non_epic_swimlane_keeps_epic_items() -> None:
     assert filter_items_for_swimlane(items, "version") == items
 
 
-def test_swimlane_header_names_mode() -> None:
-    assert swimlane_header("SAT-10 Parent", "epic") == "== Epic: SAT-10 Parent =="
-    assert swimlane_header("(none)", "version") == "== Version: (none) =="
-
-
-def test_index_rows_hide_grouped_swimlane_values() -> None:
-    item = {
-        "key": "SAT-741",
-        "status": "In Progress",
-        "priority": "High",
-        "assignee": "Marlon Garcia",
-        "component": "helm-chart",
-        "epic": "SAT-740",
-        "fixVersion": "kube-stardog-stack 1.2.0",
-        "summary": "A title",
-    }
-
-    epic_rows = index_row_lines(item, width=110, wrap=False, swimlane="epic")
-    version_rows = index_row_lines(item, width=110, wrap=False, swimlane="version")
-    component_rows = index_row_lines(item, width=110, wrap=False, swimlane="component")
-
-    assert "-> SAT-740" not in epic_rows[1]
-    assert "kube-stardog-stack" not in version_rows[1]
-    assert "helm-chart" not in component_rows[0]
-
-
-def test_index_rows_use_stable_columns_and_truncate_by_default() -> None:
-    item = {
-        "key": "SAT-741",
-        "status": "In Progress",
-        "priority": "High",
-        "assignee": "Marlon Garcia",
-        "component": "helm-chart",
-        "epic": "SAT-740",
-        "fixVersion": "kube-stardog-stack 1.2.0",
-        "summary": "A title that is too long for a narrow terminal",
-    }
-
-    header = index_header(110)
-    row = index_row_lines(item, width=110, wrap=False)
-
-    assert header.startswith("ID         State")
-    assert "Component" in header.splitlines()[0]
-    assert "Parent" in header.splitlines()[1]
-    assert "Priority" in header.splitlines()[1]
-    assert "Assignee" in header.splitlines()[1]
-    assert "Version" in header.splitlines()[1]
-    assert len(row) == 2
-    assert row[0].startswith("SAT-741    In Progress   helm-chart")
-    assert "A title" in row[0]
-    assert row[1].startswith("-> SAT-740")
-    assert "High" in row[1]
-    assert "Marlon Garcia" in row[1]
-    assert "kube-stardog-stack" in row[1]
-    narrow = index_row_lines(item, width=58, wrap=False)
-    assert "Marlon Garcia" in narrow[1]
-
-
-def test_index_rows_can_hide_second_row() -> None:
-    item = {
-        "key": "SAT-741",
-        "status": "In Progress",
-        "priority": "High",
-        "assignee": "Marlon Garcia",
-        "component": "helm-chart",
-        "epic": "SAT-740",
-        "fixVersion": "kube-stardog-stack 1.2.0",
-        "summary": "A title",
-    }
-
-    rows = index_row_lines(item, width=110, wrap=False, show_second_row=False)
-
-    assert rows == ["SAT-741    In Progress   helm-chart      A title"]
-
-
-def test_index_header_can_hide_second_row() -> None:
-    header = index_header(110, show_second_row=False)
-
-    assert header.count("\n") == 0
-    assert "ID" in header
-    assert "Summary" in header
-    assert "Parent" not in header
-
-
-def test_index_header_hides_grouped_swimlane_column_label() -> None:
-    version_header = index_header(110, swimlane="version")
-    epic_header = index_header(110, swimlane="epic")
-    component_header = index_header(110, swimlane="component")
-
-    assert "Version" not in version_header.splitlines()[1]
-    assert "Parent" not in epic_header.splitlines()[1]
-    assert "Component" not in component_header.splitlines()[0]
-    assert "Summary" in component_header.splitlines()[0]
-
-
-def test_index_title_prioritizes_help_and_fits_width() -> None:
-    title = index_title(51, ["component=helm-chart", "active"], 80)
-
-    assert len(title) <= 79
-    assert "h help" in title
-    assert "P push all" in title
-    assert "q quit" not in title
-
-
-def test_index_title_truncates_filters_before_hiding_help_marker() -> None:
-    title = index_title(51, ["component=helm-chart", "fixVersion=kube-stardog-stack 1.2.0", "active"], 46)
-
-    assert len(title) <= 45
-    assert "h" in title
-
-
-def test_index_rows_mark_modified_items() -> None:
-    item = {
-        "key": "SAT-741",
-        "status": "In Progress",
-        "component": "helm-chart",
-        "summary": "A title",
-    }
-
-    row = index_row_lines(item, width=80, wrap=False, modified_keys={"SAT-741"})
-
-    assert row[0].startswith("SAT-741*")
-
-
 def test_index_item_parent_key_reads_cached_epic() -> None:
     assert index_item_parent_key({"key": "SAT-741", "epic": "SAT-740"}) == "SAT-740"
     assert index_item_parent_key({"key": "SAT-740"}) == ""
@@ -1342,267 +1062,6 @@ def test_modified_issue_keys_reads_local_shadows(tmp_path: Path) -> None:
     set_field(tmp_path, "SAT-741", "summary", "Changed")
 
     assert modified_issue_keys(tmp_path) == {"SAT-741"}
-
-
-def test_push_all_report_lists_shadow_changes(tmp_path: Path) -> None:
-    write_json(tmp_path / "components/helm-chart/SAT-741/issue.json", {"key": "SAT-741", "fields": {}})
-    set_field(tmp_path, "SAT-741", "summary", "Changed")
-    add_comment(tmp_path, "SAT-741", "Local comment")
-
-    report = "\n".join(push_all_report_lines(tmp_path, ["SAT-741"]))
-
-    assert "Push all local shadow changes: 1 item" in report
-    assert "SAT-741" in report
-    assert "summary" in report
-    assert "Comments" in report
-    assert "Press y to confirm" in report
-
-
-def test_push_all_report_shows_short_field_before_after(tmp_path: Path) -> None:
-    write_json(
-        tmp_path / "components/helm-chart/SAT-741/issue.json",
-        {
-            "key": "SAT-741",
-            "fields": {
-                "assignee": {"displayName": "Serge Colle"},
-                "description": "Original description",
-                "fixVersions": [{"name": "helm-chart 3.4.2"}],
-                "resolution": None,
-                "status": {"name": "To Do"},
-            },
-        },
-    )
-    set_field(tmp_path, "SAT-741", "assignee", {"displayName": "Marlon Garcia"})
-    set_field(tmp_path, "SAT-741", "description", "New description")
-    set_field(tmp_path, "SAT-741", "fixVersions", [{"name": "helm-chart 3.4.4"}])
-    set_field(tmp_path, "SAT-741", "status", "Close")
-    add_comment(tmp_path, "SAT-741", "No longer strategic")
-    set_status_change(tmp_path, "SAT-741", resolution="Won't Do")
-
-    report = "\n".join(push_all_report_lines(tmp_path, ["SAT-741"]))
-
-    assert "assignee: Serge Colle -> Marlon Garcia" in report
-    assert "version: helm-chart 3.4.2 -> helm-chart 3.4.4" in report
-    assert "status: To Do -> Close" in report
-    assert "resolution: (none) -> Won't Do" in report
-    assert "description" in report
-    assert "Original description -> New description" not in report
-
-
-def test_draw_push_all_progress_shows_recent_lines() -> None:
-    window = FakeWindow()
-
-    draw_push_all_progress(window, ["one", "two", "three", "four", "five"])
-
-    output = "\n".join(window.lines)
-    assert "Push All" in window.lines[0]
-    assert "one" not in output
-    assert "two" in output
-    assert "three" in output
-    assert "five" in output
-
-
-def test_draw_push_all_result_shows_error_message() -> None:
-    window = FakeWindow()
-
-    draw_push_all_result(window, "Push All Failed", ["SAT-1: pushing (1/1)", "", "push all failed: boom"])
-
-    output = "\n".join(window.lines)
-    assert "Push All Failed" in window.lines[0]
-    assert "push all failed: boom" in output
-
-
-def test_draw_push_all_result_wraps_long_error_message() -> None:
-    window = FakeWindow(height=12, width=42)
-
-    draw_push_all_result(
-        window,
-        "Push All Completed With Errors",
-        [
-            "SAT-593: failed: SAT-593: Jira update failed for fields [description, parent, priority, summary] "
-            "(description=\"Implement and document restore from an existing Stardog server backup stored in S3\", "
-            "parent=SAT-371): missing version",
-        ],
-    )
-
-    output = "\n".join(window.lines)
-    assert "description, parent," in output
-    assert "priority, summary]" in output
-    assert "existing Stardog server" in output
-    assert "backup stored in S3" in output
-    assert "missing version" in output
-
-
-def test_draw_push_all_progress_wraps_long_error_message() -> None:
-    window = FakeWindow(height=8, width=42)
-
-    draw_push_all_progress(
-        window,
-        [
-            "SAT-593: failed: SAT-593: Jira update failed for fields [description, parent, priority, summary] "
-            "(description=\"Implement and document restore from an existing Stardog server backup stored in S3\")",
-        ],
-    )
-
-    output = "\n".join(window.lines)
-    assert "description, parent," in output
-    assert "priority, summary]" in output
-    assert "existing Stardog server" in output
-    assert "backup stored in S3" in output
-
-
-def test_draw_index_shows_message_on_empty_list() -> None:
-    window = FakeWindow()
-
-    draw_index(
-        window,
-        [],
-        0,
-        0,
-        6,
-        80,
-        component="helm-chart",
-        pattern=None,
-        fix_version=None,
-        active=True,
-        wrap=False,
-        message="push all failed: boom",
-    )
-
-    assert "push all failed: boom" in "\n".join(window.lines)
-
-
-def test_draw_index_shows_swimlane_headers() -> None:
-    window = FakeWindow(height=12, width=100)
-
-    draw_index(
-        window,
-        [
-            {
-                "key": "SAT-2",
-                "status": "To Do",
-                "component": "helm-chart",
-                "summary": "Without parent",
-            },
-            {
-                "key": "SAT-11",
-                "status": "To Do",
-                "component": "helm-chart",
-                "summary": "With parent",
-                "epic": "SAT-10",
-                "epicSummary": "Parent",
-            },
-        ],
-        0,
-        0,
-        12,
-        100,
-        component=None,
-        pattern=None,
-        fix_version=None,
-        active=True,
-        wrap=False,
-        swimlane="epic",
-    )
-
-    output = "\n".join(window.lines)
-    assert "swimlane=epic" in output
-    assert "== Epic: (none) ==" in output
-    assert "== Epic: SAT-10 Parent ==" in output
-
-
-def test_draw_index_shows_empty_epic_lane_header() -> None:
-    window = FakeWindow(height=8, width=100)
-
-    draw_index(
-        window,
-        [
-            {
-                "key": "SAT-800",
-                "type": "Epic",
-                "status": "To Do",
-                "component": "resource-as-stardog",
-                "summary": "Resource Model And Ownership",
-            },
-        ],
-        0,
-        0,
-        8,
-        100,
-        component=None,
-        pattern=None,
-        fix_version=None,
-        active=True,
-        wrap=False,
-        swimlane="epic",
-    )
-
-    output = "\n".join(window.lines)
-    assert "== Epic: SAT-800 Resource Model And Ownership ==" in output
-    assert "SAT-800    To Do" not in output
-
-
-def test_draw_index_can_hide_second_row() -> None:
-    window = FakeWindow(height=8, width=100)
-
-    draw_index(
-        window,
-        [
-            {
-                "key": "SAT-2",
-                "status": "To Do",
-                "component": "helm-chart",
-                "summary": "Without parent",
-                "priority": "Medium",
-                "epic": "SAT-1",
-            },
-        ],
-        0,
-        0,
-        8,
-        100,
-        component=None,
-        pattern=None,
-        fix_version=None,
-        active=True,
-        wrap=False,
-        show_second_row=False,
-    )
-
-    output = "\n".join(window.lines)
-    assert "single-row" in output
-    assert "Parent" not in output
-    assert "-> SAT-1" not in output
-
-
-def test_textbox_geometry_keeps_rectangle_inside_screen() -> None:
-    _, _, box_height, box_width, rectangle_y2, rectangle_x2 = textbox_geometry(24, 80)
-
-    assert rectangle_y2 == 22
-    assert rectangle_x2 == 78
-    assert box_height == 20
-    assert box_width == 76
-
-
-def test_index_rows_can_wrap_long_summaries() -> None:
-    item = {
-        "key": "SAT-741",
-        "status": "In Progress",
-        "priority": "High",
-        "assignee": "Marlon Garcia",
-        "component": "helm-chart",
-        "epic": "SAT-740",
-        "fixVersion": "kube-stardog-stack 1.2.0",
-        "summary": "A title that is too long for a narrow terminal",
-    }
-
-    rows = index_row_lines(item, width=58, wrap=True)
-
-    assert len(rows) > 1
-    assert rows[0].startswith("SAT-741    In Progress   helm-chart")
-    assert rows[-1].startswith("-> SAT-740")
-    assert "High" in rows[-1]
-    assert "Marlon Garcia" in rows[-1]
 
 
 def test_load_manifest_items_sorts_existing_manifest_by_issue_number(tmp_path: Path) -> None:
@@ -1732,21 +1191,6 @@ def test_refresh_index_item_applies_shadow_component_override(tmp_path: Path) ->
     refresh_index_item(tmp_path, items, "SAT-19", component_field="customfield_10071")
 
     assert items[0]["component"] == "security"
-
-
-def test_help_lines_document_interactive_actions() -> None:
-    help_text = "\n".join(HELP_LINES)
-
-    assert "h" in help_text
-    assert "w" in help_text
-    assert "--components" in help_text
-    assert "--component" in help_text
-    assert "--all" in help_text
-    assert "Active hides statuses" in help_text
-    assert "P" in help_text
-    assert "V" in help_text
-    assert "x" in help_text
-    assert "R" in help_text
 
 
 def test_cli_view_help_mentions_filters(capsys) -> None:

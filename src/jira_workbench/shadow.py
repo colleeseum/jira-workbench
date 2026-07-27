@@ -52,7 +52,23 @@ class JiraClient(Protocol):
     def issue_add_comment(self, issue_key: str, comment: str, visibility: dict[str, Any] | None = None) -> Any:
         pass
 
+    def issue_edit_comment(
+        self,
+        issue_key: str,
+        comment_id: str,
+        comment: str,
+        visibility: dict[str, Any] | None = None,
+        notify_users: bool = True,
+    ) -> Any:
+        pass
+
     def update_issue_field(self, key: str, fields: dict[str, Any], notify_users: bool = True) -> Any:
+        pass
+
+    def resource_url(self, resource: str, api_root: str = "rest/api", api_version: str | int = "latest") -> str:
+        pass
+
+    def delete(self, path: str, params: dict[str, Any] | None = None) -> Any:
         pass
 
 
@@ -165,6 +181,82 @@ def add_comment(jira_dir: Path, key: str, body: str) -> dict[str, Any]:
     shadow["state"] = "working"
     save_shadow(jira_dir, key, shadow)
     return shadow
+
+
+def is_local_comment_id(comment_id: str) -> bool:
+    return comment_id.startswith("local-")
+
+
+def edit_comment(jira_dir: Path, key: str, comment_id: str, body: str) -> dict[str, Any]:
+    """Edit a comment's body.
+
+    A local-only (unpushed) comment is mutated in place. An already-synced
+    remote comment is instead recorded in commentEdits, keyed by its remote
+    id, and applied via issue_edit_comment on the next push.
+    """
+    shadow = ensure_shadow(jira_dir, key)
+    if is_local_comment_id(comment_id):
+        comments = shadow.setdefault("comments", [])
+        for comment in comments:
+            if isinstance(comment, dict) and comment.get("id") == comment_id:
+                comment["body"] = body
+                break
+    else:
+        edits = shadow.setdefault("commentEdits", {})
+        if not isinstance(edits, dict):
+            raise ShadowError(f"shadow commentEdits for {key} are not a JSON object")
+        edits[comment_id] = body
+    shadow["state"] = "working"
+    save_shadow(jira_dir, key, shadow)
+    return shadow
+
+
+def remove_local_comment(jira_dir: Path, key: str, comment_id: str) -> dict[str, Any]:
+    """Discard a local-only (unpushed) comment entirely -- nothing to push, so nothing to mark."""
+    shadow = ensure_shadow(jira_dir, key)
+    comments = shadow.setdefault("comments", [])
+    if not isinstance(comments, list):
+        raise ShadowError(f"shadow comments for {key} are not a JSON array")
+    shadow["comments"] = [c for c in comments if not (isinstance(c, dict) and c.get("id") == comment_id)]
+    shadow["state"] = "working"
+    save_shadow(jira_dir, key, shadow)
+    return shadow
+
+
+def delete_comment(jira_dir: Path, key: str, comment_id: str) -> dict[str, Any]:
+    """Mark an already-synced remote comment for deletion on the next push.
+
+    Clears any pending edit for the same comment -- a queued delete wins.
+    """
+    shadow = ensure_shadow(jira_dir, key)
+    deletes = shadow.setdefault("commentDeletes", [])
+    if not isinstance(deletes, list):
+        raise ShadowError(f"shadow commentDeletes for {key} are not a JSON array")
+    if comment_id not in deletes:
+        deletes.append(comment_id)
+    edits = shadow.get("commentEdits")
+    if isinstance(edits, dict):
+        edits.pop(comment_id, None)
+    shadow["state"] = "working"
+    save_shadow(jira_dir, key, shadow)
+    return shadow
+
+
+def undelete_comment(jira_dir: Path, key: str, comment_id: str) -> dict[str, Any]:
+    """Undo a pending delete-on-push mark for a remote comment."""
+    shadow = ensure_shadow(jira_dir, key)
+    deletes = shadow.get("commentDeletes")
+    if isinstance(deletes, list) and comment_id in deletes:
+        deletes.remove(comment_id)
+    shadow["state"] = "working"
+    save_shadow(jira_dir, key, shadow)
+    return shadow
+
+
+def delete_remote_comment(client: JiraClient, key: str, comment_id: str) -> None:
+    """Delete a comment on Jira directly -- atlassian-python-api has no wrapper for this endpoint."""
+    url = f"{client.resource_url('issue')}/{key}/comment/{comment_id}"
+    client.delete(url)
 
 
 def set_status_change(
@@ -616,6 +708,22 @@ def push_key(
         for comment in comments:
             if isinstance(comment, dict) and comment.get("state") != "pushed":
                 jira_client.issue_add_comment(key, str(comment.get("body", "")))
+
+    comment_edits = shadow.get("commentEdits", {})
+    if isinstance(comment_edits, dict):
+        for comment_id, body in comment_edits.items():
+            try:
+                jira_client.issue_edit_comment(key, str(comment_id), str(body))
+            except Exception as exc:
+                raise ShadowError(f"{key}: could not edit comment {comment_id}: {exc}") from exc
+
+    comment_deletes = shadow.get("commentDeletes", [])
+    if isinstance(comment_deletes, list):
+        for comment_id in comment_deletes:
+            try:
+                delete_remote_comment(jira_client, key, str(comment_id))
+            except Exception as exc:
+                raise ShadowError(f"{key}: could not delete comment {comment_id}: {exc}") from exc
 
     refresh_local_issue_after_push(jira_dir, key, jira_client, component_field)
     delete_shadow(jira_dir, key)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG_PATH = Path("~/.jira-wb.conf")
+DEFAULT_CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "jira-wb" / "config.toml"
 
 
 class ConfigError(RuntimeError):
@@ -24,6 +25,7 @@ class WorkbenchConfig:
     view_component: str | None = None
     view_filter: str | None = None
     view_swimlane: str | None = None
+    view_preview_lines: int | None = None
     versions_filter: str | None = None
     host: str | None = None
     port: int | None = None
@@ -66,6 +68,7 @@ def load_config(path: Path) -> WorkbenchConfig:
         view_component=optional_string(view, "component", expanded),
         view_filter=optional_string(view, "filter", expanded),
         view_swimlane=optional_string(view, "swimlane", expanded),
+        view_preview_lines=optional_int(view, "preview_lines", expanded),
         versions_filter=optional_string(versions, "filter", expanded),
         host=optional_string(serve, "host", expanded),
         port=optional_int(serve, "port", expanded),
