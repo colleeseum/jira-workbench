@@ -16,6 +16,7 @@ from .sync import build_manifest, component_slug, find_existing_issue, issue_key
 API_PUSH_FIELDS = {
     "assignee",
     "description",
+    "duedate",
     "fixVersions",
     "labels",
     "parent",

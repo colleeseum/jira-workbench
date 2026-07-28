@@ -80,6 +80,13 @@ class FakeJiraClient:
     def resource_url(self, resource: str, api_root: str = "rest/api", api_version: str | int = "latest") -> str:
         return f"https://example.atlassian.net/rest/api/3/{resource}"
 
+    def get_all_fields(self) -> Any:
+        self.calls.append(("get_all_fields",))
+        return [
+            {"id": "customfield_10071", "name": "Component Team", "custom": True},
+            {"id": "customfield_10082", "name": "Customers SAT", "custom": True},
+        ]
+
 
 class FakeJiraClientWithoutIndexUpdated(FakeJiraClient):
     def enhanced_jql_get_list_of_tickets(
@@ -159,6 +166,39 @@ def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> No
     assert "[3/5] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in progress
 
 
+def test_sync_project_caches_field_names(tmp_path: Path) -> None:
+    from jira_workbench.metadata import load_field_names
+
+    client = FakeJiraClient()
+    sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+        client,
+        progress=None,
+    )
+
+    assert ("get_all_fields",) in client.calls
+    assert load_field_names(tmp_path) == {
+        "customfield_10071": "Component Team",
+        "customfield_10082": "Customers SAT",
+    }
+
+
+def test_sync_project_tolerates_field_name_fetch_failure(tmp_path: Path) -> None:
+    class NoFieldsClient(FakeJiraClient):
+        def get_all_fields(self) -> Any:
+            raise RuntimeError("boom")
+
+    progress: list[str] = []
+    result = sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+        NoFieldsClient(),
+        progress=progress.append,
+    )
+
+    assert result.work_item_count == 2  # sync still completes
+    assert any("field name refresh skipped" in line for line in progress)
+
+
 def test_sync_project_skips_unchanged_items(tmp_path: Path) -> None:
     client = FakeJiraClient()
     config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path)
@@ -170,6 +210,21 @@ def test_sync_project_skips_unchanged_items(tmp_path: Path) -> None:
     assert second.changed_count == 0
     assert second.skipped_count == 2
     assert not any(call[0] == "get_issue" for call in client.calls)
+
+
+def test_sync_project_force_refetches_even_when_updated_matches(tmp_path: Path) -> None:
+    client = FakeJiraClient()
+    config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path)
+    sync_project(config, client, progress=None)
+
+    client.calls = []
+    forced_config = SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path, force=True)
+    second = sync_project(forced_config, client, progress=None)
+
+    assert second.changed_count == 2
+    assert second.skipped_count == 0
+    assert ("get_issue", "SAT-1", "*all") in client.calls
+    assert ("get_issue", "SAT-2", "*all") in client.calls
 
 
 def test_sync_project_falls_back_to_view_when_index_has_no_updated(tmp_path: Path) -> None:

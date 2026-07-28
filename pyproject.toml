@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
   "atlassian-python-api>=4.0.0",
   "textual>=8.0.0",
+  "tomlkit>=0.13",
 ]
 
 [project.optional-dependencies]

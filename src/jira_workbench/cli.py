@@ -20,26 +20,31 @@ from .metadata import (
     archive_version_api,
     check_jira_api_config,
     delete_version_api,
+    format_boards,
     format_component_field_option_cache,
     format_doctor_checks,
     format_components as format_meta_components,
     format_component_cache,
     format_versions,
     jira_api_client,
+    load_boards,
     load_component_field_options,
     load_component_summary,
     load_components,
     load_versions,
     merge_components,
+    normalize_boards,
     normalize_components,
     normalize_versions,
     release_version_api,
     rename_version_api,
+    refresh_boards_api,
     refresh_component_field_options_api,
     refresh_components_api,
     refresh_versions_api,
     version_name,
 )
+from .issue import IssueError, build_create_fields, create_issue, fetch_issue_type_fields, resolve_reporter
 from .server import serve
 from .shadow import (
     ShadowError,
@@ -62,6 +67,10 @@ def open_interactive_view(
     *,
     component_field: str | None = None,
     component: str | None = None,
+    fix_version: str | None = None,
+    assignee: str | None = None,
+    board: str | None = None,
+    board_scope: str | None = None,
     pattern: str | None = None,
     active: bool = True,
     jira_url: str | None = None,
@@ -73,6 +82,9 @@ def open_interactive_view(
     project: str | None = None,
     versions_filter: str | None = None,
     preview_lines: int | None = None,
+    hide_done_after_days: int | None = None,
+    config_path: Path | None = None,
+    nerd_font: bool = False,
 ) -> None:
     from .tui.app import run_view as run_textual_view
 
@@ -80,6 +92,10 @@ def open_interactive_view(
         jira_dir,
         component_field=component_field,
         component=component,
+        fix_version=fix_version,
+        assignee=assignee,
+        board=board,
+        board_scope=board_scope,
         pattern=pattern,
         active=active,
         swimlane=swimlane,
@@ -91,6 +107,9 @@ def open_interactive_view(
         project=project,
         versions_filter=versions_filter,
         preview_lines=preview_lines,
+        hide_done_after_days=hide_done_after_days,
+        config_path=config_path,
+        nerd_font=nerd_font,
     )
 
 
@@ -134,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--jira-url", default=os.environ.get("JIRA_URL"))
     sync_parser.add_argument("--jira-email", default=os.environ.get("JIRA_EMAIL"))
     sync_parser.add_argument("--jira-api-token", default=os.environ.get("JIRA_API_TOKEN"))
+    sync_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-fetch every issue regardless of its updated timestamp. Normal syncs skip an issue "
+            "whose own updated timestamp hasn't changed, which misses drift caused by something else "
+            "changing (e.g. a fix version renamed in Jira) -- --force refreshes everything to catch that."
+        ),
+    )
 
     serve_parser = subparsers.add_parser("serve", help="Serve the local Jira browser")
     serve_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
@@ -182,7 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     issue_subparsers = issue_parser.add_subparsers(dest="issue_command")
 
     issue_create = issue_subparsers.add_parser("create", help="Create a Jira issue and sync it locally")
-    issue_create.add_argument("--type", default="Improvement", help="Issue type name. Default: Improvement.")
+    issue_create.add_argument(
+        "--type", default=None, help="Issue type name. Required via this flag or [issue].default_type in config."
+    )
     issue_create.add_argument("--summary", required=True)
     issue_create.add_argument("--description")
     issue_create.add_argument("--description-file")
@@ -203,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     meta_refresh = meta_subparsers.add_parser("refresh", help="Refresh cached Jira project metadata")
     meta_refresh.add_argument("--versions", action="store_true", help="Refresh project fix versions")
     meta_refresh.add_argument("--components", action="store_true", help="Refresh project components")
+    meta_refresh.add_argument("--boards", action="store_true", help="Refresh Jira Kanban boards and membership")
 
     meta_versions = meta_subparsers.add_parser("versions", help="List cached Jira project fix versions")
     meta_versions.add_argument(
@@ -286,6 +317,13 @@ def build_parser() -> argparse.ArgumentParser:
     component_field_add.add_argument(
         "--context-id",
         help="Jira custom field context id. Required unless the option already exists.",
+    )
+
+    meta_boards = meta_subparsers.add_parser("boards", help="List cached Jira Kanban boards and membership")
+    meta_boards.add_argument(
+        "--cached",
+        action="store_true",
+        help="Use cached boards only and do not refresh from Jira",
     )
 
     meta_subparsers.add_parser("doctor", help="Test Jira Workbench metadata configuration")
@@ -388,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
                     project=api_project,
                     component_field=str(component_field),
                     jira_dir=Path(str(jira_dir)),
+                    force=args.force,
                 ),
                 api_client,
                 progress=sync_progress_printer(sys.stderr),
@@ -425,8 +464,19 @@ def main(argv: list[str] | None = None) -> int:
         jira_dir = choose(args.jira_dir, config.jira_dir)
         component_field = choose(args.component_field, config.component_field) or "components"
         view_component = choose(args.component, config.view_component)
+        view_fix_version = config.view_fix_version
+        view_assignee = config.view_assignee
+        view_board = config.view_board
+        view_board_scope = config.view_board_scope
         view_filter = choose(args.filter, config.view_filter)
         view_swimlane = choose(args.swimlane, config.view_swimlane) or "none"
+        if args.all:
+            view_active = False
+        elif config.view_active is not None:
+            view_active = config.view_active
+        else:
+            view_active = True
+        view_nerd_font = config.view_nerd_font or False
         if jira_dir is None:
             print(
                 "error: missing required configuration: jira_dir. "
@@ -453,8 +503,12 @@ def main(argv: list[str] | None = None) -> int:
                         Path(str(jira_dir)),
                         component_field=str(component_field) if component_field else None,
                         component=str(view_component) if view_component else None,
+                        fix_version=str(view_fix_version) if view_fix_version else None,
+                        assignee=str(view_assignee) if view_assignee else None,
+                        board=str(view_board) if view_board else None,
+                        board_scope=str(view_board_scope) if view_board_scope else None,
                         pattern=str(view_filter) if view_filter else None,
-                        active=not args.all,
+                        active=view_active,
                         jira_url=str(config.jira_url) if config.jira_url else None,
                         jira_email=str(config.jira_email) if config.jira_email else None,
                         jira_api_token=str(config.jira_api_token) if config.jira_api_token else None,
@@ -464,6 +518,9 @@ def main(argv: list[str] | None = None) -> int:
                         project=str(config.project) if config.project else None,
                         versions_filter=str(config.versions_filter) if config.versions_filter else None,
                         preview_lines=config.view_preview_lines,
+                        hide_done_after_days=config.view_hide_done_after_days,
+                        config_path=config_path,
+                        nerd_font=view_nerd_font,
                     )
             else:
                 if args.diff or args.original:
@@ -473,8 +530,12 @@ def main(argv: list[str] | None = None) -> int:
                     Path(str(jira_dir)),
                     component_field=str(component_field) if component_field else None,
                     component=str(view_component) if view_component else None,
+                    fix_version=str(view_fix_version) if view_fix_version else None,
+                    assignee=str(view_assignee) if view_assignee else None,
+                    board=str(view_board) if view_board else None,
+                    board_scope=str(view_board_scope) if view_board_scope else None,
                     pattern=str(view_filter) if view_filter else None,
-                    active=not args.all,
+                    active=view_active,
                     jira_url=str(config.jira_url) if config.jira_url else None,
                     jira_email=str(config.jira_email) if config.jira_email else None,
                     jira_api_token=str(config.jira_api_token) if config.jira_api_token else None,
@@ -482,6 +543,9 @@ def main(argv: list[str] | None = None) -> int:
                     project=str(config.project) if config.project else None,
                     versions_filter=str(config.versions_filter) if config.versions_filter else None,
                     preview_lines=config.view_preview_lines,
+                    hide_done_after_days=config.view_hide_done_after_days,
+                    config_path=config_path,
+                    nerd_font=view_nerd_font,
                 )
         except ViewError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -509,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        issue_type = choose(args.type, config.issue_default_type)
         try:
             return run_issue(
                 args,
@@ -518,11 +583,15 @@ def main(argv: list[str] | None = None) -> int:
                 jira_url,
                 jira_email,
                 jira_api_token,
+                issue_type,
             )
         except MetadataError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         except ShadowError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except IssueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
@@ -573,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
                     jira_api_token,
                     versions_filter,
                     component_field,
+                    config_path,
                 )
             except KeyboardInterrupt:
                 print()
@@ -623,74 +693,6 @@ def issue_description(args: argparse.Namespace) -> str:
     return str(args.description or "")
 
 
-def issue_type_create_fields(client: object, project: str, issue_type: str) -> dict[str, object]:
-    try:
-        metadata = client.issue_createmeta(project)
-    except Exception as exc:
-        raise MetadataError(f"could not read Jira create metadata for {project}: {exc}") from exc
-    projects = metadata.get("projects") if isinstance(metadata, dict) else None
-    if not isinstance(projects, list):
-        raise MetadataError(f"Jira create metadata for {project} did not include projects")
-    for project_meta in projects:
-        if not isinstance(project_meta, dict):
-            continue
-        issue_types = project_meta.get("issuetypes")
-        if not isinstance(issue_types, list):
-            continue
-        for item in issue_types:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("name") or "").lower() != issue_type.lower():
-                continue
-            fields = item.get("fields")
-            if isinstance(fields, dict):
-                return fields
-    raise MetadataError(f"issue type {issue_type} is not available for project {project}")
-
-
-def issue_component_value(component_field: str, component: str) -> object:
-    if component_field == "components":
-        return [{"name": component}]
-    return {"value": component}
-
-
-def issue_create_fields(
-    *,
-    project: str,
-    issue_type: str,
-    summary: str,
-    description: str,
-    component_field: str,
-    component: str | None,
-    parent: str | None,
-    priority: str | None,
-    create_fields: dict[str, object],
-    reporter: dict[str, object] | None,
-) -> dict[str, object]:
-    fields: dict[str, object] = {
-        "project": {"key": project},
-        "issuetype": {"name": issue_type},
-        "summary": summary,
-    }
-    if description:
-        fields["description"] = description
-    if reporter is not None and "reporter" in create_fields:
-        fields["reporter"] = reporter
-    if parent:
-        if "parent" not in create_fields:
-            raise MetadataError(f"issue type {issue_type} cannot set parent during create")
-        fields["parent"] = {"key": parent}
-    if priority:
-        if "priority" not in create_fields:
-            raise MetadataError(f"issue type {issue_type} cannot set priority during create")
-        fields["priority"] = {"name": priority}
-    if component:
-        if component_field not in create_fields:
-            raise MetadataError(f"issue type {issue_type} cannot set component field {component_field} during create")
-        fields[component_field] = issue_component_value(component_field, component)
-    return fields
-
-
 def run_issue(
     args: argparse.Namespace,
     jira_dir: Path,
@@ -699,27 +701,26 @@ def run_issue(
     jira_url: object | None,
     jira_email: object | None,
     jira_api_token: object | None,
+    issue_type: object | None,
 ) -> int:
     if args.issue_command == "create":
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
         summary = str(args.summary).strip()
         if not summary:
             raise MetadataError("summary must be non-empty")
-        issue_type = str(args.type).strip()
+        issue_type = str(issue_type).strip() if issue_type else ""
         if not issue_type:
-            raise MetadataError("issue type must be non-empty")
-        create_fields = issue_type_create_fields(client, api_project, issue_type)
-        reporter = None
-        if "reporter" in create_fields:
-            try:
-                myself = client.myself()
-            except Exception as exc:
-                raise MetadataError(f"could not resolve current Jira user for reporter: {exc}") from exc
-            account_id = myself.get("accountId") if isinstance(myself, dict) else None
-            if not account_id:
-                raise MetadataError("current Jira user response did not include accountId")
-            reporter = {"accountId": account_id}
-        fields = issue_create_fields(
+            raise MetadataError(
+                "issue type is required: pass --type or set [issue].default_type in "
+                "~/.config/jira-wb/config.toml"
+            )
+        type_fields = fetch_issue_type_fields(client, api_project)
+        matched_type = next((name for name in type_fields if name.lower() == issue_type.lower()), None)
+        if matched_type is None:
+            raise IssueError(f"issue type {issue_type} is not available for project {api_project}")
+        create_fields = type_fields[matched_type]
+        reporter = resolve_reporter(client) if "reporter" in create_fields else None
+        fields = build_create_fields(
             project=api_project,
             issue_type=issue_type,
             summary=summary,
@@ -735,14 +736,8 @@ def run_issue(
             for key in sorted(fields):
                 print(f"{key}: {fields[key]}")
             return 0
-        try:
-            created = client.issue_create(fields)
-        except Exception as exc:
-            raise MetadataError(f"could not create Jira issue {summary}: {exc}") from exc
-        key = created.get("key") if isinstance(created, dict) else None
-        if not key:
-            raise MetadataError(f"Jira create response for {summary} did not include key")
-        refresh_local_issue_after_push(jira_dir, str(key), client, str(component_field or "components"))
+        key = create_issue(client, fields)
+        refresh_local_issue_after_push(jira_dir, key, client, str(component_field or "components"))
         print(f"created {key}: {summary}")
         return 0
 
@@ -771,6 +766,7 @@ def run_meta(
     jira_api_token: object | None,
     versions_filter: object | None = None,
     component_field: object | None = None,
+    config_path: Path | None = None,
 ) -> int:
     if args.meta_command is None:
         from .tui.app import run_meta_app
@@ -783,10 +779,11 @@ def run_meta(
             jira_api_token=str(jira_api_token) if jira_api_token else None,
             versions_filter=str(versions_filter) if versions_filter else None,
             component_field=str(component_field) if component_field else None,
+            config_path=config_path,
         )
 
     if args.meta_command == "refresh":
-        refresh_versions_requested = args.versions or not args.components
+        refresh_versions_requested = args.versions or not (args.components or args.boards)
         if refresh_versions_requested:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_versions_api(jira_dir, api_project, client)
@@ -799,6 +796,10 @@ def run_meta(
             else:
                 cache = refresh_components_api(jira_dir, api_project, client)
                 print(f"refreshed {len(cache.get('components', []))} native components")
+        if args.boards:
+            api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+            cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))
+            print(f"refreshed {len(cache.get('boards', []))} boards")
         return 0
 
     if args.meta_command == "versions":
@@ -847,6 +848,22 @@ def run_meta(
             file=sys.stderr,
         )
         return 1
+
+    if args.meta_command == "boards":
+        if args.cached:
+            cache = load_boards(jira_dir)
+        else:
+            api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+            cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))
+
+        if cache is None:
+            print(
+                "error: no cached boards found. Run jira-wb meta refresh --boards with Jira API configured.",
+                file=sys.stderr,
+            )
+            return 1
+        print(format_boards(cache), end="")
+        return 0
 
     if args.meta_command == "version-add":
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
@@ -1172,6 +1189,23 @@ def load_meta_versions(
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
         cache = refresh_versions_api(jira_dir, api_project, client)
     return normalize_versions(cache.get("versions"))
+
+
+def load_meta_boards(
+    jira_dir: Path,
+    project: object | None,
+    component_field: object | None,
+    jira_url: object | None,
+    jira_email: object | None,
+    jira_api_token: object | None,
+) -> list[dict[str, object]]:
+    cache = load_boards(jira_dir)
+    if cache is None:
+        if project is None or jira_url is None or jira_email is None or jira_api_token is None:
+            raise MetadataError("no cached boards found and live metadata access is not configured")
+        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+        cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))
+    return normalize_boards(cache.get("boards"))
 
 
 def version_identifier(version: dict[str, object]) -> str:

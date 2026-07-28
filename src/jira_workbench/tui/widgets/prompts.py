@@ -6,7 +6,8 @@ from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, OptionList, Static, TextArea
+from textual.widgets import Button, Input, OptionList, SelectionList, Static, TextArea
+from textual.widgets.option_list import Option
 
 
 class TextPromptScreen(ModalScreen[str | None]):
@@ -162,17 +163,32 @@ class OptionPickerScreen(ModalScreen[str | None]):
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, label: str, options: list[str], *, current: str | None = None) -> None:
+    def __init__(
+        self,
+        label: str,
+        options: list[str],
+        *,
+        current: str | None = None,
+        render: Callable[[str], object] | None = None,
+    ) -> None:
         super().__init__()
         self._label = label
         self._options = options
         self._current = current
+        # Lets a caller show a richer prompt (e.g. an icon-prefixed label)
+        # while the picker still filters/returns the plain option string --
+        # Option's `id` is the round-trip identity, independent of `prompt`
+        # (what's actually displayed).
+        self._render_option = render or (lambda option: option)
+
+    def _make_option(self, option: str) -> Option:
+        return Option(self._render_option(option), id=option)
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Static(self._label, classes="title")
             yield Input(placeholder="type to filter", id="picker-filter")
-            yield OptionList(*self._options, id="picker-options")
+            yield OptionList(*(self._make_option(option) for option in self._options), id="picker-options")
             with Horizontal(classes="dialog-buttons"):
                 yield Button("Cancel (Esc)", id="cancel-button")
 
@@ -189,21 +205,121 @@ class OptionPickerScreen(ModalScreen[str | None]):
         options.clear_options()
         for option in self._options:
             if needle in option.lower():
-                options.add_option(option)
+                options.add_option(self._make_option(option))
 
     @on(Input.Submitted, "#picker-filter")
     def _filter_submitted(self, event: Input.Submitted) -> None:
         options = self.query_one(OptionList)
         if options.option_count:
-            self.dismiss(str(options.get_option_at_index(0).prompt))
+            self.dismiss(options.get_option_at_index(0).id)
 
     @on(OptionList.OptionSelected)
     def _option_selected(self, event: OptionList.OptionSelected) -> None:
-        self.dismiss(str(event.option.prompt))
+        self.dismiss(event.option_id)
 
     @on(Button.Pressed, "#cancel-button")
     def _cancel_pressed(self) -> None:
         self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class LabelsPickerScreen(ModalScreen[list[str] | None]):
+    """Multi-select label picker: toggle known labels with Space (a checkbox
+    list, not free text) -- avoids accidentally minting a new label via a
+    typo. Adding a genuinely new one is only possible through the separate
+    input below the list, so doing that is always a deliberate, visible act.
+
+    Returns the selected labels, or None if cancelled.
+    """
+
+    DEFAULT_CSS = """
+    LabelsPickerScreen {
+        align: center middle;
+    }
+    LabelsPickerScreen > Vertical {
+        width: 70%;
+        height: 80%;
+        border: round $primary;
+        padding: 1 2;
+        background: $panel;
+    }
+    LabelsPickerScreen .title {
+        text-style: bold;
+    }
+    LabelsPickerScreen SelectionList {
+        height: 1fr;
+        margin-top: 1;
+    }
+    LabelsPickerScreen #new-label-input {
+        margin-top: 1;
+    }
+    LabelsPickerScreen .dialog-buttons {
+        margin-top: 1;
+        height: auto;
+        align-horizontal: right;
+    }
+    LabelsPickerScreen .dialog-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel"), ("ctrl+s", "save", "Save")]
+
+    def __init__(self, known_labels: list[str], *, selected: list[str]) -> None:
+        super().__init__()
+        self._selected = [label for label in selected if label]
+        self._known = sorted({*known_labels, *self._selected}, key=str.lower)
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static("Labels:", classes="title")
+            yield SelectionList(*[(label, label, label in self._selected) for label in self._known], id="labels-list")
+            yield Input(placeholder="add a new label (Enter)", id="new-label-input")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Save (Ctrl+S)", id="save-button", variant="primary")
+                yield Button("Cancel (Esc)", id="cancel-button")
+
+    def on_mount(self) -> None:
+        # Focused on the "add a new label" input by default, same convention
+        # as OptionPickerScreen's own filter input -- plain typing goes
+        # straight to adding a new label; Tab or a click reaches the
+        # checklist to toggle an existing one.
+        self.query_one("#new-label-input", Input).focus()
+
+    @on(Input.Submitted, "#new-label-input")
+    def _add_new_label(self, event: Input.Submitted) -> None:
+        self._commit_new_label_input(event.value)
+
+    def _commit_new_label_input(self, value: str) -> None:
+        stripped = value.strip()
+        input_widget = self.query_one("#new-label-input", Input)
+        input_widget.value = ""
+        if not stripped:
+            return
+        selection_list = self.query_one(SelectionList)
+        if stripped in self._known:
+            if stripped not in selection_list.selected:
+                selection_list.select(stripped)
+            return
+        self._known.append(stripped)
+        selection_list.add_option((stripped, stripped, True))
+
+    @on(Button.Pressed, "#save-button")
+    def _save_pressed(self) -> None:
+        self.action_save()
+
+    @on(Button.Pressed, "#cancel-button")
+    def _cancel_pressed(self) -> None:
+        self.action_cancel()
+
+    def action_save(self) -> None:
+        # Commit whatever's still sitting in the "add a new label" input --
+        # otherwise pressing Ctrl+S (or the Save button) right after typing a
+        # new label, without pressing Enter first, would silently drop it.
+        self._commit_new_label_input(self.query_one("#new-label-input", Input).value)
+        self.dismiss(list(self.query_one(SelectionList).selected))
 
     def action_cancel(self) -> None:
         self.dismiss(None)

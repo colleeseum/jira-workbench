@@ -14,22 +14,29 @@ from jira_workbench.metadata import (
     check_jira_api_config,
     delete_version_api,
     ensure_versions,
+    field_clause_names,
+    format_boards,
     format_component_field_option_cache,
     format_doctor_checks,
     format_components,
     format_component_cache,
     format_versions,
+    load_boards,
     load_component_field_options,
     load_component_summary,
     load_components,
+    load_field_names,
     load_versions,
+    normalize_boards,
     normalize_components,
     normalize_versions,
+    refresh_boards_api,
     refresh_component_field_options_api,
     release_version_api,
     rename_version_api,
     refresh_components_api,
     refresh_versions_api,
+    remember_field_names,
     resolve_version_id,
 )
 from jira_workbench.sync import write_json
@@ -134,6 +141,49 @@ class ApiClient:
             self.component_field_options.append({"id": f"new-{option}", "value": option})
         return {"options": options}
 
+    def get_all_agile_boards(self, project_key: str | None = None) -> object:
+        self.calls.append(("get_all_agile_boards", project_key))
+        return {
+            "values": [
+                {"id": 32, "name": "SAT board", "type": "simple"},
+                {"id": 36, "name": "PS Tools", "type": "scrum"},
+            ]
+        }
+
+    def get_agile_board_configuration(self, board_id: object) -> object:
+        self.calls.append(("get_agile_board_configuration", board_id))
+        filter_ids = {32: "10089", 36: "10166"}
+        return {"filter": {"id": filter_ids[board_id]}}
+
+    def get(self, path: str, params: dict[str, object] | None = None) -> object:
+        self.calls.append(("get", path, params))
+        if path == "rest/api/2/field":
+            # Regression fixture: Jira's field "name" ("Components") can differ
+            # from its actual JQL clause name(s) ("Components[Dropdown]"),
+            # which live under "clauseNames" -- this must be matched, not "name".
+            return [
+                {
+                    "id": "customfield_10071",
+                    "name": "Components",
+                    "clauseNames": ["Components[Dropdown]", "cf[10071]", "Components"],
+                }
+            ]
+        if path == "rest/api/2/filter/10089":
+            return {"jql": "project = SAT ORDER BY Rank ASC"}
+        if path == "rest/api/2/filter/10166":
+            return {
+                "jql": (
+                    'project = SAT AND ( "Components[Dropdown]" = helm-chart OR '
+                    '"Components[Dropdown]" = puppy )  OR  labels=k8s_sprints \n'
+                )
+            }
+        if path == "rest/agile/1.0/board/32/backlog":
+            start = params["startAt"] if params else 0
+            if start == 0:
+                return {"total": 150, "issues": [{"key": f"SAT-{i}"} for i in range(100)]}
+            return {"total": 150, "issues": [{"key": f"SAT-{i}"} for i in range(100, 150)]}
+        raise AssertionError(f"unexpected get() path in test: {path}")
+
 
 class FailingApiClient(ApiClient):
     def get_project_versions(self, key: str) -> object:
@@ -150,6 +200,26 @@ def test_normalize_components_accepts_common_shapes() -> None:
     assert normalize_components([{"name": "helm-chart"}]) == [{"name": "helm-chart"}]
     assert normalize_components({"values": [{"name": "helm-chart"}]}) == [{"name": "helm-chart"}]
     assert normalize_components({"components": [{"name": "helm-chart"}]}) == [{"name": "helm-chart"}]
+
+
+def test_load_field_names_returns_empty_when_missing(tmp_path: Path) -> None:
+    assert load_field_names(tmp_path) == {}
+
+
+def test_remember_field_names_merges_across_calls(tmp_path: Path) -> None:
+    remember_field_names(tmp_path, {"customfield_10082": "Customers SAT"})
+    remember_field_names(tmp_path, {"customfield_10071": "Component Team"})
+
+    assert load_field_names(tmp_path) == {
+        "customfield_10082": "Customers SAT",
+        "customfield_10071": "Component Team",
+    }
+
+
+def test_remember_field_names_ignores_an_empty_dict(tmp_path: Path) -> None:
+    remember_field_names(tmp_path, {})
+
+    assert load_field_names(tmp_path) == {}
 
 
 def test_refresh_versions_api_writes_cache(tmp_path: Path) -> None:
@@ -214,6 +284,98 @@ def test_refresh_components_api_writes_cache(tmp_path: Path) -> None:
     assert cache["components"][0]["name"] == "helm-chart"
     assert load_components(tmp_path) == cache
     assert ("get_project_components", "SAT") in client.calls
+
+
+def test_normalize_boards_accepts_common_shapes() -> None:
+    assert normalize_boards([{"name": "SAT board"}]) == [{"name": "SAT board"}]
+    assert normalize_boards({"values": [{"name": "SAT board"}]}) == [{"name": "SAT board"}]
+    assert normalize_boards({"boards": [{"name": "SAT board"}]}) == [{"name": "SAT board"}]
+
+
+def test_field_clause_names_native_components_field() -> None:
+    assert field_clause_names(ApiClient(), "components") == ["component"]
+
+
+def test_field_clause_names_custom_field_uses_clause_names_not_display_name() -> None:
+    assert field_clause_names(ApiClient(), "customfield_10071") == [
+        "Components[Dropdown]",
+        "cf[10071]",
+        "Components",
+    ]
+
+
+def test_field_clause_names_falls_back_to_field_id_when_unknown() -> None:
+    assert field_clause_names(ApiClient(), "customfield_99999") == ["customfield_99999"]
+
+
+def test_refresh_boards_api_writes_cache_with_compiled_predicates_and_backlog(tmp_path: Path) -> None:
+    client = ApiClient()
+
+    cache = refresh_boards_api(tmp_path, "SAT", client, "customfield_10071")
+
+    assert load_boards(tmp_path) == cache
+    boards = {board["name"]: board for board in cache["boards"]}
+
+    sat_board = boards["SAT board"]
+    assert sat_board["type"] == "simple"
+    assert sat_board["unsupportedReason"] is None
+    assert sat_board["predicate"] == {"op": "true"}
+    assert sat_board["backlogKeys"] == [f"SAT-{i}" for i in range(150)]
+
+    ps_tools = boards["PS Tools"]
+    assert ps_tools["type"] == "scrum"
+    assert ps_tools["unsupportedReason"] is None
+    assert ps_tools["predicate"] is not None
+    # scrum boards are out of scope for the active/backlog split
+    assert ps_tools["backlogKeys"] is None
+
+
+def test_refresh_boards_api_wraps_client_errors(tmp_path: Path) -> None:
+    class FailingBoardsClient(ApiClient):
+        def get_all_agile_boards(self, project_key: str | None = None) -> object:
+            raise RuntimeError("boom")
+
+    try:
+        refresh_boards_api(tmp_path, "SAT", FailingBoardsClient(), "customfield_10071")
+    except MetadataError as exc:
+        assert "could not refresh Jira boards for SAT" in str(exc)
+    else:
+        raise AssertionError("expected MetadataError")
+
+
+def test_refresh_boards_api_marks_board_unsupported_on_bad_jql(tmp_path: Path) -> None:
+    class UnsupportedFilterClient(ApiClient):
+        def get(self, path: str, params: dict[str, object] | None = None) -> object:
+            if path == "rest/api/2/filter/10089":
+                return {"jql": "assignee = currentUser()"}
+            return super().get(path, params)
+
+    cache = refresh_boards_api(tmp_path, "SAT", UnsupportedFilterClient(), "customfield_10071")
+
+    sat_board = next(board for board in cache["boards"] if board["name"] == "SAT board")
+    assert sat_board["predicate"] is None
+    assert sat_board["unsupportedReason"]
+
+
+def test_format_boards_reports_membership_and_backlog_counts() -> None:
+    output = format_boards(
+        {
+            "boards": [
+                {"name": "SAT board", "type": "simple", "unsupportedReason": None, "backlogKeys": ["SAT-1"]},
+                {"name": "PS Tools", "type": "scrum", "unsupportedReason": None, "backlogKeys": None},
+                {"name": "Weird", "type": "simple", "unsupportedReason": "unsupported field: assignee", "backlogKeys": None},
+            ]
+        }
+    )
+
+    assert "SAT board" in output
+    assert "1 issues" in output
+    assert "n/a" in output
+    assert "unsupported: unsupported field: assignee" in output
+
+
+def test_format_boards_reports_no_boards() -> None:
+    assert format_boards({"boards": []}) == "no boards found\n"
 
 
 def test_refresh_component_field_options_api_writes_cache(tmp_path: Path) -> None:

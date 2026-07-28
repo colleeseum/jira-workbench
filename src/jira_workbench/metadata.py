@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from .jql import compile_jql
 from .sync import read_json, utc_now, write_json
 
 
@@ -95,6 +96,15 @@ class ProjectMetadataClient(Protocol):
     def add_custom_field_option(self, field_id: str | int, context_id: str | int, options: list[str]) -> Any:
         pass
 
+    def get_all_agile_boards(self, project_key: str | None = None) -> Any:
+        pass
+
+    def get_agile_board_configuration(self, board_id: object) -> Any:
+        pass
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        pass
+
 
 def jira_api_client(config: JiraApiConfig) -> ProjectMetadataClient:
     try:
@@ -169,8 +179,16 @@ def components_path(jira_dir: Path) -> Path:
     return jira_dir / "meta" / "components.json"
 
 
+def boards_path(jira_dir: Path) -> Path:
+    return jira_dir / "meta" / "boards.json"
+
+
 def component_field_options_path(jira_dir: Path, field_id: str) -> Path:
     return jira_dir / "meta" / f"{field_id}-options.json"
+
+
+def field_names_path(jira_dir: Path) -> Path:
+    return jira_dir / "meta" / "field-names.json"
 
 
 def manifest_path(jira_dir: Path) -> Path:
@@ -192,6 +210,18 @@ def normalize_versions(payload: Any) -> list[dict[str, Any]]:
 def normalize_components(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         for key in ("values", "components"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return [payload]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def normalize_boards(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        for key in ("values", "boards"):
             value = payload.get(key)
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
@@ -238,12 +268,43 @@ def load_components(jira_dir: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def load_boards(jira_dir: Path) -> dict[str, Any] | None:
+    path = boards_path(jira_dir)
+    if not path.exists():
+        return None
+    value = read_json(path)
+    return value if isinstance(value, dict) else None
+
+
 def load_component_field_options(jira_dir: Path, field_id: str) -> dict[str, Any] | None:
     path = component_field_options_path(jira_dir, field_id)
     if not path.exists():
         return None
     value = read_json(path)
     return value if isinstance(value, dict) else None
+
+
+def load_field_names(jira_dir: Path) -> dict[str, str]:
+    """Locally-cached field id -> display name, e.g. "customfield_10082" ->
+    "Customers SAT" -- built up opportunistically (see remember_field_names)
+    from whatever live editmeta/createmeta fetches already happen elsewhere,
+    never its own API call, so this stays available offline once discovered."""
+    path = field_names_path(jira_dir)
+    if not path.exists():
+        return {}
+    value = read_json(path)
+    names = value.get("names") if isinstance(value, dict) else None
+    if not isinstance(names, dict):
+        return {}
+    return {key: name for key, name in names.items() if isinstance(key, str) and isinstance(name, str)}
+
+
+def remember_field_names(jira_dir: Path, names: dict[str, str]) -> None:
+    if not names:
+        return
+    existing = load_field_names(jira_dir)
+    existing.update(names)
+    write_json(field_names_path(jira_dir), {"names": existing})
 
 
 def refresh_versions_api(
@@ -289,6 +350,116 @@ def refresh_components_api(
         "components": sort_components(normalize_components(components)),
     }
     write_json(components_path(jira_dir), cache)
+    return cache
+
+
+def field_clause_names(client: ProjectMetadataClient, field_id: str) -> list[str]:
+    """Every name usable in a JQL clause for this field.
+
+    A field's plain "name" (what's shown in the UI) is not necessarily what
+    JQL accepts -- Jira disambiguates same-named fields by giving each a
+    distinct "clauseNames" alias (e.g. a custom field named "Components"
+    might only be queryable as "Components[Dropdown]"), so board filters
+    must be matched against clauseNames, not name.
+    """
+    if field_id == "components":
+        # The native multi-value Components field is queried in JQL as the
+        # singular "component", unlike custom fields which use clauseNames.
+        return ["component"]
+    try:
+        fields = client.get("rest/api/2/field")
+    except Exception as exc:
+        raise MetadataError(f"could not read Jira field metadata: {exc}") from exc
+    if isinstance(fields, list):
+        for entry in fields:
+            if isinstance(entry, dict) and entry.get("id") == field_id:
+                clause_names = entry.get("clauseNames")
+                if isinstance(clause_names, list) and clause_names:
+                    return [str(name) for name in clause_names]
+                name = entry.get("name")
+                if isinstance(name, str) and name:
+                    return [name]
+    return [field_id]
+
+
+def fetch_backlog_keys(client: ProjectMetadataClient, board_id: object) -> list[str]:
+    keys: list[str] = []
+    start = 0
+    while True:
+        page = client.get(
+            f"rest/agile/1.0/board/{board_id}/backlog",
+            params={"startAt": start, "maxResults": 100, "fields": "key"},
+        )
+        if not isinstance(page, dict):
+            break
+        issues = page.get("issues")
+        if not isinstance(issues, list):
+            break
+        keys.extend(issue["key"] for issue in issues if isinstance(issue, dict) and isinstance(issue.get("key"), str))
+        total = page.get("total")
+        if not isinstance(total, int) or start + 100 >= total:
+            break
+        start += 100
+    return keys
+
+
+def refresh_boards_api(
+    jira_dir: Path,
+    project: str,
+    client: ProjectMetadataClient,
+    component_field: str,
+) -> dict[str, Any]:
+    try:
+        component_field_names = field_clause_names(client, component_field)
+        raw_boards = client.get_all_agile_boards(project_key=project)
+    except Exception as exc:
+        raise MetadataError(f"could not refresh Jira boards for {project}: {exc}") from exc
+
+    boards: list[dict[str, Any]] = []
+    for raw_board in normalize_boards(raw_boards):
+        board_id = raw_board.get("id")
+        name = str(raw_board.get("name") or board_id)
+        board_type = str(raw_board.get("type") or "unknown")
+        jql: str | None = None
+        predicate: dict[str, Any] | None = None
+        reason: str | None = None
+        try:
+            config = client.get_agile_board_configuration(board_id)
+            filter_ref = config.get("filter") if isinstance(config, dict) else None
+            filter_id = filter_ref.get("id") if isinstance(filter_ref, dict) else None
+            if filter_id:
+                filter_payload = client.get(f"rest/api/2/filter/{filter_id}")
+                jql = filter_payload.get("jql") if isinstance(filter_payload, dict) else None
+        except Exception as exc:
+            reason = f"could not read board filter: {exc}"
+
+        if reason is None:
+            if not jql:
+                reason = "board has no filter JQL"
+            else:
+                predicate, reason = compile_jql(jql, component_field_names=component_field_names)
+
+        backlog_keys: list[str] | None = None
+        if board_type != "scrum":
+            try:
+                backlog_keys = fetch_backlog_keys(client, board_id)
+            except Exception:
+                backlog_keys = None
+
+        boards.append(
+            {
+                "id": board_id,
+                "name": name,
+                "type": board_type,
+                "jql": jql,
+                "predicate": predicate,
+                "unsupportedReason": reason,
+                "backlogKeys": backlog_keys,
+            }
+        )
+
+    cache = {"project": project, "fetchedAt": utc_now(), "boards": boards}
+    write_json(boards_path(jira_dir), cache)
     return cache
 
 
@@ -606,6 +777,24 @@ def format_versions(cache: dict[str, Any]) -> str:
 def format_component_cache(cache: dict[str, Any]) -> str:
     components = normalize_components(cache.get("components"))
     return format_components(components)
+
+
+def format_boards(cache: dict[str, Any]) -> str:
+    boards = normalize_boards(cache.get("boards"))
+    if not boards:
+        return "no boards found\n"
+
+    names = [str(board.get("name") or "") for board in boards]
+    width = max(len("board"), *(len(name) for name in names))
+    rows = [f"{'board':<{width}}  type    membership   backlog"]
+    for board, name in zip(boards, names, strict=True):
+        board_type = str(board.get("type") or "")
+        reason = board.get("unsupportedReason")
+        membership = f"unsupported: {reason}" if reason else "ok"
+        backlog_keys = board.get("backlogKeys")
+        backlog_display = f"{len(backlog_keys)} issues" if isinstance(backlog_keys, list) else "n/a"
+        rows.append(f"{name:<{width}}  {board_type:<6}  {membership:<12} {backlog_display}")
+    return "\n".join(rows) + "\n"
 
 
 def format_component_field_option_cache(cache: dict[str, Any]) -> str:

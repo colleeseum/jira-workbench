@@ -541,3 +541,25 @@ def test_push_refuses_unsupported_fields(tmp_path: Path) -> None:
 
     assert result.failed == 1
     assert "fix_version" in result.errors[0]
+
+
+def test_push_supports_duedate_field(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "duedate", "2026-08-01")
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    assert client.update_calls == [("SAT-1", {"duedate": "2026-08-01"}, False)]
+
+
+def test_push_supports_custom_labels_type_field(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "customfield_10082", ["acme", "globex"])
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    assert client.update_calls == [("SAT-1", {"customfield_10082": ["acme", "globex"]}, False)]

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import copy
 import difflib
+import hashlib
 import json
 import re
 import textwrap
+from datetime import datetime
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 
-from .metadata import load_versions, version_name
+from .jql import evaluate_predicate
+from .metadata import load_boards, load_field_names, load_versions, normalize_boards, version_name
 from .shadow import load_shadow, render_diff
 from .sync import find_existing_issue, issue_key_sort_key, issue_path_sort_key, read_json
 
@@ -22,7 +25,7 @@ DONE_STATUSES = {"close", "closed", "done", "resolved"}
 DEFAULT_RESOLUTIONS = ["Done", "Won't Do", "Duplicate", "Cannot Reproduce"]
 VIRTUAL_NONE = "(none)"
 FILTER_ANY = "(any)"  # UI-only "no filter on this dimension" sentinel; never stored
-SWIMLANE_MODES = ("none", "epic", "version", "component")
+SWIMLANE_MODES = ("none", "epic", "version", "component", "board")
 REPORT_FIELD_LABELS = {
     "assignee": "assignee",
     "fixVersions": "version",
@@ -32,6 +35,64 @@ REPORT_FIELD_LABELS = {
     "status": "status",
     "type": "type",
 }
+
+
+def extract_field_names(edit_fields: dict[str, dict[str, Any]] | None) -> dict[str, str]:
+    """Pull {field_id: display_name} out of an issue_editmeta response, e.g.
+    "customfield_10082" -> "Customers SAT" -- fed into remember_field_names
+    so the locally-cached name survives for later, offline report rendering."""
+    if not edit_fields:
+        return {}
+    return {
+        field_id: str(meta["name"])
+        for field_id, meta in edit_fields.items()
+        if isinstance(meta, dict) and isinstance(meta.get("name"), str)
+    }
+
+
+def report_field_label(jira_dir: Path, field: str) -> str:
+    """Human-friendly label for a shadow-changed field name in a report --
+    the fixed system-field labels first, then whatever custom field name has
+    been locally cached (see remember_field_names), falling back to the raw
+    field id (e.g. "customfield_10082") only if neither is known."""
+    if field in REPORT_FIELD_LABELS:
+        return REPORT_FIELD_LABELS[field]
+    return load_field_names(jira_dir).get(field, field)
+
+
+def version_id_to_name_map(jira_dir: Path) -> dict[str, str]:
+    cache = load_versions(jira_dir)
+    versions = as_list(as_dict(cache).get("versions")) if cache else []
+    result: dict[str, str] = {}
+    for version in versions:
+        if not isinstance(version, dict):
+            continue
+        version_id = version.get("id")
+        name = version_name(version)
+        if isinstance(version_id, str) and name:
+            result[version_id] = name
+    return result
+
+
+def resolve_fix_version_names(jira_dir: Path, value: Any) -> list[str]:
+    """Fix version display names, resolved by id against the current
+    versions cache first. A version can be renamed in Jira after an issue
+    was last synced -- Meta's own versions.json is kept current on rename
+    (see VersionsScreen.action_rename), but the issue's own locally synced
+    fixVersions still has whatever name was embedded back when it was last
+    fetched. Falls back to that embedded name only if the id isn't in the
+    cache (e.g. offline, or the versions cache has never been refreshed)."""
+    id_to_name = version_id_to_name_map(jira_dir)
+    names: list[str] = []
+    for entry in as_list(value):
+        version_id = entry.get("id") if isinstance(entry, dict) else None
+        if isinstance(version_id, str) and version_id in id_to_name:
+            names.append(id_to_name[version_id])
+            continue
+        name = display_name(entry)
+        if name:
+            names.append(name)
+    return names
 
 
 BASE_EDITABLE_FIELDS = [
@@ -85,6 +146,36 @@ def item_fix_version(item: dict[str, Any]) -> str:
     return field_value(item, "fixVersion")
 
 
+def matches_board(item: dict[str, Any], board: str | None, board_scope: str | None) -> bool:
+    """Board membership is list-valued (an item can be on several boards), so
+    it can't reuse matches_field's single-value equality contract."""
+    if not board:
+        return True
+    if board not in as_list(item.get("boards")):
+        return False
+    if board_scope and board_scope != "any":
+        return item.get("boardStatus", {}).get(board) == board_scope
+    return True
+
+
+def is_stale_done(item: dict[str, Any], *, max_age_days: int) -> bool:
+    """True if this item is Done/Closed and has been so for more than
+    max_age_days -- a local, explicit stand-in for the "hide old completed
+    issues" behavior Jira's own Kanban board UI applies (that setting isn't
+    exposed by any API, so this is our own equivalent, not a replica)."""
+    if display_name(item.get("status")).strip().lower() not in DONE_STATUSES:
+        return False
+    changed = item.get("statusCategoryChangeDate")
+    if not isinstance(changed, str) or not changed:
+        return False
+    try:
+        changed_at = datetime.fromisoformat(changed.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    now = datetime.now(changed_at.tzinfo)
+    return (now - changed_at).days > max_age_days
+
+
 def filter_items(
     items: list[dict[str, Any]],
     *,
@@ -93,6 +184,9 @@ def filter_items(
     active: bool = True,
     modified_keys: set[str] | None = None,
     modified_only: bool = False,
+    board: str | None = None,
+    board_scope: str | None = None,
+    max_done_age_days: int | None = None,
 ) -> list[dict[str, Any]]:
     field_filters = field_filters or {}
     modified_keys = modified_keys or set()
@@ -108,6 +202,8 @@ def filter_items(
         and matches_filter(item, pattern)
         and (not active or is_active_item(item))
         and (not modified_only or display_name(item.get("key")) in modified_keys)
+        and matches_board(item, board, board_scope)
+        and (max_done_age_days is None or not is_stale_done(item, max_age_days=max_done_age_days))
     ]
 
 
@@ -150,6 +246,20 @@ def distinct_field_values(
     for item in items:
         value = field_value(item, field) or empty_bucket
         counts[value] = counts.get(value, 0) + 1
+    return sorted(counts.items(), key=lambda row: row[0].lower())
+
+
+def label_counts(items: list[dict[str, Any]]) -> list[tuple[str, int]]:
+    # Labels are multi-valued, unlike component/fixVersion/etc., so this
+    # can't reuse distinct_field_values (one bucket per item) -- each item
+    # can contribute to several labels' counts at once. `items` is expected
+    # to already be shadow-merged (e.g. from load_manifest_items), so this
+    # reflects local edits immediately, the same as every other local view.
+    counts: dict[str, int] = {}
+    for item in items:
+        for label in item.get("labels") or []:
+            if isinstance(label, str) and label:
+                counts[label] = counts.get(label, 0) + 1
     return sorted(counts.items(), key=lambda row: row[0].lower())
 
 
@@ -225,6 +335,13 @@ def swimlane_label(item: dict[str, Any], swimlane: str | None) -> str | None:
         return virtual_none(item_fix_version(item))
     if mode == "component":
         return virtual_none(display_name(item.get("component")))
+    if mode == "board":
+        # An item can genuinely belong to more than one board (board
+        # membership is a JQL filter match, not an exclusive field) -- shown
+        # as one joined lane per item rather than duplicating rows, since
+        # every other swimlane assumes one lane per item.
+        boards = as_list(item.get("boards"))
+        return ", ".join(str(board) for board in boards) if boards else VIRTUAL_NONE
     return None
 
 
@@ -293,38 +410,134 @@ def is_epic_item(item: dict[str, Any]) -> bool:
     return display_name(item.get("type")).strip().lower() == "epic"
 
 
-TYPE_ICONS: dict[str, tuple[str, str]] = {
-    "epic": ("◆", "purple"),  # diamond
-    "story": ("●", "green"),  # circle
-    "task": ("■", "blue"),  # square
-    "bug": ("▲", "red"),  # triangle
-    "sub-task": ("▪", "cyan"),  # small square
-    "subtask": ("▪", "cyan"),
+# Explicit hex, not bare ANSI color names ("blue", "purple", ...) -- those are
+# ColorType.STANDARD in Rich, meaning the actual rendered color depends on the
+# terminal's own (often themed/remapped) ANSI palette rather than a fixed RGB
+# value. Confirmed live: Rich's "blue" resolves to ColorType.STANDARD number=4,
+# exactly the ANSI slot many dark terminal themes retint toward violet/indigo
+# -- hex values render identically in every terminal regardless of its color
+# scheme, the same way Textual's own chrome (e.g. the footer) already does
+# via its theme system.
+TYPE_ICON_COLORS = {
+    "purple": "#a855f7",
+    "green": "#22c55e",
+    "blue": "#3b82f6",
+    "red": "#ef4444",
+    "cyan": "#06b6d4",
 }
-DEFAULT_TYPE_ICON: tuple[str, str] = ("○", "dim")  # white circle
+
+TYPE_ICONS: dict[str, tuple[str, str]] = {
+    "epic": ("◆", TYPE_ICON_COLORS["purple"]),  # diamond
+    "story": ("●", TYPE_ICON_COLORS["green"]),  # circle
+    "task": ("■", TYPE_ICON_COLORS["blue"]),  # square
+    "bug": ("▲", TYPE_ICON_COLORS["red"]),  # triangle
+    "sub-task": ("▪", TYPE_ICON_COLORS["cyan"]),  # small square
+    "subtask": ("▪", TYPE_ICON_COLORS["cyan"]),
+}
+DEFAULT_TYPE_ICON: tuple[str, str] = ("○", "dim")  # white circle; "dim" is a style attribute, not an ANSI color
+
+# Nerd Font v3 codepoints (verified against the project's own glyphnames.json,
+# not guessed from memory -- these are easy to misremember and a wrong
+# codepoint just renders as a broken glyph). Opt-in only; see type_icon().
+NERD_FONT_TYPE_ICONS: dict[str, tuple[str, str]] = {
+    "epic": ("", TYPE_ICON_COLORS["purple"]),  # oct-rocket
+    "story": ("\U000f00c0", TYPE_ICON_COLORS["green"]),  # md-bookmark
+    "task": ("", TYPE_ICON_COLORS["blue"]),  # fa-square_check
+    "bug": ("", TYPE_ICON_COLORS["red"]),  # fa-bug
+    "sub-task": ("\U000f060d", TYPE_ICON_COLORS["cyan"]),  # md-subdirectory_arrow_right
+    "subtask": ("\U000f060d", TYPE_ICON_COLORS["cyan"]),
+}
+DEFAULT_NERD_FONT_TYPE_ICON: tuple[str, str] = ("", "dim")  # oct-dot_fill
 
 
-def type_icon(type_name: Any) -> tuple[str, str]:
+def type_icon(type_name: Any, *, nerd_font: bool = False) -> tuple[str, str]:
     """Glyph + Rich color for an issue type, echoing Jira's web icon colors.
 
-    Plain geometric shapes rather than emoji, so it stays single-width and
-    renders consistently across terminals/fonts.
+    Plain geometric shapes by default, so it stays single-width and renders
+    consistently across terminals/fonts with no setup needed. Pass
+    nerd_font=True (driven by the [view].nerd_font config setting) for the
+    Nerd Font v3 glyph set instead -- only sensible if the user's terminal
+    font actually has those glyphs patched in.
     """
-    return TYPE_ICONS.get(display_name(type_name).strip().lower(), DEFAULT_TYPE_ICON)
+    icons = NERD_FONT_TYPE_ICONS if nerd_font else TYPE_ICONS
+    default = DEFAULT_NERD_FONT_TYPE_ICON if nerd_font else DEFAULT_TYPE_ICON
+    return icons.get(display_name(type_name).strip().lower(), default)
 
 
-PRIORITY_COLORS: dict[str, str] = {
-    "highest": "red",
-    "high": "yellow",
-    "low": "cyan",
-    "lowest": "green",
+PRIORITY_ICON_COLORS = {
+    "red": "#ef4444",
+    "orange": "#f59e0b",
+    "cyan": "#06b6d4",
+    "green": "#22c55e",
+    # Deliberately not on the red-to-green urgency gradient -- Medium is the
+    # baseline, not a signal, so it gets a neutral gray rather than a hue.
+    "gray": "#94a3b8",
 }
 
+PRIORITY_ICONS: dict[str, tuple[str, str]] = {
+    "highest": ("⇈", PRIORITY_ICON_COLORS["red"]),
+    "high": ("↑", PRIORITY_ICON_COLORS["orange"]),
+    "medium": ("=", PRIORITY_ICON_COLORS["gray"]),
+    "low": ("↓", PRIORITY_ICON_COLORS["cyan"]),
+    "lowest": ("⇊", PRIORITY_ICON_COLORS["green"]),
+}
+DEFAULT_PRIORITY_ICON: tuple[str, str] = ("", "dim")  # unrecognized priority name -- not worth guessing at
 
-def priority_color(priority_name: Any) -> str | None:
-    """Color for priority, red (highest) to green (lowest); Medium stays
-    plain since it's the baseline, not worth calling out."""
-    return PRIORITY_COLORS.get(display_name(priority_name).strip().lower())
+# Nerd Font v3 codepoints, verified against glyphnames.json the same way as
+# NERD_FONT_TYPE_ICONS above.
+NERD_FONT_PRIORITY_ICONS: dict[str, tuple[str, str]] = {
+    "highest": ("\U000f013f", PRIORITY_ICON_COLORS["red"]),  # md-chevron_double_up
+    "high": ("\U000f0143", PRIORITY_ICON_COLORS["orange"]),  # md-chevron_up
+    "medium": ("\U000f01fc", PRIORITY_ICON_COLORS["gray"]),  # md-equal
+    "low": ("\U000f0140", PRIORITY_ICON_COLORS["cyan"]),  # md-chevron_down
+    "lowest": ("\U000f013c", PRIORITY_ICON_COLORS["green"]),  # md-chevron_double_down
+}
+DEFAULT_NERD_FONT_PRIORITY_ICON: tuple[str, str] = ("", "dim")
+
+
+def priority_icon(priority_name: Any, *, nerd_font: bool = False) -> tuple[str, str]:
+    """Glyph + Rich color for a priority, red (highest) to green (lowest),
+    with Medium shown as a neutral gray baseline marker rather than left
+    blank. An unrecognized priority name still falls back to a blank,
+    plain default -- nothing sensible to guess at for a custom scheme."""
+    icons = NERD_FONT_PRIORITY_ICONS if nerd_font else PRIORITY_ICONS
+    default = DEFAULT_NERD_FONT_PRIORITY_ICON if nerd_font else DEFAULT_PRIORITY_ICON
+    return icons.get(display_name(priority_name).strip().lower(), default)
+
+
+# Darker/more saturated ("600"-ish) shades than TYPE_ICON_COLORS -- these sit
+# under white bold text as a filled background, so need more contrast margin
+# than a bare colored glyph does.
+PILL_PALETTE: list[str] = [
+    "#ef4444",
+    "#f97316",
+    "#65a30d",
+    "#16a34a",
+    "#0d9488",
+    "#0891b2",
+    "#2563eb",
+    "#4f46e5",
+    "#9333ea",
+    "#db2777",
+]
+
+
+def pill_color(value: str) -> str:
+    """Deterministic per-name color: the same value always maps to the same
+    palette entry, across runs and processes. Uses hashlib rather than the
+    builtin hash() -- Python randomizes str hash per-process by default,
+    which would make every label's color reshuffle on every launch."""
+    digest = hashlib.sha256(value.encode("utf-8")).digest()
+    return PILL_PALETTE[digest[0] % len(PILL_PALETTE)]
+
+
+def pill_values(value: Any) -> list[str]:
+    """Normalize a raw Jira field value (list, dict, str, None) into the list
+    of individual display strings to render as separate pills."""
+    if isinstance(value, list):
+        return [name for item in value if (name := display_name(item))]
+    name = display_name(value)
+    return [name] if name else []
 
 
 def filter_items_for_swimlane(items: list[dict[str, Any]], swimlane: str | None) -> list[dict[str, Any]]:
@@ -421,6 +634,20 @@ def display_name(value: Any) -> str:
     return str(value)
 
 
+def display_component(value: Any) -> str:
+    # "_unassigned" is the real on-disk sync sentinel for "no component"
+    # (see sync.py's component_slug) -- meaningful for filtering, but not a
+    # useful thing to print in a list view where every other unset field
+    # (assignee, fix version, ...) just renders blank.
+    name = display_name(value)
+    return "" if name == "_unassigned" else name
+
+
+def load_cached_boards(jira_dir: Path) -> list[dict[str, Any]]:
+    cache = load_boards(jira_dir)
+    return normalize_boards(cache.get("boards")) if cache else []
+
+
 def load_manifest_items(jira_dir: Path, component_field: str | None = None) -> list[dict[str, Any]]:
     manifest_path = jira_dir / "manifest.json"
     if not manifest_path.exists():
@@ -429,8 +656,13 @@ def load_manifest_items(jira_dir: Path, component_field: str | None = None) -> l
     items = manifest.get("workItems") if isinstance(manifest, dict) else None
     if not isinstance(items, list):
         raise ViewError(f"manifest at {manifest_path} does not contain workItems")
+    boards = load_cached_boards(jira_dir)
     return sorted(
-        (with_local_index_fields(jira_dir, item, component_field) for item in items if isinstance(item, dict)),
+        (
+            with_local_index_fields(jira_dir, item, component_field, boards=boards)
+            for item in items
+            if isinstance(item, dict)
+        ),
         key=lambda item: issue_key_sort_key(display_name(item.get("key"))),
     )
 
@@ -439,6 +671,8 @@ def with_local_index_fields(
     jira_dir: Path,
     item: dict[str, Any],
     component_field: str | None = None,
+    *,
+    boards: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     enriched = dict(item)
     key = display_name(item.get("key"))
@@ -456,18 +690,40 @@ def with_local_index_fields(
     fields = as_dict(issue.get("fields"))
     issue_type = fields.get("issuetype")
     status = fields.get("status")
-    fix_versions = as_list(fields.get("fixVersions"))
+    fix_version_names = resolve_fix_version_names(jira_dir, fields.get("fixVersions"))
     parent = as_dict(fields.get("parent"))
     parent_fields = as_dict(parent.get("fields"))
     enriched["summary"] = display_name(fields.get("summary"))
     enriched["status"] = display_name(status)
     enriched["type"] = display_name(issue_type)
     enriched["component"] = hierarchy_component(issue, component_field) or display_name(item.get("component"))
-    enriched["fixVersion"] = display_name(fix_versions[0]) if fix_versions else ""
+    enriched["fixVersion"] = fix_version_names[0] if fix_version_names else ""
     enriched["priority"] = display_name(fields.get("priority"))
     enriched["assignee"] = display_name(fields.get("assignee"))
     enriched["epic"] = display_name(parent.get("key"))
     enriched["epicSummary"] = display_name(parent_fields.get("summary"))
+    enriched["statusCategoryChangeDate"] = display_name(fields.get("statuscategorychangedate"))
+
+    labels = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
+    enriched["labels"] = labels
+    if boards is None:
+        boards = load_cached_boards(jira_dir)
+    component_value = enriched["component"] or None
+    matched_boards: list[str] = []
+    board_status: dict[str, str] = {}
+    for board in boards:
+        predicate = board.get("predicate")
+        if not predicate:
+            continue
+        if not evaluate_predicate(predicate, component=component_value, labels=labels):
+            continue
+        name = str(board.get("name") or "")
+        matched_boards.append(name)
+        backlog_keys = board.get("backlogKeys")
+        if isinstance(backlog_keys, list):
+            board_status[name] = "backlog" if key in backlog_keys else "active"
+    enriched["boards"] = matched_boards
+    enriched["boardStatus"] = board_status
     return enriched
 
 
@@ -476,10 +732,12 @@ def refresh_index_item(
     items: list[dict[str, Any]],
     key: str,
     component_field: str | None = None,
+    *,
+    boards: list[dict[str, Any]] | None = None,
 ) -> None:
     for index, item in enumerate(items):
         if display_name(item.get("key")) == key:
-            items[index] = with_local_index_fields(jira_dir, item, component_field)
+            items[index] = with_local_index_fields(jira_dir, item, component_field, boards=boards)
             return
 
 
@@ -489,8 +747,9 @@ def refresh_stale_index_items(
     keys: set[str],
     component_field: str | None = None,
 ) -> None:
+    boards = load_cached_boards(jira_dir)
     for key in sorted(keys, key=issue_key_sort_key):
-        refresh_index_item(jira_dir, items, key, component_field)
+        refresh_index_item(jira_dir, items, key, component_field, boards=boards)
     keys.clear()
 
 
@@ -588,8 +847,12 @@ def issue_parent_key(issue: dict[str, Any]) -> str:
     return display_name(as_dict(fields.get("parent")).get("key")).strip()
 
 
-def field_section(fields: dict[str, Any], component_field: str | None) -> list[str]:
-    fix_versions = display_name(fields.get("fixVersions")) or "(none)"
+def field_section(fields: dict[str, Any], component_field: str | None, jira_dir: Path | None = None) -> list[str]:
+    if jira_dir is not None:
+        fix_version_names = resolve_fix_version_names(jira_dir, fields.get("fixVersions"))
+        fix_versions = ", ".join(fix_version_names) if fix_version_names else "(none)"
+    else:
+        fix_versions = display_name(fields.get("fixVersions")) or "(none)"
     component_source = component_field or "components"
     components = display_name(fields.get(component_source))
     labels = display_name(fields.get("labels"))
@@ -665,10 +928,46 @@ def observed_field_options(jira_dir: Path, field: str, *, include_empty: str | N
         name = display_name(value).strip()
         if name:
             options.add(name)
-    sorted_options = sorted(options, key=str.lower)
+    # Priority has a real severity order (same PRIORITY_RANK the index table
+    # sorts by) -- alphabetical would scatter it as Highest/High/Low/Lowest/
+    # Medium, putting Medium at the end instead of in the middle where it
+    # belongs.
+    if field == "priority":
+        sorted_options = sorted(options, key=lambda name: PRIORITY_RANK.get(name.strip().lower(), len(PRIORITY_RANK)))
+    else:
+        sorted_options = sorted(options, key=str.lower)
     if include_empty:
         return [include_empty, *sorted_options]
     return sorted_options
+
+
+def field_label_options(jira_dir: Path, field: str) -> list[str]:
+    values: set[str] = set()
+    for issue in local_issues(jira_dir):
+        fields = as_dict(issue.get("fields"))
+        for value in as_list(fields.get(field)):
+            if isinstance(value, str) and value.strip():
+                values.add(value.strip())
+    return sorted(values, key=str.lower)
+
+
+def label_options(jira_dir: Path) -> list[str]:
+    return field_label_options(jira_dir, "labels")
+
+
+def label_type_fields(edit_fields: dict[str, dict[str, Any]] | None) -> list[tuple[str, str]]:
+    # Native "labels" is always included, even without live edit metadata (fetch
+    # failed, or no API configured) -- so that one already-known field never
+    # regresses just because the live fetch didn't happen this time.
+    result: dict[str, str] = {"labels": "Labels"}
+    for field_id, meta in (edit_fields or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        schema = meta.get("schema")
+        custom = schema.get("custom") if isinstance(schema, dict) else None
+        if isinstance(custom, str) and custom.endswith(":labels"):
+            result[field_id] = str(meta.get("name") or field_id)
+    return sorted(result.items(), key=lambda pair: pair[1].lower())
 
 
 def component_options(jira_dir: Path) -> list[str]:
@@ -804,6 +1103,8 @@ def detail_field_rows(
     issue: dict[str, Any],
     component_field: str | None,
     comments: str | None = None,
+    *,
+    edit_fields: dict[str, dict[str, Any]] | None = None,
 ) -> list[tuple[str, str, str]]:
     fields = as_dict(issue.get("fields"))
     component_source = component_field or "components"
@@ -826,6 +1127,12 @@ def detail_field_rows(
         ("Updated", "updated", display_name(fields.get("updated"))),
         ("Created", "created", display_name(fields.get("created"))),
     ])
+    if edit_fields and "duedate" in edit_fields:
+        rows.append(("Due date", "duedate", display_name(fields.get("duedate")) or "(none)"))
+    for field_id, field_name in label_type_fields(edit_fields):
+        if field_id == "labels":
+            continue  # already a static row above
+        rows.append((field_name, field_id, display_name(fields.get(field_id)) or "(none)"))
     return [(label, field, value) for label, field, value in rows if value]
 
 
@@ -965,8 +1272,14 @@ def other_field_rows(issue: dict[str, Any], component_field: str | None) -> list
     return rows
 
 
-def editable_detail_fields(component_field: str | None = None) -> set[str]:
-    return {field for _, field in editable_field_choices(component_field)}
+def editable_detail_fields(
+    component_field: str | None = None, edit_fields: dict[str, dict[str, Any]] | None = None
+) -> set[str]:
+    fields = {field for _, field in editable_field_choices(component_field)}
+    if edit_fields and "duedate" in edit_fields:
+        fields.add("duedate")
+    fields.update(field_id for field_id, _ in label_type_fields(edit_fields))
+    return fields
 
 
 def format_issue(
@@ -991,7 +1304,7 @@ def format_issue(
     if shadow is not None:
         lines.extend(format_shadow_summary(shadow))
         lines.append("")
-    lines.extend(field_section(fields, component_field))
+    lines.extend(field_section(fields, component_field, jira_dir))
     lines.append("")
     lines.append("Description")
     lines.append("-----------")
@@ -1071,7 +1384,7 @@ def diffable_issue_text(
     description = text_from_adf(fields.get("description")).strip()
 
     lines = [f"{key}  {summary}".rstrip(), ""]
-    lines.extend(field_section(fields, component_field))
+    lines.extend(field_section(fields, component_field, jira_dir))
     lines.append("")
     lines.append("Description")
     lines.append("-----------")
@@ -1222,7 +1535,7 @@ def shadow_change_summary(shadow: dict[str, Any], jira_dir: Path, key: str) -> l
 
     fields = as_dict(shadow.get("fields"))
     if fields:
-        names = ", ".join(sorted(fields))
+        names = ", ".join(report_field_label(jira_dir, field) for field in sorted(fields))
         parts.append(f"{len(fields)} field{'s' if len(fields) != 1 else ''} ({names})")
 
     rows = list_comments(jira_dir, key, shadow=shadow)
@@ -1351,8 +1664,12 @@ def detailed_shadow_report_lines(jira_dir: Path, keys: list[str]) -> list[str]:
         if fields:
             lines.append("Changes:")
             for field in sorted(fields):
-                label = REPORT_FIELD_LABELS.get(field, field)
-                before = original_report_value(issue, field)
+                label = report_field_label(jira_dir, field)
+                if field == "fixVersions":
+                    names = resolve_fix_version_names(jira_dir, as_dict(issue.get("fields")).get("fixVersions"))
+                    before = ", ".join(names) if names else report_empty_value(field)
+                else:
+                    before = original_report_value(issue, field)
                 after = shadow_report_value(field, fields[field])
                 if field == "description":
                     lines.append(f"- {label}:")

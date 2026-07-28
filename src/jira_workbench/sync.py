@@ -54,6 +54,7 @@ class SyncConfig:
     project: str
     jira_dir: Path
     component_field: str = "components"
+    force: bool = False
 
 
 @dataclass(frozen=True)
@@ -272,7 +273,8 @@ def sync_project(
 
     if progress:
         progress("[1/5] Refreshing project metadata...")
-    from .metadata import refresh_versions_api
+    from .issue import fetch_all_field_names
+    from .metadata import refresh_versions_api, remember_field_names
 
     version_count = 0
     try:
@@ -282,6 +284,16 @@ def sync_project(
     except Exception as exc:
         if progress:
             progress(f"metadata refresh skipped: {exc}")
+
+    try:
+        # Populated here (not just opportunistically from the TUI's Detail
+        # screen) so a CLI-only workflow -- `jira-wb shadow set` / `shadow
+        # report`, no TUI involved -- still shows friendly custom field
+        # names instead of raw ids like "customfield_10082".
+        remember_field_names(jira_dir, fetch_all_field_names(client))
+    except Exception as exc:
+        if progress:
+            progress(f"field name refresh skipped: {exc}")
 
     if progress:
         progress("[2/5] Refreshing project index...")
@@ -306,7 +318,7 @@ def sync_project(
 
         existing = find_existing_issue(components_dir, key)
         index_updated = updated_at(work_item)
-        if existing is not None and index_updated is not None:
+        if not config.force and existing is not None and index_updated is not None:
             existing_issue = read_json(existing)
             if isinstance(existing_issue, dict) and updated_at(existing_issue) == index_updated:
                 skipped += 1
@@ -314,7 +326,7 @@ def sync_project(
 
         issue = normalize_issue(client.get_issue(key, fields="*all"), key)
 
-        if existing is not None:
+        if not config.force and existing is not None:
             existing_issue = read_json(existing)
             if isinstance(existing_issue, dict) and updated_at(existing_issue) == updated_at(issue):
                 skipped += 1

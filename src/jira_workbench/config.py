@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import tomlkit
+
 
 DEFAULT_CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config").expanduser() / "jira-wb" / "config.toml"
 
@@ -24,10 +26,18 @@ class WorkbenchConfig:
     jira_email: str | None = None
     jira_api_token: str | None = None
     view_component: str | None = None
+    view_fix_version: str | None = None
+    view_assignee: str | None = None
+    view_board: str | None = None
+    view_board_scope: str | None = None
     view_filter: str | None = None
     view_swimlane: str | None = None
+    view_active: bool | None = None
+    view_nerd_font: bool | None = None
     view_preview_lines: int | None = None
+    view_hide_done_after_days: int | None = None
     versions_filter: str | None = None
+    issue_default_type: str | None = None
     host: str | None = None
     port: int | None = None
 
@@ -74,6 +84,11 @@ def load_config(path: Path) -> WorkbenchConfig:
         versions = {}
     if not isinstance(versions, dict):
         raise ConfigError(f"invalid config file {expanded}: [versions] must be a table")
+    issue = data.get("issue", {})
+    if issue is None:
+        issue = {}
+    if not isinstance(issue, dict):
+        raise ConfigError(f"invalid config file {expanded}: [issue] must be a table")
 
     return WorkbenchConfig(
         project=optional_string(data, "project", expanded),
@@ -83,10 +98,18 @@ def load_config(path: Path) -> WorkbenchConfig:
         jira_email=optional_string(data, "jira_email", expanded),
         jira_api_token=optional_string(data, "jira_api_token", expanded),
         view_component=optional_string(view, "component", expanded),
+        view_fix_version=optional_string(view, "fix_version", expanded),
+        view_assignee=optional_string(view, "assignee", expanded),
+        view_board=optional_string(view, "board", expanded),
+        view_board_scope=optional_string(view, "board_scope", expanded),
         view_filter=optional_string(view, "filter", expanded),
         view_swimlane=optional_string(view, "swimlane", expanded),
+        view_active=optional_bool(view, "active", expanded),
+        view_nerd_font=optional_bool(view, "nerd_font", expanded),
         view_preview_lines=optional_int(view, "preview_lines", expanded),
+        view_hide_done_after_days=optional_int(view, "hide_done_after_days", expanded),
         versions_filter=optional_string(versions, "filter", expanded),
+        issue_default_type=optional_string(issue, "default_type", expanded),
         host=optional_string(serve, "host", expanded),
         port=optional_int(serve, "port", expanded),
     )
@@ -110,5 +133,46 @@ def optional_int(data: dict[str, Any], key: str, path: Path) -> int | None:
     return value
 
 
+def optional_bool(data: dict[str, Any], key: str, path: Path) -> bool | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ConfigError(f"invalid config file {path}: {key} must be a boolean")
+    return value
+
+
 def choose(flag: str | int | None, configured: str | int | None) -> str | int | None:
     return flag if flag is not None else configured
+
+
+def save_view_defaults(path: Path, updates: dict[str, str | bool | None]) -> None:
+    """Persist `updates` into the `[view]` table of `path`, preserving comments/formatting.
+
+    A None or empty-string value removes that key entirely, so saving a
+    filter that's currently unset clears any previously saved default
+    rather than leaving a stale value behind.
+    """
+    expanded = path.expanduser()
+    if expanded.exists():
+        try:
+            document = tomlkit.parse(expanded.read_text())
+        except tomlkit.exceptions.ParseError as exc:
+            raise ConfigError(f"invalid config file {expanded}: {exc}") from exc
+    else:
+        expanded.parent.mkdir(parents=True, exist_ok=True)
+        document = tomlkit.document()
+
+    view = document.get("view")
+    if not isinstance(view, dict):
+        view = tomlkit.table()
+        document["view"] = view
+
+    for key, value in updates.items():
+        if value is None or value == "":
+            view.pop(key, None)
+        else:
+            view[key] = value
+
+    expanded.write_text(tomlkit.dumps(document))
+    secure_config_permissions(expanded)

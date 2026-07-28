@@ -3,20 +3,28 @@ from __future__ import annotations
 from pathlib import Path
 
 from jira_workbench.cli import main
+from jira_workbench.metadata import remember_field_names
 from jira_workbench.shadow import add_comment, delete_comment, edit_comment, load_shadow, set_field
-from jira_workbench.sync import SyncConfig, sync_project, write_json
+from jira_workbench.sync import SyncConfig, build_manifest, read_json, sync_project, write_json
 from jira_workbench.view import (
+    NERD_FONT_PRIORITY_ICONS,
+    NERD_FONT_TYPE_ICONS,
+    PILL_PALETTE,
+    PRIORITY_ICONS,
+    TYPE_ICONS,
     comment_body_text,
     comments_text,
     component_counts,
     cycle_component,
     cycle_fix_version,
     cycle_swimlane,
+    detailed_shadow_report_lines,
     detail_field_rows,
     editable_field_choices,
     editable_detail_fields,
     effective_comments_text,
     encode_edit_value,
+    extract_field_names,
     filter_items,
     filter_items_for_swimlane,
     find_item_index,
@@ -25,18 +33,29 @@ from jira_workbench.view import (
     format_work_item,
     full_diff_texts,
     item_index_by_key,
+    field_label_options,
     index_item_parent_key,
+    label_counts,
+    label_options,
+    label_type_fields,
     load_manifest_items,
     issue_parent_key,
     modified_issue_keys,
     parent_options,
+    pill_color,
+    pill_values,
+    priority_icon,
     refresh_index_item,
     refresh_stale_index_items,
+    report_field_label,
+    resolve_fix_version_names,
     selectable_field_options,
+    shadow_change_summary,
     side_by_side_diff_lines,
     sort_items_for_swimlane,
     swimlane_label,
     text_from_adf,
+    type_icon,
     version_options,
     wrap_preview_lines,
 )
@@ -425,6 +444,300 @@ def test_detail_field_rows_show_parent_none_when_unset() -> None:
     assert ("Parent", "parent", "(none)") in rows
 
 
+CUSTOM_LABELS_FIELD_META = {
+    "customfield_10082": {
+        "name": "Customers SAT",
+        "schema": {"type": "array", "custom": "com.atlassian.jira.plugin.system.customfieldtypes:labels"},
+    }
+}
+DUE_DATE_EDIT_FIELDS = {"duedate": {"name": "Due date", "schema": {"type": "date"}}}
+
+
+def test_label_type_fields_always_includes_native_labels() -> None:
+    assert label_type_fields(None) == [("labels", "Labels")]
+    assert label_type_fields({}) == [("labels", "Labels")]
+
+
+def test_label_type_fields_discovers_custom_labels_schema_field() -> None:
+    result = label_type_fields(CUSTOM_LABELS_FIELD_META)
+
+    # Sorted by display name -- "Customers SAT" sorts before "Labels".
+    assert result == [("customfield_10082", "Customers SAT"), ("labels", "Labels")]
+
+
+def test_label_type_fields_ignores_non_labels_custom_fields() -> None:
+    edit_fields = {
+        "customfield_10071": {
+            "name": "Components",
+            "schema": {"type": "option", "custom": "com.atlassian.jira.plugin.system.customfieldtypes:select"},
+        }
+    }
+
+    assert label_type_fields(edit_fields) == [("labels", "Labels")]
+
+
+def test_field_label_options_generalizes_to_any_field(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"customfield_10082": ["acme", "globex"]}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-2/issue.json",
+        {"key": "SAT-2", "fields": {"customfield_10082": ["acme"]}},
+    )
+
+    assert field_label_options(tmp_path, "customfield_10082") == ["acme", "globex"]
+
+
+def test_type_icon_defaults_to_plain_unicode_shapes() -> None:
+    assert type_icon("Epic") == ("◆", "#a855f7")
+    assert type_icon("Story") == ("●", "#22c55e")
+    assert type_icon("Task") == ("■", "#3b82f6")
+    assert type_icon("Bug") == ("▲", "#ef4444")
+    assert type_icon("Sub-task") == ("▪", "#06b6d4")
+    assert type_icon("Unknown type") == ("○", "dim")
+
+
+def test_type_icon_colors_are_explicit_hex_not_ansi_names() -> None:
+    # Bare ANSI color names (e.g. "blue") are ColorType.STANDARD in Rich --
+    # their rendered color depends on the terminal's own (often themed) ANSI
+    # palette rather than a fixed RGB value, unlike Textual's own chrome.
+    # Regression guard: every non-default type color must be explicit hex.
+    for glyph, color in TYPE_ICONS.values():
+        assert color.startswith("#"), f"{glyph!r} uses a bare color name: {color!r}"
+    for glyph, color in NERD_FONT_TYPE_ICONS.values():
+        assert color.startswith("#"), f"{glyph!r} uses a bare color name: {color!r}"
+
+
+def test_type_icon_nerd_font_uses_verified_v3_codepoints() -> None:
+    assert type_icon("Epic", nerd_font=True) == ("", "#a855f7")  # oct-rocket
+    assert type_icon("Story", nerd_font=True) == ("\U000f00c0", "#22c55e")  # md-bookmark
+    assert type_icon("Task", nerd_font=True) == ("", "#3b82f6")  # fa-square_check
+    assert type_icon("Bug", nerd_font=True) == ("", "#ef4444")  # fa-bug
+    assert type_icon("Subtask", nerd_font=True) == ("\U000f060d", "#06b6d4")  # md-subdirectory_arrow_right
+    assert type_icon("Unknown type", nerd_font=True) == ("", "dim")  # oct-dot_fill
+
+
+def test_priority_icon_defaults_to_plain_unicode_arrows() -> None:
+    assert priority_icon("Highest") == ("⇈", "#ef4444")
+    assert priority_icon("High") == ("↑", "#f59e0b")
+    assert priority_icon("Medium") == ("=", "#94a3b8")
+    assert priority_icon("Low") == ("↓", "#06b6d4")
+    assert priority_icon("Lowest") == ("⇊", "#22c55e")
+    assert priority_icon("Unknown priority") == ("", "dim")
+
+
+def test_priority_icon_colors_are_explicit_hex_not_ansi_names() -> None:
+    # Same regression guard as test_type_icon_colors_are_explicit_hex_not_ansi_names.
+    for glyph, color in PRIORITY_ICONS.values():
+        assert color.startswith("#"), f"{glyph!r} uses a bare color name: {color!r}"
+    for glyph, color in NERD_FONT_PRIORITY_ICONS.values():
+        assert color.startswith("#"), f"{glyph!r} uses a bare color name: {color!r}"
+
+
+def test_priority_icon_nerd_font_uses_verified_v3_codepoints() -> None:
+    assert priority_icon("Highest", nerd_font=True) == ("\U000f013f", "#ef4444")  # md-chevron_double_up
+    assert priority_icon("High", nerd_font=True) == ("\U000f0143", "#f59e0b")  # md-chevron_up
+    assert priority_icon("Low", nerd_font=True) == ("\U000f0140", "#06b6d4")  # md-chevron_down
+    assert priority_icon("Lowest", nerd_font=True) == ("\U000f013c", "#22c55e")  # md-chevron_double_down
+    assert priority_icon("Medium", nerd_font=True) == ("\U000f01fc", "#94a3b8")  # md-equal
+    assert priority_icon("Unknown priority", nerd_font=True) == ("", "dim")
+
+
+def test_pill_color_is_deterministic_across_calls() -> None:
+    assert pill_color("backend") == pill_color("backend")
+    assert pill_color("v1.0") == pill_color("v1.0")
+
+
+def test_pill_color_returns_a_palette_hex() -> None:
+    assert pill_color("backend") in PILL_PALETTE
+    assert pill_color("") in PILL_PALETTE
+
+
+def test_pill_color_differs_for_different_names_at_least_sometimes() -> None:
+    # Not a strict requirement (a palette of 10 permits collisions), but a
+    # handful of distinct real-world label names landing on the same single
+    # color for all of them would defeat the point of the feature.
+    colors = {pill_color(name) for name in ("backend", "frontend", "urgent", "flaky", "docs")}
+    assert len(colors) > 1
+
+
+def test_pill_values_normalizes_lists_dicts_strings_and_none() -> None:
+    assert pill_values(["urgent", "flaky"]) == ["urgent", "flaky"]
+    assert pill_values([{"name": "v1.0"}, {"name": "v2.0"}]) == ["v1.0", "v2.0"]
+    assert pill_values({"name": "Backend"}) == ["Backend"]
+    assert pill_values("Backend") == ["Backend"]
+    assert pill_values(None) == []
+    assert pill_values([]) == []
+    assert pill_values([{"name": ""}, None]) == []
+
+
+def test_extract_field_names_pulls_name_from_edit_fields() -> None:
+    edit_fields = {
+        "customfield_10082": {"name": "Customers SAT", "schema": {"custom": "...:labels"}},
+        "priority": {"name": "Priority", "schema": {}},
+        "customfield_bad": {"schema": {}},  # no "name" -- skipped
+    }
+    assert extract_field_names(edit_fields) == {
+        "customfield_10082": "Customers SAT",
+        "priority": "Priority",
+    }
+
+
+def test_extract_field_names_handles_none_and_empty() -> None:
+    assert extract_field_names(None) == {}
+    assert extract_field_names({}) == {}
+
+
+def test_report_field_label_prefers_system_label_then_cached_custom_name(tmp_path: Path) -> None:
+    remember_field_names(tmp_path, {"customfield_10082": "Customers SAT"})
+
+    assert report_field_label(tmp_path, "fixVersions") == "version"  # static system label wins
+    assert report_field_label(tmp_path, "customfield_10082") == "Customers SAT"
+    assert report_field_label(tmp_path, "customfield_unknown") == "customfield_unknown"  # falls back to raw id
+
+
+def test_shadow_change_summary_shows_custom_field_display_name(tmp_path: Path) -> None:
+    write_json(tmp_path / "components/_unassigned/SAT-1/issue.json", {"key": "SAT-1", "fields": {}})
+    remember_field_names(tmp_path, {"customfield_10082": "Customers SAT"})
+    shadow = {"fields": {"customfield_10082": ["acme"]}}
+
+    summary = shadow_change_summary(shadow, tmp_path, "SAT-1")
+
+    assert any("Customers SAT" in line for line in summary)
+    assert not any("customfield_10082" in line for line in summary)
+
+
+def test_resolve_fix_version_names_prefers_cached_current_name_over_stale_embedded_one(tmp_path: Path) -> None:
+    write_json(tmp_path / "meta/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+
+    assert resolve_fix_version_names(tmp_path, [{"id": "10000", "name": "v1"}]) == ["v1-renamed"]
+
+
+def test_resolve_fix_version_names_falls_back_to_embedded_name_when_id_not_cached(tmp_path: Path) -> None:
+    assert resolve_fix_version_names(tmp_path, [{"id": "99999", "name": "v1"}]) == ["v1"]
+    assert resolve_fix_version_names(tmp_path, [{"name": "no-id-at-all"}]) == ["no-id-at-all"]
+    assert resolve_fix_version_names(tmp_path, None) == []
+
+
+def test_resolve_fix_version_names_handles_multiple_entries(tmp_path: Path) -> None:
+    write_json(tmp_path / "meta/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+
+    assert resolve_fix_version_names(tmp_path, [{"id": "10000", "name": "v1"}, {"id": "99999", "name": "v2"}]) == [
+        "v1-renamed",
+        "v2",
+    ]
+
+
+def _write_issue_with_stale_fix_version(jira_dir: Path) -> None:
+    write_json(
+        jira_dir / "components/_unassigned/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "Chart values",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "fixVersions": [{"id": "10000", "name": "v1"}],
+            },
+        },
+    )
+    write_json(jira_dir / "meta/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+
+
+def test_load_manifest_items_shows_current_version_name_not_stale_embedded_one(tmp_path: Path) -> None:
+    _write_issue_with_stale_fix_version(tmp_path)
+    build_manifest(tmp_path)
+
+    items = load_manifest_items(tmp_path)
+
+    assert items[0]["fixVersion"] == "v1-renamed"
+
+
+def test_format_issue_shows_current_version_name_not_stale_embedded_one(tmp_path: Path) -> None:
+    _write_issue_with_stale_fix_version(tmp_path)
+    issue = read_json(tmp_path / "components/_unassigned/SAT-1/issue.json")
+
+    output = format_issue(issue, jira_dir=tmp_path)
+
+    assert "v1-renamed" in output
+    assert "v1\n" not in output
+
+
+def test_detailed_shadow_report_lines_shows_current_version_name_as_before_value(tmp_path: Path) -> None:
+    _write_issue_with_stale_fix_version(tmp_path)
+    set_field(tmp_path, "SAT-1", "fixVersions", [{"name": "v2"}])
+
+    report = detailed_shadow_report_lines(tmp_path, ["SAT-1"])
+
+    assert any("v1-renamed -> v2" in line for line in report)
+
+
+def test_detail_field_rows_shows_due_date_only_when_in_edit_fields() -> None:
+    issue = {
+        "key": "SAT-1",
+        "fields": {
+            "summary": "Has a due date",
+            "issuetype": {"name": "Story"},
+            "status": {"name": "To Do"},
+            "duedate": "2026-08-01",
+        },
+    }
+
+    rows_without_meta = detail_field_rows(issue, "components")
+    assert not any(field == "duedate" for _, field, _ in rows_without_meta)
+
+    rows_with_meta = detail_field_rows(issue, "components", edit_fields=DUE_DATE_EDIT_FIELDS)
+    assert ("Due date", "duedate", "2026-08-01") in rows_with_meta
+
+
+def test_detail_field_rows_due_date_shows_none_placeholder_when_unset() -> None:
+    issue = {
+        "key": "SAT-1",
+        "fields": {"summary": "No due date yet", "issuetype": {"name": "Story"}, "status": {"name": "To Do"}},
+    }
+
+    rows = detail_field_rows(issue, "components", edit_fields=DUE_DATE_EDIT_FIELDS)
+
+    assert ("Due date", "duedate", "(none)") in rows
+
+
+def test_detail_field_rows_shows_custom_labels_field_from_edit_fields() -> None:
+    issue = {
+        "key": "SAT-1",
+        "fields": {
+            "summary": "Has a customer",
+            "issuetype": {"name": "Story"},
+            "status": {"name": "To Do"},
+            "customfield_10082": ["acme"],
+        },
+    }
+
+    rows_without_meta = detail_field_rows(issue, "components")
+    assert not any(field == "customfield_10082" for _, field, _ in rows_without_meta)
+
+    rows_with_meta = detail_field_rows(issue, "components", edit_fields=CUSTOM_LABELS_FIELD_META)
+    assert ("Customers SAT", "customfield_10082", "acme") in rows_with_meta
+
+
+def test_editable_detail_fields_includes_due_date_and_custom_labels_field_when_known() -> None:
+    edit_fields = {**DUE_DATE_EDIT_FIELDS, **CUSTOM_LABELS_FIELD_META}
+
+    fields = editable_detail_fields("components", edit_fields)
+
+    assert "duedate" in fields
+    assert "customfield_10082" in fields
+    assert "labels" in fields  # still present via the always-included native fallback
+
+
+def test_editable_detail_fields_without_edit_fields_excludes_dynamic_fields() -> None:
+    fields = editable_detail_fields("components")
+
+    assert "duedate" not in fields
+    assert "customfield_10082" not in fields
+    assert "labels" in fields
+
+
 def test_issue_parent_key_reads_parent_field() -> None:
     issue = {"key": "SAT-741", "fields": {"parent": {"key": "SAT-740"}}}
 
@@ -484,6 +797,17 @@ def test_selectable_field_options_use_local_issue_values(tmp_path: Path) -> None
     assert selectable_field_options(jira_dir, "customfield_10071", "customfield_10071") == ["API Team"]
 
 
+def test_observed_field_options_orders_priority_by_severity(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)  # SAT-1 is "Medium"
+    for index, name in enumerate(("Highest", "High", "Low", "Lowest")):
+        write_json(
+            jira_dir / f"components/_unassigned/EXTRA-{index}/issue.json",
+            {"key": f"EXTRA-{index}", "fields": {"priority": {"name": name}}},
+        )
+
+    assert selectable_field_options(jira_dir, "priority") == ["Highest", "High", "Medium", "Low", "Lowest"]
+
+
 def test_selectable_field_options_use_cached_components_when_available(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     write_json(
@@ -523,6 +847,53 @@ def test_fix_version_options_use_cached_versions(tmp_path: Path) -> None:
         "helm-chart-sa 3.4.4",
         "helm-chart-sa 3.5.0",
     ]
+
+
+def test_label_options_collect_distinct_labels_from_local_issues(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"labels": ["infra", "helm"]}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-2/issue.json",
+        {"key": "SAT-2", "fields": {"labels": ["helm", "k8s"]}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-3/issue.json",
+        {"key": "SAT-3", "fields": {}},
+    )
+
+    assert label_options(tmp_path) == ["helm", "infra", "k8s"]
+
+
+def test_label_options_empty_when_no_labels_synced(tmp_path: Path) -> None:
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1", "fields": {}})
+
+    assert label_options(tmp_path) == []
+
+
+def test_label_counts_counts_across_multi_valued_items() -> None:
+    items = [
+        {"key": "SAT-1", "labels": ["infra", "helm"]},
+        {"key": "SAT-2", "labels": ["helm"]},
+        {"key": "SAT-3", "labels": []},
+        {"key": "SAT-4"},
+    ]
+
+    assert label_counts(items) == [("helm", 2), ("infra", 1)]
+
+
+def test_label_counts_reflects_shadow_merged_items_not_raw_sync(tmp_path: Path) -> None:
+    write_json(tmp_path / "manifest.json", {"workItems": [{"key": "SAT-1"}]})
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "s", "issuetype": {"name": "Task"}, "labels": ["old-label"]}},
+    )
+    set_field(tmp_path, "SAT-1", "labels", ["new-label"])
+
+    items = load_manifest_items(tmp_path)
+
+    assert label_counts(items) == [("new-label", 1)]
 
 
 def test_parent_options_use_local_issue_keys(tmp_path: Path) -> None:
@@ -981,7 +1352,8 @@ def test_cycle_swimlane() -> None:
     assert cycle_swimlane("none") == "epic"
     assert cycle_swimlane("epic") == "version"
     assert cycle_swimlane("version") == "component"
-    assert cycle_swimlane("component") == "none"
+    assert cycle_swimlane("component") == "board"
+    assert cycle_swimlane("board") == "none"
 
 
 def test_sort_items_for_swimlane_groups_virtual_none_first() -> None:
@@ -1191,6 +1563,140 @@ def test_refresh_index_item_applies_shadow_component_override(tmp_path: Path) ->
     refresh_index_item(tmp_path, items, "SAT-19", component_field="customfield_10071")
 
     assert items[0]["component"] == "security"
+
+
+def _write_board_issue(tmp_path: Path, key: str, component: str, labels: list[str] | None = None) -> None:
+    manifest_file = tmp_path / "manifest.json"
+    manifest = read_json(manifest_file) if manifest_file.exists() else {"workItems": []}
+    manifest["workItems"] = [item for item in manifest["workItems"] if item["key"] != key]
+    manifest["workItems"].append({"key": key, "component": component})
+    write_json(manifest_file, manifest)
+    write_json(
+        tmp_path / f"components/{component}/{key}/issue.json",
+        {
+            "key": key,
+            "fields": {
+                "summary": "summary",
+                "customfield_10071": {"value": component},
+                "labels": labels or [],
+            },
+        },
+    )
+
+
+def _write_boards_cache(tmp_path: Path, boards: list[dict]) -> None:
+    write_json(tmp_path / "meta" / "boards.json", {"project": "SAT", "fetchedAt": "now", "boards": boards})
+
+
+def test_load_manifest_items_includes_labels(tmp_path: Path) -> None:
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart", labels=["k8s_sprints"])
+
+    item = load_manifest_items(tmp_path, component_field="customfield_10071")[0]
+
+    assert item["labels"] == ["k8s_sprints"]
+
+
+def test_load_manifest_items_computes_board_membership_from_predicate(tmp_path: Path) -> None:
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    _write_board_issue(tmp_path, "SAT-2", "other")
+    _write_boards_cache(
+        tmp_path,
+        [{"id": 36, "name": "PS Tools", "type": "scrum", "predicate": {"op": "eq", "field": "component", "value": "helm-chart"}}],
+    )
+
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["SAT-1"]["boards"] == ["PS Tools"]
+    assert by_key["SAT-2"]["boards"] == []
+
+
+def test_load_manifest_items_computes_board_status_active_vs_backlog(tmp_path: Path) -> None:
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    _write_board_issue(tmp_path, "SAT-2", "helm-chart")
+    _write_boards_cache(
+        tmp_path,
+        [
+            {
+                "id": 32,
+                "name": "SAT board",
+                "type": "simple",
+                "predicate": {"op": "eq", "field": "component", "value": "helm-chart"},
+                "backlogKeys": ["SAT-2"],
+            }
+        ],
+    )
+
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["SAT-1"]["boardStatus"] == {"SAT board": "active"}
+    assert by_key["SAT-2"]["boardStatus"] == {"SAT board": "backlog"}
+
+
+def test_board_membership_reflects_shadow_edit_immediately(tmp_path: Path) -> None:
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    _write_boards_cache(
+        tmp_path,
+        [{"id": 36, "name": "PS Tools", "type": "scrum", "predicate": {"op": "eq", "field": "component", "value": "helm-chart"}}],
+    )
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+    assert items[0]["boards"] == ["PS Tools"]
+
+    set_field(tmp_path, "SAT-1", "customfield_10071", {"value": "unrelated"})
+    refresh_index_item(tmp_path, items, "SAT-1", component_field="customfield_10071")
+
+    assert items[0]["boards"] == []
+
+
+def test_swimlane_label_board_mode() -> None:
+    from jira_workbench.view import VIRTUAL_NONE, swimlane_label
+
+    assert swimlane_label({"boards": ["PS Tools", "SAT board"]}, "board") == "PS Tools, SAT board"
+    assert swimlane_label({"boards": []}, "board") == VIRTUAL_NONE
+
+
+def test_matches_board_membership_and_scope() -> None:
+    from jira_workbench.view import matches_board
+
+    item = {"boards": ["PS Tools"], "boardStatus": {"PS Tools": "backlog"}}
+
+    assert matches_board(item, None, None) is True
+    assert matches_board(item, "PS Tools", None) is True
+    assert matches_board(item, "SAT board", None) is False
+    assert matches_board(item, "PS Tools", "backlog") is True
+    assert matches_board(item, "PS Tools", "active") is False
+    assert matches_board(item, "PS Tools", "any") is True
+
+
+def test_is_stale_done() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from jira_workbench.view import is_stale_done
+
+    recent = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    old = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+
+    assert is_stale_done({"status": "Done", "statusCategoryChangeDate": old}, max_age_days=7) is True
+    assert is_stale_done({"status": "Done", "statusCategoryChangeDate": recent}, max_age_days=7) is False
+    assert is_stale_done({"status": "In Progress", "statusCategoryChangeDate": old}, max_age_days=7) is False
+    assert is_stale_done({"status": "Done", "statusCategoryChangeDate": None}, max_age_days=7) is False
+
+
+def test_filter_items_max_done_age_days() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from jira_workbench.view import filter_items
+
+    old = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    items = [
+        {"key": "SAT-1", "status": "Done", "statusCategoryChangeDate": old},
+        {"key": "SAT-2", "status": "To Do", "statusCategoryChangeDate": old},
+    ]
+
+    result = filter_items(items, active=False, max_done_age_days=7)
+
+    assert [item["key"] for item in result] == ["SAT-2"]
 
 
 def test_cli_view_help_mentions_filters(capsys) -> None:
