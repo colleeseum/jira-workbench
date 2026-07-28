@@ -74,6 +74,76 @@ def version_id_to_name_map(jira_dir: Path) -> dict[str, str]:
     return result
 
 
+# Jira Cloud mirrors its "Development" panel data (branches/PRs) into a
+# regular custom field on every issue -- this is what a normal sync already
+# fetches (fields="*all"), so the list view can show a Git/PR indicator for
+# every synced issue with zero extra API calls. The default id is common but
+# not guaranteed to be the same on every Jira instance -- see
+# [view].dev_status_field.
+DEV_STATUS_FIELD_DEFAULT = "customfield_10000"
+
+_DEV_STATUS_JSON_RE = re.compile(r"json=(\{.*\})\}\s*$")
+
+
+def parse_dev_status_summary(raw: Any) -> dict[str, Any] | None:
+    """Parse the "Development" field mirror's semi-structured string value
+    into its `summary` dict (one of pullrequest/branch/repository), or None
+    if empty/unparseable.
+
+    The field's own value is not real JSON -- it's a Groovy/Java-style
+    toString() of an internal object (unquoted `key=value` pairs), except
+    for a `json=` sub-value which IS valid JSON once its one extra trailing
+    "}" (the outer wrapper's own close) is stripped. Undocumented and
+    unofficial, like devstatus.py's fetch_dev_status -- best-effort and
+    silent on any failure, never a user-facing error.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    match = _DEV_STATUS_JSON_RE.search(raw)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    summary = as_dict(parsed).get("cachedValue")
+    summary = as_dict(summary).get("summary") if summary else None
+    return summary if isinstance(summary, dict) and summary else None
+
+
+# Darker/more saturated than a bare icon color needs -- same reasoning as
+# PILL_PALETTE: white bold text sitting on a filled background needs more
+# contrast margin than a colored glyph on the terminal's own background.
+# ("500"-level shades here were confirmed too light to read, especially the
+# grey/green ones -- these are "600"/"700"-level instead.)
+DEV_STATUS_PR_COLORS = {
+    "OPEN": "#15803d",
+    "DRAFT": "#334155",
+    "MERGED": "#7e22ce",
+    "DECLINED": "#b91c1c",
+}
+DEV_STATUS_BRANCH_COLOR = "#1d4ed8"
+DEV_STATUS_REPOSITORY_COLOR = "#334155"
+
+
+def dev_status_indicator(summary: dict[str, Any] | None) -> tuple[str, str, str] | None:
+    """(kind, label, hex color) for a list-view Git/PR cell, or None to
+    render blank. kind is "pr" | "branch" | "repository" -- richest signal
+    (an actual PR, colored by its state) to weakest (just a repo
+    reference, no specific branch)."""
+    if not isinstance(summary, dict):
+        return None
+    if "pullrequest" in summary:
+        overall = as_dict(summary["pullrequest"]).get("overall")
+        state = str(as_dict(overall).get("state") or "OPEN").upper()
+        return ("pr", state.title(), DEV_STATUS_PR_COLORS.get(state, DEV_STATUS_REPOSITORY_COLOR))
+    if "branch" in summary:
+        return ("branch", "Branch", DEV_STATUS_BRANCH_COLOR)
+    if "repository" in summary:
+        return ("repository", "Linked", DEV_STATUS_REPOSITORY_COLOR)
+    return None
+
+
 def resolve_fix_version_names(jira_dir: Path, value: Any) -> list[str]:
     """Fix version display names, resolved by id against the current
     versions cache first. A version can be renamed in Jira after an issue
@@ -648,7 +718,9 @@ def load_cached_boards(jira_dir: Path) -> list[dict[str, Any]]:
     return normalize_boards(cache.get("boards")) if cache else []
 
 
-def load_manifest_items(jira_dir: Path, component_field: str | None = None) -> list[dict[str, Any]]:
+def load_manifest_items(
+    jira_dir: Path, component_field: str | None = None, *, dev_status_field: str | None = None
+) -> list[dict[str, Any]]:
     manifest_path = jira_dir / "manifest.json"
     if not manifest_path.exists():
         raise ViewError(f"manifest not found under {jira_dir}. Run jira-wb sync first.")
@@ -659,7 +731,7 @@ def load_manifest_items(jira_dir: Path, component_field: str | None = None) -> l
     boards = load_cached_boards(jira_dir)
     return sorted(
         (
-            with_local_index_fields(jira_dir, item, component_field, boards=boards)
+            with_local_index_fields(jira_dir, item, component_field, boards=boards, dev_status_field=dev_status_field)
             for item in items
             if isinstance(item, dict)
         ),
@@ -673,6 +745,7 @@ def with_local_index_fields(
     component_field: str | None = None,
     *,
     boards: list[dict[str, Any]] | None = None,
+    dev_status_field: str | None = None,
 ) -> dict[str, Any]:
     enriched = dict(item)
     key = display_name(item.get("key"))
@@ -703,6 +776,8 @@ def with_local_index_fields(
     enriched["epic"] = display_name(parent.get("key"))
     enriched["epicSummary"] = display_name(parent_fields.get("summary"))
     enriched["statusCategoryChangeDate"] = display_name(fields.get("statuscategorychangedate"))
+    enriched["issueId"] = issue.get("id")
+    enriched["devStatus"] = parse_dev_status_summary(fields.get(dev_status_field or DEV_STATUS_FIELD_DEFAULT))
 
     labels = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
     enriched["labels"] = labels
@@ -734,10 +809,13 @@ def refresh_index_item(
     component_field: str | None = None,
     *,
     boards: list[dict[str, Any]] | None = None,
+    dev_status_field: str | None = None,
 ) -> None:
     for index, item in enumerate(items):
         if display_name(item.get("key")) == key:
-            items[index] = with_local_index_fields(jira_dir, item, component_field, boards=boards)
+            items[index] = with_local_index_fields(
+                jira_dir, item, component_field, boards=boards, dev_status_field=dev_status_field
+            )
             return
 
 
@@ -746,10 +824,12 @@ def refresh_stale_index_items(
     items: list[dict[str, Any]],
     keys: set[str],
     component_field: str | None = None,
+    *,
+    dev_status_field: str | None = None,
 ) -> None:
     boards = load_cached_boards(jira_dir)
     for key in sorted(keys, key=issue_key_sort_key):
-        refresh_index_item(jira_dir, items, key, component_field, boards=boards)
+        refresh_index_item(jira_dir, items, key, component_field, boards=boards, dev_status_field=dev_status_field)
     keys.clear()
 
 
@@ -1099,6 +1179,32 @@ def format_field_rows(rows: list[tuple[str, str]]) -> list[str]:
     return lines
 
 
+def issue_link_groups(issue: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """[(phrase, [linked issue keys]), ...], e.g. [("blocks", ["SAT-900"]),
+    ("is blocked by", ["SAT-100", "SAT-200"])] -- multiple links sharing the
+    same phrase are grouped into one row's worth of keys. Read from
+    fields.issuelinks, already part of a regular sync (fields="*all"), so
+    this needs no extra fetching."""
+    fields = as_dict(issue.get("fields"))
+    groups: dict[str, list[str]] = {}
+    for link in as_list(fields.get("issuelinks")):
+        if not isinstance(link, dict):
+            continue
+        link_type = as_dict(link.get("type"))
+        if "outwardIssue" in link:
+            phrase = link_type.get("outward")
+            other = link.get("outwardIssue")
+        elif "inwardIssue" in link:
+            phrase = link_type.get("inward")
+            other = link.get("inwardIssue")
+        else:
+            continue
+        key = display_name(as_dict(other).get("key"))
+        if phrase and key:
+            groups.setdefault(str(phrase), []).append(key)
+    return sorted(groups.items())
+
+
 def detail_field_rows(
     issue: dict[str, Any],
     component_field: str | None,
@@ -1133,6 +1239,8 @@ def detail_field_rows(
         if field_id == "labels":
             continue  # already a static row above
         rows.append((field_name, field_id, display_name(fields.get(field_id)) or "(none)"))
+    for phrase, keys in issue_link_groups(issue):
+        rows.append((phrase.capitalize(), f"link:{phrase}", ", ".join(keys)))
     return [(label, field, value) for label, field, value in rows if value]
 
 

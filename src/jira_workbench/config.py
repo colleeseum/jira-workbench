@@ -34,6 +34,7 @@ class WorkbenchConfig:
     view_swimlane: str | None = None
     view_active: bool | None = None
     view_nerd_font: bool | None = None
+    view_dev_status_field: str | None = None
     view_preview_lines: int | None = None
     view_hide_done_after_days: int | None = None
     versions_filter: str | None = None
@@ -106,6 +107,7 @@ def load_config(path: Path) -> WorkbenchConfig:
         view_swimlane=optional_string(view, "swimlane", expanded),
         view_active=optional_bool(view, "active", expanded),
         view_nerd_font=optional_bool(view, "nerd_font", expanded),
+        view_dev_status_field=optional_string(view, "dev_status_field", expanded),
         view_preview_lines=optional_int(view, "preview_lines", expanded),
         view_hide_done_after_days=optional_int(view, "hide_done_after_days", expanded),
         versions_filter=optional_string(versions, "filter", expanded),

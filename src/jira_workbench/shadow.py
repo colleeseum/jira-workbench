@@ -458,6 +458,48 @@ def api_field_value(jira_dir: Path, field: str, value: Any) -> Any:
     return value
 
 
+def _field_identity(value: Any) -> Any:
+    """Normalized, hashable identity for a Jira field value, used to decide
+    whether two snapshots of the same field genuinely differ. Prefers a
+    stable identifier (id/key/accountId) over a display name -- e.g. a fix
+    version renamed between the shadow's base and now is the same version,
+    not a conflicting edit, the same reasoning as resolve_fix_version_names
+    in view.py."""
+    if isinstance(value, dict):
+        for id_key in ("id", "key", "accountId", "name", "value"):
+            if value.get(id_key) is not None:
+                return (id_key, value[id_key])
+        return json.dumps(value, sort_keys=True) if value else None
+    if isinstance(value, list):
+        return frozenset(_field_identity(item) for item in value)
+    return value
+
+
+def conflicting_fields(jira_dir: Path, key: str, shadow: dict[str, Any], remote_issue: dict[str, Any]) -> list[str]:
+    """Which of the shadow's own edited fields also changed remotely since
+    the shadow's base snapshot -- a genuine edit-vs-edit conflict, as opposed
+    to the issue's overall `updated` timestamp moving for an unrelated reason
+    (someone else's comment, a linked dependency, an unrelated field, etc.).
+    Status/resolution is transition-based, not a plain field diff, and is
+    excluded here; new comment additions are always safe to push regardless
+    (Jira comments are additive) and are likewise not covered by this check.
+    """
+    base_issue = read_json(issue_path(jira_dir, key))
+    base_fields = base_issue.get("fields") if isinstance(base_issue, dict) else None
+    remote_fields = remote_issue.get("fields") if isinstance(remote_issue, dict) else None
+    shadow_fields = shadow.get("fields")
+    if not isinstance(shadow_fields, dict) or not isinstance(base_fields, dict) or not isinstance(remote_fields, dict):
+        return list(shadow_fields) if isinstance(shadow_fields, dict) else []
+    conflicts = []
+    for field in shadow_fields:
+        if field == "status":
+            continue
+        api_name = api_field_name(field)
+        if _field_identity(base_fields.get(api_name)) != _field_identity(remote_fields.get(api_name)):
+            conflicts.append(field)
+    return conflicts
+
+
 def update_field_summary(field: str, value: Any) -> str:
     if field == "fixVersions" and isinstance(value, list):
         names = []
@@ -656,9 +698,26 @@ def push_key(
 
     current_updated = remote_updated(jira_client, key)
     if shadow.get("baseUpdated") != current_updated:
+        # The issue changed remotely since this shadow was based -- but that
+        # doesn't necessarily conflict with what THIS shadow is pushing (a
+        # comment from someone else, a linked dependency, an unrelated field
+        # all bump the issue's own `updated` timestamp too). Only block if a
+        # field the shadow itself edits also changed remotely; anything else
+        # is safe to push as-is and gets reconciled by the post-push refresh
+        # below regardless.
+        try:
+            remote_issue = jira_client.get_issue(key, fields="*all")
+        except Exception as exc:
+            raise ShadowError(f"could not read remote issue {key} to check for conflicts: {exc}") from exc
+        if not isinstance(remote_issue, dict):
+            raise ShadowError(f"could not read remote issue {key} to check for conflicts")
+        conflicts = conflicting_fields(jira_dir, key, shadow, remote_issue)
+        if conflicts:
+            if progress:
+                progress(f"{key}: blocked, remote changed for {', '.join(conflicts)} since local edits")
+            return "blocked"
         if progress:
-            progress(f"{key}: skipped, remote changed since local edits")
-        return "blocked"
+            progress(f"{key}: remote changed since local edits, but no conflicting fields -- pushing")
 
     unsupported = unsupported_fields(shadow)
     if unsupported:

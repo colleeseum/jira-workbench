@@ -401,6 +401,7 @@ def test_view_reads_default_component_and_filter_from_config(tmp_path: Path, mon
                 "active = false",
                 "preview_lines = 20",
                 "nerd_font = true",
+                'dev_status_field = "customfield_10099"',
             ]
         )
         + "\n"
@@ -428,6 +429,7 @@ def test_view_reads_default_component_and_filter_from_config(tmp_path: Path, mon
     assert calls[0][1]["preview_lines"] == 20
     assert calls[0][1]["config_path"] == config_path
     assert calls[0][1]["nerd_font"] is True
+    assert calls[0][1]["dev_status_field"] == "customfield_10099"
 
 
 def test_view_nerd_font_defaults_to_false_when_unset(tmp_path: Path, monkeypatch) -> None:
@@ -445,6 +447,7 @@ def test_view_nerd_font_defaults_to_false_when_unset(tmp_path: Path, monkeypatch
 
     assert code == 0
     assert calls[0][1]["nerd_font"] is False
+    assert calls[0][1]["dev_status_field"] is None
 
 
 def test_view_all_flag_overrides_configured_active_default(tmp_path: Path, monkeypatch) -> None:

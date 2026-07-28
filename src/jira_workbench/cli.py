@@ -85,6 +85,7 @@ def open_interactive_view(
     hide_done_after_days: int | None = None,
     config_path: Path | None = None,
     nerd_font: bool = False,
+    dev_status_field: str | None = None,
 ) -> None:
     from .tui.app import run_view as run_textual_view
 
@@ -110,6 +111,7 @@ def open_interactive_view(
         hide_done_after_days=hide_done_after_days,
         config_path=config_path,
         nerd_font=nerd_font,
+        dev_status_field=dev_status_field,
     )
 
 
@@ -521,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
                         hide_done_after_days=config.view_hide_done_after_days,
                         config_path=config_path,
                         nerd_font=view_nerd_font,
+                        dev_status_field=str(config.view_dev_status_field) if config.view_dev_status_field else None,
                     )
             else:
                 if args.diff or args.original:
@@ -546,6 +549,7 @@ def main(argv: list[str] | None = None) -> int:
                     hide_done_after_days=config.view_hide_done_after_days,
                     config_path=config_path,
                     nerd_font=view_nerd_font,
+                    dev_status_field=str(config.view_dev_status_field) if config.view_dev_status_field else None,
                 )
         except ViewError as exc:
             print(f"error: {exc}", file=sys.stderr)

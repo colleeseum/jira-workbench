@@ -20,6 +20,7 @@ from jira_workbench.view import (
     cycle_swimlane,
     detailed_shadow_report_lines,
     detail_field_rows,
+    dev_status_indicator,
     editable_field_choices,
     editable_detail_fields,
     effective_comments_text,
@@ -35,6 +36,7 @@ from jira_workbench.view import (
     item_index_by_key,
     field_label_options,
     index_item_parent_key,
+    issue_link_groups,
     label_counts,
     label_options,
     label_type_fields,
@@ -42,6 +44,7 @@ from jira_workbench.view import (
     issue_parent_key,
     modified_issue_keys,
     parent_options,
+    parse_dev_status_summary,
     pill_color,
     pill_values,
     priority_icon,
@@ -627,6 +630,104 @@ def test_resolve_fix_version_names_handles_multiple_entries(tmp_path: Path) -> N
         "v1-renamed",
         "v2",
     ]
+
+
+# Real examples of Jira's "Development" field mirror (fields.customfield_10000),
+# verified live against a real synced jira_dir -- not guessed at.
+DEV_STATUS_PR_RAW = (
+    '{pullrequest={dataType=pullrequest, state=DRAFT, stateCount=2}, '
+    'json={"cachedValue":{"errors":[],"summary":{"pullrequest":{"overall":'
+    '{"count":2,"lastUpdated":"2026-04-16T10:16:17.000-0400","stateCount":2,'
+    '"state":"DRAFT","dataType":"pullrequest","open":false},"byInstanceType":'
+    '{"oAuth-com.github.integration.production":{"count":1,"name":"GitHub"},'
+    '"GitHub":{"count":1,"name":"GitHub"}}}}},"isStale":true}}'
+)
+DEV_STATUS_BRANCH_RAW = (
+    '{branch={count=2, dataType=branch}, json={"cachedValue":{"errors":[],'
+    '"summary":{"branch":{"overall":{"count":2,"lastUpdated":'
+    '"2026-05-01T11:02:40.000-0400","dataType":"branch"},"byInstanceType":'
+    '{"GitHub":{"count":1,"name":"GitHub"},'
+    '"oAuth-com.github.integration.production":{"count":1,"name":"GitHub"}}}}},'
+    '"isStale":true}}'
+)
+DEV_STATUS_REPOSITORY_RAW = (
+    '{repository={count=3, dataType=repository}, json={"cachedValue":{"errors":[],'
+    '"summary":{"repository":{"overall":{"count":3,"lastUpdated":'
+    '"2024-11-18T10:01:22.000-0500","dataType":"repository"},"byInstanceType":'
+    '{"oAuth-com.github.integration.production":{"count":3,"name":"GitHub"},'
+    '"GitHub":{"count":3,"name":"GitHub"}}}}},"isStale":true}}'
+)
+
+
+def test_parse_dev_status_summary_extracts_pullrequest_state() -> None:
+    summary = parse_dev_status_summary(DEV_STATUS_PR_RAW)
+    assert summary is not None
+    assert summary["pullrequest"]["overall"]["state"] == "DRAFT"
+    assert summary["pullrequest"]["overall"]["count"] == 2
+
+
+def test_parse_dev_status_summary_extracts_branch_and_repository() -> None:
+    branch_summary = parse_dev_status_summary(DEV_STATUS_BRANCH_RAW)
+    assert branch_summary is not None
+    assert "branch" in branch_summary
+
+    repo_summary = parse_dev_status_summary(DEV_STATUS_REPOSITORY_RAW)
+    assert repo_summary is not None
+    assert "repository" in repo_summary
+
+
+def test_parse_dev_status_summary_handles_empty_none_and_garbage() -> None:
+    assert parse_dev_status_summary("{}") is None
+    assert parse_dev_status_summary("") is None
+    assert parse_dev_status_summary(None) is None
+    assert parse_dev_status_summary("not even close to the real shape") is None
+    assert parse_dev_status_summary("json={not valid json}}") is None
+
+
+def test_dev_status_indicator_for_each_kind_and_pr_state() -> None:
+    assert dev_status_indicator(None) is None
+    assert dev_status_indicator({}) is None
+
+    kind, label, color = dev_status_indicator({"pullrequest": {"overall": {"state": "OPEN"}}})
+    assert (kind, label) == ("pr", "Open")
+    assert color.startswith("#")
+
+    kind, label, color = dev_status_indicator({"pullrequest": {"overall": {"state": "MERGED"}}})
+    assert (kind, label) == ("pr", "Merged")
+    assert color.startswith("#")
+
+    kind, label, color = dev_status_indicator({"branch": {"overall": {"count": 1}}})
+    assert (kind, label) == ("branch", "Branch")
+    assert color.startswith("#")
+
+    kind, label, color = dev_status_indicator({"repository": {"overall": {"count": 1}}})
+    assert (kind, label) == ("repository", "Linked")
+    assert color.startswith("#")
+
+
+def test_issue_link_groups_handles_outward_inward_and_grouping() -> None:
+    link_type = {"outward": "blocks", "inward": "is blocked by"}
+    issue = {
+        "fields": {
+            "issuelinks": [
+                {"type": link_type, "outwardIssue": {"key": "SAT-900"}},
+                {"type": link_type, "inwardIssue": {"key": "SAT-100"}},
+                {"type": link_type, "inwardIssue": {"key": "SAT-200"}},
+                "not-a-dict",
+                {"type": {"outward": "relates to"}},  # neither inwardIssue nor outwardIssue -- skipped
+            ]
+        }
+    }
+
+    assert issue_link_groups(issue) == [
+        ("blocks", ["SAT-900"]),
+        ("is blocked by", ["SAT-100", "SAT-200"]),
+    ]
+
+
+def test_issue_link_groups_empty_when_no_links() -> None:
+    assert issue_link_groups({"fields": {}}) == []
+    assert issue_link_groups({"fields": {"issuelinks": []}}) == []
 
 
 def _write_issue_with_stale_fix_version(jira_dir: Path) -> None:

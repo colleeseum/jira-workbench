@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from textual import events
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable
+from textual.widgets.data_table import RowKey
 
 
 class ClickableRowDataTable(DataTable):
@@ -25,7 +28,29 @@ class ClickableRowDataTable(DataTable):
     click, regardless of whether this override calls super() or fully
     reimplements the logic. event.prevent_default() is the documented way
     to suppress those base-class handlers.
+
+    Optionally, a single column can be designated a "link" column: clicking
+    a cell in that column calls `on_link_click` with the row's key instead
+    of selecting the row -- e.g. Index's Dev/Git status column opening a
+    PR/branch in a browser. Every other caller (Detail's table, Meta
+    screens) passes neither kwarg and is unaffected.
+
+    `on_link_click` runs via `run_worker` rather than being awaited directly
+    -- `_on_click` is a plain message handler, not a worker, and a hook that
+    wants to show a modal screen (`push_screen_wait`) can only do that from
+    inside an actual worker context.
     """
+
+    def __init__(
+        self,
+        *args: object,
+        link_column: str | None = None,
+        on_link_click: Callable[[RowKey], Awaitable[None]] | None = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._link_column = link_column
+        self._on_link_click = on_link_click
 
     async def _on_click(self, event: events.Click) -> None:
         event.prevent_default()
@@ -50,6 +75,14 @@ class ClickableRowDataTable(DataTable):
             return
         if not (self.show_cursor and self.cursor_type != "none"):
             return
+
+        if self._link_column is not None and self._on_link_click is not None:
+            column = self.ordered_columns[column_index]
+            if str(column.key.value) == self._link_column:
+                row = self.ordered_rows[row_index]
+                self.run_worker(self._on_link_click(row.key))
+                event.stop()
+                return
 
         new_coordinate = Coordinate(row_index, column_index)
         if self.cursor_type == "row":

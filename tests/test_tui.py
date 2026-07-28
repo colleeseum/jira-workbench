@@ -429,6 +429,53 @@ async def test_detail_screen_fix_version_pill_shows_current_name_not_stale_embed
 
 
 @pytest.mark.asyncio
+async def test_detail_screen_shows_linked_issues_as_read_only_pills(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    _set_issue_fields(
+        jira_dir,
+        "SAT-1",
+        {
+            "issuelinks": [
+                {"type": {"outward": "blocks", "inward": "is blocked by"}, "outwardIssue": {"key": "SAT-900"}},
+                {"type": {"outward": "blocks", "inward": "is blocked by"}, "inwardIssue": {"key": "SAT-100"}},
+            ]
+        },
+    )
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("link:blocks", "value")) == " SAT-900 "
+        assert str(table.get_cell("link:is blocked by", "value")) == " SAT-100 "
+
+        table.move_cursor(row=table.get_row_index("link:blocks"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        # Read-only for now -- selecting it just notifies, no editor opens.
+        assert isinstance(app.screen, DetailScreen)
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_has_no_linked_issues_row_when_there_are_none(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+
+        table = app.screen.query_one(DataTable)
+        with pytest.raises(Exception):
+            table.get_row_index("link:blocks")
+
+
+@pytest.mark.asyncio
 async def test_detail_screen_sets_and_clears_due_date(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     _set_issue_id(jira_dir, "SAT-1", "78547")
@@ -768,6 +815,46 @@ async def test_revert_confirm_cancel_button_makes_no_change(tmp_path: Path) -> N
         shadow = load_shadow(jira_dir, "SAT-1")
         assert shadow is not None
         assert shadow["fields"]["summary"] == "Local edit"
+
+
+class RefreshFromJiraClient:
+    def __init__(self, *, fresh_summary: str) -> None:
+        self.fresh_summary = fresh_summary
+        self.get_issue_calls = 0
+
+    def get_issue(self, issue_id_or_key: str, fields: Any = None, **kwargs: Any) -> Any:
+        self.get_issue_calls += 1
+        return {
+            "key": issue_id_or_key,
+            "fields": {
+                "summary": self.fresh_summary,
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "customfield_10071": {"value": "API Team"},
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_refresh_from_jira_pulls_fresh_data_and_keeps_shadow(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "description", "Local description edit")
+    client = RefreshFromJiraClient(fresh_summary="Renamed upstream in Jira")
+    app = _app_with_client(jira_dir, client)
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        assert isinstance(app.screen, DetailScreen)
+        await pilot.press("R")
+        await pilot.pause()
+
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("summary", "value")) == "Renamed upstream in Jira"
+
+    assert client.get_issue_calls == 1
+    shadow = load_shadow(jira_dir, "SAT-1")
+    assert shadow is not None
+    assert shadow["fields"]["description"] == "Local description edit"
 
 
 @pytest.mark.asyncio
@@ -2199,6 +2286,103 @@ async def test_index_table_shows_priority_icon_instead_of_text(tmp_path: Path) -
     async with app.run_test():
         table = app.screen.query_one(DataTable)
         assert str(table.get_cell("SAT-9", "Priority")) == "↑"
+
+
+DEV_STATUS_OPEN_PR_RAW = (
+    '{pullrequest={dataType=pullrequest, state=OPEN, stateCount=1}, '
+    'json={"cachedValue":{"errors":[],"summary":{"pullrequest":{"overall":'
+    '{"count":1,"lastUpdated":"2026-04-16T10:16:17.000-0400","stateCount":1,'
+    '"state":"OPEN","dataType":"pullrequest","open":true}}}},"isStale":false}}'
+)
+DEV_STATUS_BRANCH_ONLY_RAW = (
+    '{branch={count=1, dataType=branch}, json={"cachedValue":{"errors":[],'
+    '"summary":{"branch":{"overall":{"count":1,"lastUpdated":'
+    '"2026-05-01T11:02:40.000-0400","dataType":"branch"}}}},"isStale":false}}'
+)
+
+
+@pytest.mark.asyncio
+async def test_index_table_dev_column_blank_when_no_dev_status(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test():
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("SAT-1", "Dev")) == ""
+
+
+@pytest.mark.asyncio
+async def test_index_table_dev_column_shows_pr_state(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    _set_issue_fields(jira_dir, "SAT-1", {"customfield_10000": DEV_STATUS_OPEN_PR_RAW})
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test():
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("SAT-1", "Dev")) == " Open "
+
+
+@pytest.mark.asyncio
+async def test_index_table_dev_column_shows_branch_when_no_pr(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    _set_issue_fields(jira_dir, "SAT-1", {"customfield_10000": DEV_STATUS_BRANCH_ONLY_RAW})
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test():
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("SAT-1", "Dev")) == " Branch "
+
+
+@pytest.mark.asyncio
+async def test_index_dev_status_click_opens_the_single_link_directly(tmp_path: Path, monkeypatch) -> None:
+    from jira_workbench.tui.screens import index as index_module
+    from textual.widgets.data_table import RowKey
+
+    jira_dir = synced_jira_dir(tmp_path)
+    _set_issue_id(jira_dir, "SAT-1", "78547")
+    _set_issue_fields(jira_dir, "SAT-1", {"customfield_10000": DEV_STATUS_OPEN_PR_RAW})
+    single_pr_summary = {
+        "summary": {"pullrequest": {"overall": {"count": 1}, "byInstanceType": {APP_TYPE: {"count": 1}}}}
+    }
+    client = DevStatusClient(summary=single_pr_summary, pr_detail=LINKED_PR_DETAIL, branch_detail={"detail": []})
+    app = _app_with_client(jira_dir, client)
+    opened: list[str] = []
+    monkeypatch.setattr(index_module.webbrowser, "open", lambda url: opened.append(url))
+
+    async with app.run_test():
+        assert isinstance(app.screen, IndexScreen)
+        await app.screen._open_dev_status_link(RowKey("SAT-1"))
+
+        assert opened == ["https://github.com/stardog-oss/kube-stardog-stack/pull/15"]
+
+
+@pytest.mark.asyncio
+async def test_index_dev_status_click_with_multiple_links_opens_a_picker(tmp_path: Path, monkeypatch) -> None:
+    from jira_workbench.tui.screens import index as index_module
+    from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+    from textual.widgets import OptionList
+    from textual.widgets.data_table import RowKey
+
+    jira_dir = synced_jira_dir(tmp_path)
+    _set_issue_id(jira_dir, "SAT-1", "78547")
+    _set_issue_fields(jira_dir, "SAT-1", {"customfield_10000": DEV_STATUS_OPEN_PR_RAW})
+    client = DevStatusClient(summary=LINKED_SUMMARY, pr_detail=LINKED_PR_DETAIL, branch_detail=LINKED_BRANCH_DETAIL)
+    app = _app_with_client(jira_dir, client)
+    opened: list[str] = []
+    monkeypatch.setattr(index_module.webbrowser, "open", lambda url: opened.append(url))
+
+    async with app.run_test() as pilot:
+        assert isinstance(app.screen, IndexScreen)
+        worker = app.screen.run_worker(app.screen._open_dev_status_link(RowKey("SAT-1")))
+        await pilot.pause()
+        assert isinstance(app.screen, OptionPickerScreen)
+
+        options = app.screen.query_one(OptionList)
+        options.highlighted = 0
+        await pilot.press("enter")
+        await worker.wait()
+
+        assert opened == ["https://github.com/stardog-oss/kube-stardog-stack/pull/15"]
 
 
 async def test_push_all_pushes_shadow_and_clears_it(tmp_path: Path) -> None:

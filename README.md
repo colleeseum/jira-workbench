@@ -66,6 +66,11 @@ hide_done_after_days = 7
 # detect that, so the wrong setting here just shows broken/tofu glyphs
 # instead of the plain shapes. No effect on anything else in the app.
 nerd_font = true
+# Optional. The custom field Jira Cloud mirrors its "Development" panel data
+# (branches/PRs) into -- already part of a normal sync (fields="*all"), so
+# the index's Dev column reads it with no extra API calls. "customfield_10000"
+# is the common default, but custom field ids can differ per Jira instance.
+dev_status_field = "customfield_10000"
 
 [versions]
 filter = "helm-chart-sa 3\\.[45]"
@@ -103,6 +108,11 @@ changed. Pass `--force` to re-fetch every issue regardless of its timestamp:
 ```bash
 jira-wb sync --force
 ```
+
+To refresh just the one issue you're looking at, without waiting on a full
+project sync, press `R` on its Detail screen in the interactive view -- an
+immediate, single-issue equivalent of `sync --force`. Any local shadow edit
+on that issue is preserved.
 
 Serve the local browser:
 
@@ -216,6 +226,10 @@ When Jira API access is configured, the detail view also shows a **Development**
 
 That same live check (`issue_editmeta`, fetched once per item opened) also drives two more editable fields beyond the fixed set: **Due date**, and *any* labels-type custom field your Jira site has (the same underlying field type as native Labels — for example a "Customers" field), discovered generically rather than hardcoded to one specific field. Neither shows up until that fetch succeeds, and both stay hidden (not erroring) if it fails or no API is configured — native Labels editing is unaffected either way, since it's always available regardless of that fetch. Due date takes `YYYY-MM-DD`; typing `(none)` clears it, leaving the prompt blank cancels (same convention as everywhere else a "no value" option exists). A labels-type custom field opens the same checklist picker as Labels.
 
+The index list also has a **Dev** column with an at-a-glance Git/PR indicator for every synced issue — blank if there's no branch/PR, "Branch" if there's a branch but no PR yet, or the PR's state (Open/Draft/Merged/Declined) if there is one. Unlike the Development panel above, this needs no live API call at all: Jira Cloud already mirrors a summary of that data into a regular custom field (`[view].dev_status_field`, default `customfield_10000`) that a normal sync fetches for every issue. Click a Dev cell to resolve and open the actual branch/PR — that click is the one point this does make a live call (to fetch the real URL), and only for that one issue; if there's more than one branch/PR linked, a picker lets you choose which to open.
+
+If an issue has Jira issue links (blocks/is blocked by/relates to/etc.), Detail shows one row per link phrase, each a pill per linked issue key. This is read-only for now — selecting the row just notes that it isn't editable yet.
+
 The generated layout is:
 
 ```text
@@ -279,7 +293,7 @@ Push committed local changes:
 jira-wb shadow push SAT-1
 ```
 
-Before pushing a work item, Jira Workbench fetches the remote `updated` value and compares it to the value captured when the first local shadow edit was created. If the work item changed remotely, that item is skipped and not pushed.
+Before pushing a work item, Jira Workbench fetches the remote `updated` value and compares it to the value captured when the first local shadow edit was created. If it differs, that doesn't necessarily mean a conflict -- a comment from someone else, a linked dependency, or any other unrelated change also bumps `updated` without touching the fields you're pushing. In that case Jira Workbench re-fetches the full issue and checks, field by field, whether anything *you're actually editing* also changed remotely (a version rename is not treated as a conflict, since the underlying version id is unchanged -- only the display name). The push is blocked only if a field you edited was also genuinely changed remotely; otherwise it proceeds, and the post-push refresh picks up whatever else changed remotely along the way.
 
 Current push support is intentionally narrow to the Jira REST API fields Jira Workbench has verified update behavior for:
 

@@ -87,6 +87,24 @@ def test_load_config_rejects_non_boolean_nerd_font(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_load_config_reads_dev_status_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[view]\ndev_status_field = "customfield_10099"\n')
+
+    config = load_config(path)
+
+    assert config.view_dev_status_field == "customfield_10099"
+
+
+def test_load_config_dev_status_field_defaults_to_none(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("")
+
+    config = load_config(path)
+
+    assert config.view_dev_status_field is None
+
+
 def test_load_config_reads_issue_default_type(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text('[issue]\ndefault_type = "Story"\n')

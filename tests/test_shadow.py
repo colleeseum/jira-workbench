@@ -6,6 +6,7 @@ from typing import Any
 from jira_workbench.shadow import (
     add_comment,
     commit_shadow,
+    conflicting_fields,
     delete_comment,
     edit_comment,
     load_shadow,
@@ -208,16 +209,81 @@ def test_push_applies_comment_edits_and_deletes(tmp_path: Path) -> None:
     assert load_shadow(jira_dir, "SAT-1") is None
 
 
-def test_push_skips_remote_changed_item(tmp_path: Path) -> None:
+def test_push_blocks_when_remote_change_conflicts_with_a_shadow_edited_field(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     set_field(jira_dir, "SAT-1", "description", "Local description")
     commit_shadow(jira_dir, "SAT-1")
     client = PushJiraClient("2026-07-20T99:99:99.000+0000")
+    # A genuine remote edit to the same field ("description") the shadow
+    # itself is trying to push -- a real conflict, not just an unrelated
+    # timestamp bump.
+    client.refreshed_issues["SAT-1"] = {
+        "key": "SAT-1",
+        "fields": {"updated": "2026-07-20T99:99:99.000+0000-refreshed", "description": "Someone else's remote edit"},
+    }
 
     result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
 
     assert result.blocked == 1
     assert client.update_calls == []
+
+
+def test_push_proceeds_when_remote_updated_moved_but_no_field_actually_conflicts(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "description", "Local description")
+    commit_shadow(jira_dir, "SAT-1")
+    client = PushJiraClient("2026-07-20T99:99:99.000+0000")
+    # The issue's own `updated` timestamp differs from this shadow's base
+    # (e.g. someone added a comment, or linked a dependency, elsewhere) --
+    # but nothing about the "description" field itself changed remotely
+    # (the fake's default *all response has no "description" key at all,
+    # same as the locally synced base), so this is not a real conflict.
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    assert result.blocked == 0
+
+
+def test_conflicting_fields_empty_when_shadow_edited_field_unchanged_remotely(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "description", "Local description")
+    shadow = load_shadow(jira_dir, "SAT-1")
+    remote_issue = {"key": "SAT-1", "fields": {"description": None, "priority": {"name": "Medium"}}}
+
+    assert conflicting_fields(jira_dir, "SAT-1", shadow, remote_issue) == []
+
+
+def test_conflicting_fields_flags_a_field_the_shadow_edits_that_also_changed_remotely(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "description", "Local description")
+    shadow = load_shadow(jira_dir, "SAT-1")
+    remote_issue = {"key": "SAT-1", "fields": {"description": "Someone else's remote edit"}}
+
+    assert conflicting_fields(jira_dir, "SAT-1", shadow, remote_issue) == ["description"]
+
+
+def test_conflicting_fields_ignores_a_version_rename_id_stays_the_same(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    issue_path = jira_dir / "components/api-team/SAT-1/issue.json"
+    issue = read_json(issue_path)
+    issue["fields"]["fixVersions"] = [{"id": "10001", "name": "helm-chart-sa 3.3.0"}]
+    write_json(issue_path, issue)
+    set_field(jira_dir, "SAT-1", "fixVersions", [{"id": "10001", "name": "helm-chart-sa 3.3.0"}])
+    shadow = load_shadow(jira_dir, "SAT-1")
+    # Same version id, just renamed remotely -- not a real conflict, per _field_identity.
+    remote_issue = {"key": "SAT-1", "fields": {"fixVersions": [{"id": "10001", "name": "helm-chart-sa 3.3.0-renamed"}]}}
+
+    assert conflicting_fields(jira_dir, "SAT-1", shadow, remote_issue) == []
+
+
+def test_conflicting_fields_ignores_status_field(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "status", "Done")
+    shadow = load_shadow(jira_dir, "SAT-1")
+    remote_issue = {"key": "SAT-1", "fields": {"status": {"name": "In Progress"}}}
+
+    assert conflicting_fields(jira_dir, "SAT-1", shadow, remote_issue) == []
 
 
 def test_push_applies_supported_fields_and_comments(tmp_path: Path) -> None:
@@ -431,13 +497,19 @@ def test_push_shadows_blocks_child_when_parent_dependency_does_not_push(tmp_path
             "SAT-593": "2026-07-20T00:00:02.000+0000",
         }
     )
+    # A genuine remote conflict on the same field the shadow edits (type),
+    # not just an unrelated timestamp bump, so SAT-371 is blocked for cause.
+    client.refreshed_issues["SAT-371"] = {
+        "key": "SAT-371",
+        "fields": {"updated": "2026-07-21T00:00:01.000+0000", "issuetype": {"name": "Task"}},
+    }
     events: list[str] = []
 
     result = push_shadows(tmp_path, ["SAT-593", "SAT-371"], client, progress=events.append)
 
     assert result.pushed == 0
     assert result.blocked == 2
-    assert "SAT-371: skipped, remote changed since local edits" in events
+    assert "SAT-371: blocked, remote changed for type since local edits" in events
     assert "SAT-593: blocked, dependency did not push: SAT-371" in events
     assert client.update_calls == []
 

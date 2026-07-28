@@ -14,7 +14,17 @@ from textual.widgets import DataTable, Footer, Header, Static
 from ...devstatus import DevStatus, fetch_dev_status
 from ...issue import IssueError, fetch_all_field_names, fetch_issue_edit_fields
 from ...metadata import MetadataError, remember_field_names
-from ...shadow import ShadowError, add_comment, delete_shadow, load_shadow, push_key, render_diff, set_field, set_status_change
+from ...shadow import (
+    ShadowError,
+    add_comment,
+    delete_shadow,
+    load_shadow,
+    push_key,
+    refresh_local_issue_after_push,
+    render_diff,
+    set_field,
+    set_status_change,
+)
 from ...view import (
     DEFAULT_RESOLUTIONS,
     DONE_STATUSES,
@@ -32,6 +42,7 @@ from ...view import (
     has_shadow_changes,
     hierarchy_section,
     issue_identity,
+    issue_link_groups,
     issue_parent_key,
     label_type_fields,
     load_issue,
@@ -71,6 +82,7 @@ class DetailScreen(Screen[None]):
         Binding("r", "revert", "Revert"),
         Binding("p", "push", "Push"),
         Binding("O", "toggle_other", "Other fields"),
+        Binding("R", "refresh_from_jira", "Refresh"),
         Binding("v", "view_key", "View key"),
         Binding("V", "open_parent", "Parent"),
         Binding("h", "show_help", "Help"),
@@ -257,6 +269,10 @@ class DetailScreen(Screen[None]):
             more = len(lines) > max_lines
             text = "\n".join(shown) + (" [...]" if more else "")
             return Text(text), len(shown)
+        if field.startswith("link:"):
+            phrase = field.removeprefix("link:")
+            groups = dict(issue_link_groups(self.effective_issue))
+            return render_pills(groups.get(phrase, [])), 1
         if field in self._pill_fields():
             fields = as_dict(self.effective_issue.get("fields"))
             if field == "fixVersions":
@@ -324,6 +340,39 @@ class DetailScreen(Screen[None]):
         self.mode = "shadow"
         self._refresh_data()
         self.notify("local shadow reverted")
+
+    @work
+    async def action_refresh_from_jira(self) -> None:
+        # An immediate, single-issue equivalent of `jira-wb sync --force`:
+        # pulls this one issue fresh from Jira right now, rather than
+        # waiting on this issue's own updated timestamp to change (a normal
+        # sync misses drift caused by something *else* changing, e.g. a
+        # fix version renamed elsewhere). The local shadow is preserved --
+        # refresh_local_issue_after_push reads it before overwriting the
+        # issue and writes it back untouched.
+        if not self.app.can_push():
+            self.notify("cannot refresh: missing Jira API configuration", severity="warning")
+            return
+        try:
+            client = self.app.get_api_client()
+        except MetadataError as exc:
+            self.notify(f"cannot refresh: {exc}", severity="error")
+            return
+        try:
+            await asyncio.to_thread(
+                refresh_local_issue_after_push,
+                self.app.jira_dir,
+                self.key,
+                client,
+                self.app.component_field or "components",
+            )
+        except ShadowError as exc:
+            self.notify(f"refresh failed: {exc}", severity="error")
+            return
+        self.app.mark_changed(self.key)
+        self.mode = "shadow"
+        self._refresh_data()
+        self.notify(f"refreshed {self.key} from Jira")
 
     @work
     async def action_push(self) -> None:

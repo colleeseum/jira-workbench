@@ -7,7 +7,7 @@ from textual import events
 from textual.app import App
 
 from ..metadata import JiraApiConfig, MetadataError, jira_api_client
-from ..view import normalize_swimlane
+from ..view import DEV_STATUS_FIELD_DEFAULT, normalize_swimlane
 
 DEFAULT_PREVIEW_LINES = 10
 
@@ -42,6 +42,7 @@ class JiraWorkbenchApp(App):
         hide_done_after_days: int | None = None,
         config_path: Path | None = None,
         nerd_font: bool = False,
+        dev_status_field: str | None = None,
     ) -> None:
         super().__init__()
         self.jira_dir = jira_dir
@@ -49,6 +50,7 @@ class JiraWorkbenchApp(App):
         self.preview_lines = preview_lines if preview_lines and preview_lines > 0 else DEFAULT_PREVIEW_LINES
         self.hide_done_after_days = hide_done_after_days if hide_done_after_days and hide_done_after_days > 0 else None
         self.nerd_font_enabled = nerd_font
+        self.dev_status_field = dev_status_field or DEV_STATUS_FIELD_DEFAULT
         self.initial_component = component
         self.initial_fix_version = fix_version
         self.initial_assignee = assignee
@@ -174,6 +176,7 @@ def run_view(
     hide_done_after_days: int | None = None,
     config_path: Path | None = None,
     nerd_font: bool = False,
+    dev_status_field: str | None = None,
 ) -> None:
     app = JiraWorkbenchApp(
         jira_dir,
@@ -197,6 +200,7 @@ def run_view(
         hide_done_after_days=hide_done_after_days,
         config_path=config_path,
         nerd_font=nerd_font,
+        dev_status_field=dev_status_field,
     )
     app.run()
 

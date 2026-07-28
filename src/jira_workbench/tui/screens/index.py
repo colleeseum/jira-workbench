@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import webbrowser
 from collections import Counter
 from typing import Any
 
@@ -10,13 +11,16 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header
+from textual.widgets.data_table import RowKey
 
+from ...devstatus import fetch_dev_status
 from ...issue import IssueError, fetch_current_user, fetch_issue_type_fields
 from ...metadata import MetadataError
 from ...sync import issue_key_sort_key
 from ...view import (
     VIRTUAL_NONE,
     cycle_swimlane,
+    dev_status_indicator,
     display_component,
     display_name,
     filter_items,
@@ -38,13 +42,13 @@ from ...view import (
     with_local_index_fields,
 )
 from ..render import render_pills
-from ..widgets.prompts import TextPromptScreen
+from ..widgets.prompts import OptionPickerScreen, TextPromptScreen
 from ..widgets.tables import ClickableRowDataTable
 from .filters import FILTER_FIELDS
 
 LANE_ROW_PREFIX = "__lane__::"
 
-COLUMNS = ("", "Key", "State", "Component", "Summary", "Priority", "Assignee", "Version")
+COLUMNS = ("", "Key", "State", "Component", "Summary", "Priority", "Assignee", "Version", "Dev")
 # Priority now shows an icon rather than text (see _add_item_row) -- keeping the
 # full "Priority" header would waste the width the icon was meant to save, so
 # this is the displayed text only; the column's identity/sort key stays "Priority".
@@ -115,7 +119,9 @@ class IndexScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield ClickableRowDataTable(id="index-table", cursor_type="row")
+        yield ClickableRowDataTable(
+            id="index-table", cursor_type="row", link_column="Dev", on_link_click=self._open_dev_status_link
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -124,7 +130,9 @@ class IndexScreen(Screen[None]):
             width = ICON_COLUMN_WIDTH_INDENTED if column == "" else None
             label = self._column_label(column) if column in SORT_FIELDS else column
             table.add_column(label, key=column, width=width)
-        self.items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        self.items = load_manifest_items(
+            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+        )
         self._rebuild_table()
 
     def _visible_items(self) -> list[dict[str, Any]]:
@@ -258,7 +266,9 @@ class IndexScreen(Screen[None]):
         # no room for a collapse arrow since it's a real item row, not a
         # divider -- a rare enough edge case not to warrant its own layout.)
         if self.current_swimlane == "epic" and lane_key != VIRTUAL_NONE and lane_key not in seen_item_keys:
-            epic_item = with_local_index_fields(self.app.jira_dir, {"key": lane_key}, self.app.component_field)
+            epic_item = with_local_index_fields(
+                self.app.jira_dir, {"key": lane_key}, self.app.component_field, dev_status_field=self.app.dev_status_field
+            )
             if "summary" in epic_item:
                 seen_item_keys.add(lane_key)
                 self._add_item_row(table, epic_item, modified_keys, bold=True, indent=False)
@@ -269,6 +279,7 @@ class IndexScreen(Screen[None]):
         table.add_row(
             "",
             Text(label, style="bold"),
+            "",
             "",
             "",
             "",
@@ -305,6 +316,13 @@ class IndexScreen(Screen[None]):
         # bigger gap before State on every un-indented (epic) row.
         icon_text = f"{' ' * INDENT_WIDTH}{glyph}" if indent else glyph
         icon = Text(icon_text, style=f"bold {color}" if bold else color)
+
+        dev_indicator = dev_status_indicator(item.get("devStatus"))
+        dev_cell: Any = ""
+        if dev_indicator is not None:
+            _, dev_label, dev_color = dev_indicator
+            dev_cell = Text(f" {dev_label} ", style=f"bold white on {dev_color}")
+
         table.add_row(
             icon,
             key_cell,
@@ -314,6 +332,7 @@ class IndexScreen(Screen[None]):
             priority_cell,
             cell(display_name(item.get("assignee"))),
             render_pills(pill_values(item.get("fixVersion"))),
+            dev_cell,
             key=key_value,
         )
         self._row_keys.append(key_value)
@@ -471,7 +490,9 @@ class IndexScreen(Screen[None]):
         self.notify(f"saved current filter to {self.app.config_path}")
 
     def action_reload(self) -> None:
-        self.items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        self.items = load_manifest_items(
+            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+        )
         self._rebuild_table()
         self.notify(f"reloaded {len(self.items)} items")
 
@@ -505,7 +526,9 @@ class IndexScreen(Screen[None]):
         for key in keys:
             self.app.mark_changed(key)
         for key in self.app.drain_changed_keys():
-            refresh_index_item(self.app.jira_dir, self.items, key, self.app.component_field)
+            refresh_index_item(
+                self.app.jira_dir, self.items, key, self.app.component_field, dev_status_field=self.app.dev_status_field
+            )
         self._rebuild_table()
         if result is not None:
             self.notify(
@@ -601,10 +624,48 @@ class IndexScreen(Screen[None]):
         if key is None:
             return
 
-        self.items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        self.items = load_manifest_items(
+            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+        )
         self._rebuild_table()
         self._select_key(key)
         self.notify(f"created {key}")
+
+    async def _open_dev_status_link(self, row_key: RowKey) -> None:
+        # The Dev column's cached indicator (from the already-synced
+        # "Development" field mirror) has no real URL -- only clicking
+        # triggers the live per-issue fetch_dev_status call to resolve one,
+        # exactly like Detail's own dev-status panel. One click = at most
+        # one issue's worth of API calls, never a batch fetch across the list.
+        key = row_key.value
+        if key is None or key.startswith(LANE_ROW_PREFIX):
+            return
+        item = next((i for i in self.items if display_name(i.get("key")) == key), None)
+        if item is None or item.get("devStatus") is None:
+            return
+        if not self.app.can_push():
+            self.notify("cannot open: missing Jira API configuration", severity="warning")
+            return
+        try:
+            client = self.app.get_api_client()
+        except MetadataError:
+            return
+        status = self.app.dev_status_cache.get(key)
+        if status is None:
+            status = await asyncio.to_thread(fetch_dev_status, client, str(item.get("issueId")))
+            self.app.dev_status_cache[key] = status
+        links = [(pr.name, pr.url) for pr in status.pull_requests] + [
+            (branch.name, branch.url) for branch in status.branches
+        ]
+        if not links:
+            self.notify("no branch/PR details available")
+            return
+        if len(links) == 1:
+            webbrowser.open(links[0][1])
+            return
+        choice = await self.app.push_screen_wait(OptionPickerScreen("Open:", [name for name, _ in links]))
+        if choice:
+            webbrowser.open(dict(links)[choice])
 
     @work
     async def action_search(self) -> None:
@@ -683,7 +744,9 @@ class IndexScreen(Screen[None]):
         # way returning from Detail already does, rather than special-casing
         # just that one path.
         for key in self.app.drain_changed_keys():
-            refresh_index_item(self.app.jira_dir, self.items, key, self.app.component_field)
+            refresh_index_item(
+                self.app.jira_dir, self.items, key, self.app.component_field, dev_status_field=self.app.dev_status_field
+            )
         self._rebuild_table()
 
     def action_quit_app(self) -> None:
@@ -713,5 +776,7 @@ class IndexScreen(Screen[None]):
 
     def _on_detail_closed(self, _result: None) -> None:
         for key in self.app.drain_changed_keys():
-            refresh_index_item(self.app.jira_dir, self.items, key, self.app.component_field)
+            refresh_index_item(
+                self.app.jira_dir, self.items, key, self.app.component_field, dev_status_field=self.app.dev_status_field
+            )
         self._rebuild_table()
