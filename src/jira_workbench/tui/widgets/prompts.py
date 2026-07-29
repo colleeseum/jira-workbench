@@ -6,7 +6,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, OptionList, SelectionList, Static, TextArea
+from textual.widgets import Button, Checkbox, Input, OptionList, SelectionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 
@@ -159,9 +159,22 @@ class OptionPickerScreen(ModalScreen[str | None]):
         height: auto;
         align-horizontal: right;
     }
+    OptionPickerScreen Checkbox {
+        margin-top: 1;
+        height: auto;
+        border: none;
+        padding: 0;
+    }
     """
 
-    BINDINGS = [("escape", "cancel", "Cancel")]
+    # ctrl+r, not a bare letter -- the filter Input is focused by default and
+    # would swallow any plain printable key as text before it ever reaches a
+    # screen-level binding (same reason Input has no single-letter bindings
+    # of its own; only Ctrl/function-key combos reliably bubble up). This is
+    # just a fast alternative to the real Checkbox below -- both drive the
+    # exact same toggle, so Tab/mouse work too, consistent with every other
+    # widget in the app.
+    BINDINGS = [("escape", "cancel", "Cancel"), ("ctrl+r", "toggle_extra", "Toggle")]
 
     def __init__(
         self,
@@ -170,6 +183,8 @@ class OptionPickerScreen(ModalScreen[str | None]):
         *,
         current: str | None = None,
         render: Callable[[str], object] | None = None,
+        on_toggle: Callable[[bool], list[str]] | None = None,
+        toggle_hint: str | None = None,
     ) -> None:
         super().__init__()
         self._label = label
@@ -180,6 +195,14 @@ class OptionPickerScreen(ModalScreen[str | None]):
         # Option's `id` is the round-trip identity, independent of `prompt`
         # (what's actually displayed).
         self._render_option = render or (lambda option: option)
+        # Optional checkbox toggle (e.g. the fixVersions picker's "show
+        # released" reveal) -- purely opt-in: the Checkbox itself is only
+        # composed when on_toggle/toggle_hint are given, and check_action
+        # hides the "ctrl+r" binding otherwise, so neither ever appears for
+        # every other OptionPickerScreen use (priority/status/component/
+        # parent/etc.).
+        self._on_toggle = on_toggle
+        self._toggle_hint = toggle_hint
 
     def _make_option(self, option: str) -> Option:
         return Option(self._render_option(option), id=option)
@@ -188,6 +211,8 @@ class OptionPickerScreen(ModalScreen[str | None]):
         with Vertical():
             yield Static(self._label, classes="title")
             yield Input(placeholder="type to filter", id="picker-filter")
+            if self._on_toggle is not None and self._toggle_hint:
+                yield Checkbox(f"{self._toggle_hint} (ctrl+r)", id="picker-toggle")
             yield OptionList(*(self._make_option(option) for option in self._options), id="picker-options")
             with Horizontal(classes="dialog-buttons"):
                 yield Button("Cancel (Esc)", id="cancel-button")
@@ -198,14 +223,17 @@ class OptionPickerScreen(ModalScreen[str | None]):
         if self._current in self._options:
             options.highlighted = self._options.index(self._current)
 
-    @on(Input.Changed, "#picker-filter")
-    def _filter_changed(self, event: Input.Changed) -> None:
-        needle = event.value.strip().lower()
+    def _refresh_options(self, needle_raw: str) -> None:
+        needle = needle_raw.strip().lower()
         options = self.query_one(OptionList)
         options.clear_options()
         for option in self._options:
             if needle in option.lower():
                 options.add_option(self._make_option(option))
+
+    @on(Input.Changed, "#picker-filter")
+    def _filter_changed(self, event: Input.Changed) -> None:
+        self._refresh_options(event.value)
 
     @on(Input.Submitted, "#picker-filter")
     def _filter_submitted(self, event: Input.Submitted) -> None:
@@ -217,12 +245,28 @@ class OptionPickerScreen(ModalScreen[str | None]):
     def _option_selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(event.option_id)
 
+    @on(Checkbox.Changed, "#picker-toggle")
+    def _toggle_changed(self, event: Checkbox.Changed) -> None:
+        if self._on_toggle is None:
+            return
+        self._options = self._on_toggle(event.value)
+        self._refresh_options(self.query_one("#picker-filter", Input).value)
+
     @on(Button.Pressed, "#cancel-button")
     def _cancel_pressed(self) -> None:
         self.action_cancel()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "toggle_extra" and self._on_toggle is None:
+            return False
+        return True
+
+    def action_toggle_extra(self) -> None:
+        checkbox = self.query_one("#picker-toggle", Checkbox)
+        checkbox.toggle()
 
 
 class MultiOptionPickerScreen(ModalScreen[list[str]]):

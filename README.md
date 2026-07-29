@@ -88,7 +88,25 @@ nerd_font = true
 dev_status_field = "customfield_10000"
 
 [versions]
+# Applies to the Meta fix-versions browser's `/` filter only (see below) --
+# not the fixVersion picker used when editing/creating an issue, which is
+# always scoped to that issue's own project (see [versions.by_component]).
 filter = "helm-chart-sa 3\\.[45]"
+
+# Optional. A regex fix-version filter per component, scoped per project --
+# applied only to the fixVersion *picker* (Detail's Fix Version row, New
+# Issue's Version row), narrowing an already project-scoped list further.
+# Keyed by whatever the issue's own component value is (case-insensitive).
+# A component with no entry here just sees every version in its project,
+# unfiltered. Scoped per project (not one flat table) since the same
+# component name can mean, and be versioned, completely differently across
+# two different configured projects.
+[versions.by_component.SAT]
+helm-chart = "helm-chart-sa"
+terraform = "infra-\\d+"
+
+[versions.by_component.PLAT]
+helm-chart = "plat-helm"
 
 [issue]
 # Default --type for `jira-wb issue create` (both CLI and the New issue TUI
@@ -246,6 +264,10 @@ Without a subcommand, `jira-wb meta` opens an interactive metadata browser (buil
 The labels browser lists every label used across your locally synced issues (shadow-merged, so a pending local edit shows immediately) with its issue count. Jira has no API for labels as an independent entity, unlike fix versions/components -- a label is just free text on each issue's `labels` field. So `e` (rename) and `d` (delete) here find every locally synced issue with the selected label, edit each one's shadow, and push them -- the same thing Jira's own bulk-edit issue navigator does under the hood, just without a dedicated API for it. Both ask for confirmation (with the affected issue count) before touching anything, and require Jira API credentials to push. `n` (new) doesn't create anything -- Jira has no standalone label registry to add to, so it just explains that and points you at applying a label directly to an issue instead (Detail or the New issue screen's Labels field).
 
 The `[versions].filter` setting applies to the fix-versions browser's `/` filter. It uses Python regular expression syntax, case-insensitive. It is not a full PCRE engine.
+
+The fixVersion **picker** (Detail's Fix Version row, New Issue's Version row) is a separate thing from the browser above and always scoped to the issue's own project -- Jira refuses to assign a fixVersion from a different project on push, so the picker never offers one. `[versions.by_component]` (see the config example above) additionally narrows that already project-scoped list by a regex keyed on the issue's own component, for projects where fix versions are themselves organized per component.
+
+By default the picker only offers versions that are both unreleased and unarchived -- assigning new work to an already-shipped version is unusual enough to want a deliberate second step rather than a default option. Archived versions are never offered at all, matching Jira's own UI (archiving a version removes it from every Fix Version/Affects Version picker for good). A "show released" checkbox inside the picker reveals released-but-unarchived versions too, without leaving it -- toggle it with a click, Tab to it and press Space/Enter, or press `Ctrl+R` as a shortcut from the filter box.
 
 ## Boards (Kanban)
 

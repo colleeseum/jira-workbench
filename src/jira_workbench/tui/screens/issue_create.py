@@ -251,9 +251,24 @@ class IssueCreateScreen(Screen[str | None]):
             return
 
         if key == "version":
-            options = version_options(self._jira_dir)
+
+            def version_options_for(include_released: bool) -> list[str]:
+                return version_options(
+                    self._jira_dir,
+                    project=self._project,
+                    component=self.values["component"] or None,
+                    version_filters_by_component=self.app.version_filters_by_component,
+                    include_released=include_released,
+                )
+
             choice = await self.app.push_screen_wait(
-                OptionPickerScreen("Version:", options, current=self.values["version"] or None)
+                OptionPickerScreen(
+                    "Version:",
+                    version_options_for(False),
+                    current=self.values["version"] or None,
+                    on_toggle=version_options_for,
+                    toggle_hint="show released",
+                )
             )
             if choice is not None:
                 self.values["version"] = "" if choice == "(none)" else choice

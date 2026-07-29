@@ -16,7 +16,7 @@ from jira_workbench.cli import (
     sync_progress_printer,
     version_identifier,
 )
-from jira_workbench.config import load_config
+from jira_workbench.config import ConfigError, load_config
 from jira_workbench.metadata import remember_field_names
 from jira_workbench.shadow import load_shadow
 from jira_workbench.sync import write_json
@@ -1148,6 +1148,70 @@ def test_versions_filter_is_read_from_config(tmp_path: Path) -> None:
     config = load_config(config_path)
 
     assert config.versions_filter == "helm-chart-sa 3\\.[45]"
+
+
+def test_version_filters_by_component_is_read_from_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[versions.by_component.SAT]",
+                'helm-chart = "helm-chart-sa"',
+                'terraform = "infra-\\\\d+"',
+                "[versions.by_component.PLAT]",
+                'helm-chart = "plat-helm"',
+            ]
+        )
+        + "\n"
+    )
+
+    config = load_config(config_path)
+
+    assert config.version_filters_by_component == {
+        "SAT": {"helm-chart": "helm-chart-sa", "terraform": "infra-\\d+"},
+        "PLAT": {"helm-chart": "plat-helm"},
+    }
+
+
+def test_version_filters_by_component_defaults_to_empty(tmp_path: Path) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text("")
+
+    config = load_config(config_path)
+
+    assert config.version_filters_by_component == {}
+
+
+def test_version_filters_by_component_rejects_non_table(tmp_path: Path) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text('[versions]\nby_component = "not a table"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+def test_version_filters_by_component_rejects_non_table_project_entry(tmp_path: Path) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text("[versions.by_component]\nSAT = 3\n")
+
+    with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+def test_version_filters_by_component_rejects_non_string_value(tmp_path: Path) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text("[versions.by_component.SAT]\nhelm-chart = 3\n")
+
+    with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+def test_version_filters_by_component_rejects_invalid_regex(tmp_path: Path) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text('[versions.by_component.SAT]\nhelm-chart = "["\n')
+
+    with pytest.raises(ConfigError):
+        load_config(config_path)
 
 
 def test_filter_versions_uses_regex() -> None:

@@ -40,6 +40,7 @@ class JiraWorkbenchApp(App):
         initial_screen: str = "index",
         project: str | None = None,
         versions_filter: str | None = None,
+        version_filters_by_component: dict[str, dict[str, str]] | None = None,
         preview_lines: int | None = None,
         hide_done_after_days: int | None = None,
         config_path: Path | None = None,
@@ -71,6 +72,7 @@ class JiraWorkbenchApp(App):
         self.initial_screen = initial_screen if initial_screen in {"index", "meta"} else "index"
         self.project = project
         self.versions_filter = versions_filter
+        self.version_filters_by_component = version_filters_by_component or {}
         self.config_path = config_path
         self._changed_keys: set[str] = set()
         self._suppress_focus_restoring_click = False
@@ -138,6 +140,11 @@ class JiraWorkbenchApp(App):
 
         from .screens.index import IndexScreen
 
+        # IndexScreen itself opens Detail for self.initial_key, once its own
+        # items are loaded (see its on_mount) -- pushing DetailScreen from
+        # here would only ever see this screen's not-yet-populated `[]`,
+        # since screens mount asynchronously (this handler returns well
+        # before IndexScreen.on_mount actually runs).
         self.push_screen(
             IndexScreen(
                 project=self.initial_project_filter,
@@ -152,10 +159,6 @@ class JiraWorkbenchApp(App):
                 swimlane=self.initial_swimlane,
             )
         )
-        if self.initial_key:
-            from .screens.detail import DetailScreen
-
-            self.push_screen(DetailScreen(key=self.initial_key, mode=self.initial_mode))
 
     def can_push(self) -> bool:
         return bool(self.jira_url and self.jira_email and self.jira_api_token)
@@ -191,6 +194,7 @@ def run_view(
     jira_api_token: str | None = None,
     project: str | None = None,
     versions_filter: str | None = None,
+    version_filters_by_component: dict[str, dict[str, str]] | None = None,
     preview_lines: int | None = None,
     hide_done_after_days: int | None = None,
     config_path: Path | None = None,
@@ -217,6 +221,7 @@ def run_view(
         jira_api_token=jira_api_token,
         project=project,
         versions_filter=versions_filter,
+        version_filters_by_component=version_filters_by_component,
         preview_lines=preview_lines,
         hide_done_after_days=hide_done_after_days,
         config_path=config_path,

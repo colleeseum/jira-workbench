@@ -40,6 +40,7 @@ from ...view import (
     extract_field_names,
     field_label_options,
     has_shadow_changes,
+    hierarchy_component,
     hierarchy_section,
     issue_identity,
     issue_link_groups,
@@ -52,6 +53,7 @@ from ...view import (
     resolve_fix_version_names,
     selectable_field_options,
     shadow_change_summary,
+    version_options,
     wrap_preview_lines,
 )
 from ..render import priority_option_render, render_pills
@@ -91,10 +93,17 @@ class DetailScreen(Screen[None]):
         Binding("escape", "close", "Back"),
     ]
 
-    def __init__(self, *, key: str, mode: str = "shadow") -> None:
+    def __init__(self, *, key: str, mode: str = "shadow", items: list[dict[str, Any]] | None = None) -> None:
         super().__init__()
         self.key = key
         self.mode = mode if mode in {"shadow", "original", "diff"} else "shadow"
+        # IndexScreen's own already-loaded (and incrementally kept fresh)
+        # item list -- lets hierarchy_section look up an epic's children in
+        # memory instead of re-scanning every locally synced issue from disk
+        # (the dominant cost of opening any parentless issue). None (e.g. a
+        # detail screen opened without an index behind it) falls back to
+        # that disk scan.
+        self._items = items
         self.show_other_fields = False
         self.issue: dict[str, Any] = {}
         self.effective_issue: dict[str, Any] = {}
@@ -131,7 +140,7 @@ class DetailScreen(Screen[None]):
         self.title = issue_identity(effective)
         self._project_read_only = self.app.is_project_read_only(issue_project_key(effective))
 
-        header_lines = list(hierarchy_section(jira_dir, effective, self.app.component_field))
+        header_lines = list(hierarchy_section(jira_dir, effective, self.app.component_field, items=self._items))
         if shadow is not None and has_shadow_changes(shadow):
             header_lines.append("")
             header_lines.extend(shadow_change_summary(shadow, jira_dir, self.key))
@@ -406,14 +415,14 @@ class DetailScreen(Screen[None]):
     async def action_view_key(self) -> None:
         key = await self.app.push_screen_wait(TextPromptScreen("View work item key:", initial=self.key))
         if key:
-            self.app.push_screen(DetailScreen(key=key))
+            self.app.push_screen(DetailScreen(key=key, items=self._items))
 
     def action_open_parent(self) -> None:
         parent_key = issue_parent_key(self.effective_issue)
         if not parent_key:
             self.notify("no parent on this item")
             return
-        self.app.push_screen(DetailScreen(key=parent_key))
+        self.app.push_screen(DetailScreen(key=parent_key, items=self._items))
 
     def action_show_help(self) -> None:
         from .help import HelpScreen
@@ -481,11 +490,19 @@ class DetailScreen(Screen[None]):
         if field in {field_id for field_id, _ in label_type_fields(self.edit_fields)}:
             await self._edit_label_field(field, current_value)
             return
+        if field == "fixVersions":
+            await self._edit_fix_version(current_value)
+            return
         options = selectable_field_options(
             self.app.jira_dir,
             field,
             self.app.component_field,
-            current_issue=self.issue,
+            # effective_issue, not issue -- reflects an unpushed local
+            # component/status shadow edit, so e.g. picking Version right
+            # after changing Component filters by the *new* component, not
+            # the still-synced one.
+            current_issue=self.effective_issue,
+            version_filters_by_component=self.app.version_filters_by_component,
         )
         if options:
             render = priority_option_render(nerd_font=self.app.nerd_font_enabled) if field == "priority" else None
@@ -520,6 +537,43 @@ class DetailScreen(Screen[None]):
         self.mode = "shadow"
         self._refresh_data()
         self.notify("shadow updated: duedate")
+
+    async def _edit_fix_version(self, current_value: str) -> None:
+        # Its own method (not the generic selectable_field_options path)
+        # since it's the one field whose picker needs a live toggle --
+        # released-but-unarchived versions are hidden by default (assigning
+        # new work to an already-shipped version is unusual enough to want a
+        # deliberate second step), revealed with "r" without leaving the
+        # picker.
+        project = issue_project_key(self.effective_issue)
+        component = hierarchy_component(self.effective_issue, self.app.component_field)
+
+        def options_for(include_released: bool) -> list[str]:
+            return version_options(
+                self.app.jira_dir,
+                project=project,
+                component=component,
+                version_filters_by_component=self.app.version_filters_by_component,
+                include_released=include_released,
+            )
+
+        value = await self.app.push_screen_wait(
+            OptionPickerScreen(
+                "fixVersions:",
+                options_for(False),
+                current=current_value,
+                on_toggle=options_for,
+                toggle_hint="show released",
+            )
+        )
+        if value is None:
+            return
+        encoded = encode_edit_value("fixVersions", value, component_field=self.app.component_field)
+        set_field(self.app.jira_dir, self.key, "fixVersions", encoded)
+        self.app.mark_changed(self.key)
+        self.mode = "shadow"
+        self._refresh_data()
+        self.notify("shadow updated: fixVersions")
 
     async def _edit_label_field(self, field: str, current_value: str) -> None:
         known = field_label_options(self.app.jira_dir, field)

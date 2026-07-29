@@ -17,6 +17,8 @@ from .metadata import (
     load_all_components,
     load_all_versions,
     load_field_names,
+    load_versions,
+    normalize_versions,
     version_name,
 )
 from .shadow import load_shadow, render_diff
@@ -966,7 +968,13 @@ def child_issues(jira_dir: Path, parent_key: str) -> list[dict[str, Any]]:
         issue = read_json(issue_path)
         if not isinstance(issue, dict):
             continue
-        shadow = load_shadow(jira_dir, display_name(issue.get("key")))
+        # issue_path is already components/{component}/{key}/issue.json --
+        # passing its own component segment as a hint lets load_shadow skip
+        # re-resolving the same directory via find_existing_issue's glob,
+        # which otherwise makes this whole-tree scan (already O(every synced
+        # issue) by nature) redo an O(every component dir) glob per issue on
+        # top of that.
+        shadow = load_shadow(jira_dir, display_name(issue.get("key")), component_hint=issue_path.parent.parent.name)
         if shadow is not None:
             issue = apply_shadow(issue, shadow)
         fields = as_dict(issue.get("fields"))
@@ -1006,20 +1014,52 @@ def hierarchy_child_identity(issue: dict[str, Any], component_field: str | None)
     return f"{key} [{component}] {summary}".rstrip()
 
 
-def hierarchy_section(jira_dir: Path, issue: dict[str, Any], component_field: str | None = None) -> list[str]:
+def _enriched_child_identity(item: dict[str, Any]) -> str:
+    """Same rendering as hierarchy_child_identity, but off an already-
+    enriched index item (item["summary"]/item["component"] directly)
+    instead of a raw issue dict -- see hierarchy_section's `items` param."""
+    key = display_name(item.get("key"))
+    summary = display_name(item.get("summary"))
+    identity = f"{key} {summary}".rstrip()
+    component = display_name(item.get("component"))
+    if not component:
+        return identity
+    return f"{key} [{component}] {summary}".rstrip()
+
+
+def hierarchy_section(
+    jira_dir: Path,
+    issue: dict[str, Any],
+    component_field: str | None = None,
+    *,
+    items: list[dict[str, Any]] | None = None,
+) -> list[str]:
     key = display_name(issue.get("key"))
     fields = as_dict(issue.get("fields"))
     parent = as_dict(fields.get("parent"))
     parent_key = display_name(parent.get("key"))
     parent_summary = display_name(as_dict(parent.get("fields")).get("summary"))
-    children = child_issues(jira_dir, key)
 
     if parent_key:
+        # child_issues does a whole-tree scan (every synced issue's own
+        # issue.json + shadow) -- skip it entirely here, since an issue
+        # that already has its own parent never uses `children` below.
         epic_identity = f"{parent_key} {parent_summary}".rstrip()
         return [f"Epic: {epic_identity}", f"|- {hierarchy_child_identity(issue, component_field)}", ""]
-    if children:
+
+    if items is not None:
+        # Index items are already enriched (including a shadow-correct
+        # "epic" field, see with_local_index_fields) and already loaded in
+        # memory -- reusing them here skips child_issues' whole-tree disk
+        # scan entirely, the same "reuse what Index already has" fix
+        # already applied to Meta > Boards.
+        child_identities = [_enriched_child_identity(item) for item in items if display_name(item.get("epic")) == key]
+    else:
+        child_identities = [hierarchy_child_identity(child, component_field) for child in child_issues(jira_dir, key)]
+
+    if child_identities:
         lines = [f"Epic: {issue_identity(issue)}"]
-        lines.extend(f"|- {hierarchy_child_identity(child, component_field)}" for child in children)
+        lines.extend(f"|- {identity}" for identity in child_identities)
         lines.append("")
         return lines
     return []
@@ -1082,16 +1122,29 @@ def selectable_field_options(
     field: str,
     component_field: str | None = None,
     *,
-    include_inactive_versions: bool = False,
+    include_released_versions: bool = False,
     current_issue: dict[str, Any] | None = None,
     include_inactive_parents: bool = False,
+    project: str | None = None,
+    component: str | None = None,
+    version_filters_by_component: dict[str, dict[str, str]] | None = None,
 ) -> list[str]:
     if field == "status":
         return observed_field_options(jira_dir, "status")
     if field == "assignee":
         return observed_field_options(jira_dir, "assignee", include_empty="(unassigned)")
     if field == "fixVersions":
-        return version_options(jira_dir, include_inactive=include_inactive_versions)
+        resolved_project = project or (issue_project_key(current_issue) if current_issue else None)
+        resolved_component = component or (
+            hierarchy_component(current_issue, component_field) if current_issue else None
+        )
+        return version_options(
+            jira_dir,
+            project=resolved_project,
+            component=resolved_component,
+            version_filters_by_component=version_filters_by_component,
+            include_released=include_released_versions,
+        )
     if field == "priority":
         return observed_field_options(jira_dir, "priority")
     if field == "components":
@@ -1181,19 +1234,78 @@ def component_options(jira_dir: Path) -> list[str]:
     return [component for component, _ in component_counts(load_manifest_items(jira_dir))]
 
 
-def is_active_version(version: dict[str, Any]) -> bool:
-    return not version.get("archived") and not version.get("released")
+def is_archived_version(version: dict[str, Any]) -> bool:
+    return bool(version.get("archived"))
 
 
-def version_options(jira_dir: Path, *, include_inactive: bool = False) -> list[str]:
-    versions = load_all_versions(jira_dir)
-    names = sorted(
-        {
-            version_name(version).strip()
-            for version in versions
-            if isinstance(version, dict) and (include_inactive or is_active_version(version))
-        }
-    )
+def _component_version_filter(
+    project: str | None,
+    component: str | None,
+    version_filters_by_component: dict[str, dict[str, str]] | None,
+) -> str | None:
+    if not project or not component or not version_filters_by_component:
+        return None
+    project_filters = version_filters_by_component.get(project)
+    if not project_filters:
+        return None
+    target = component.strip().lower()
+    for configured_component, pattern in project_filters.items():
+        if configured_component.strip().lower() == target:
+            return pattern
+    return None
+
+
+def version_options(
+    jira_dir: Path,
+    *,
+    project: str | None = None,
+    component: str | None = None,
+    version_filters_by_component: dict[str, dict[str, str]] | None = None,
+    include_released: bool = False,
+) -> list[str]:
+    """Fix-version names selectable for a new/edited issue.
+
+    Scoped to `project`'s own synced versions when given -- a fixVersion
+    from any other project is something Jira refuses to accept on push
+    anyway, so showing the old merged-every-project list could always
+    suggest something unassignable. Falls back to every synced project's
+    versions merged together only when no project is known at all (e.g. a
+    caller with no current issue/project context).
+
+    Archived versions are always excluded, regardless of `include_released`
+    -- archiving a version is what removes it from Jira's own Fix Version
+    picker for good, the one unambiguous signal here (unlike whether the
+    API itself would also reject one on push). Released-but-unarchived
+    versions are hidden by default too -- assigning new work to an
+    already-shipped version is unusual enough to want a deliberate second
+    step rather than a default option -- pass `include_released=True` (see
+    the interactive picker's toggle) to reveal them.
+
+    Further narrowed by a `[versions.by_component.<project>]` regex
+    configured for `component` in `project` specifically, if one applies
+    (see config.py's parse_version_filters_by_component) -- matched
+    case-insensitively against the version's own name. Scoped per project
+    since the same component name can mean, and be versioned, completely
+    differently across two different configured projects.
+    """
+    if project:
+        versions = normalize_versions(load_versions(jira_dir, project))
+    else:
+        versions = load_all_versions(jira_dir)
+    versions = [
+        version
+        for version in versions
+        if isinstance(version, dict) and not is_archived_version(version) and (include_released or not version.get("released"))
+    ]
+    pattern = _component_version_filter(project, component, version_filters_by_component)
+    if pattern:
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            regex = None
+        if regex is not None:
+            versions = [version for version in versions if regex.search(version_name(version))]
+    names = sorted({version_name(version).strip() for version in versions})
     return ["(none)", *(name for name in names if name)]
 
 

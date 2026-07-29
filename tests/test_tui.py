@@ -461,6 +461,96 @@ async def test_detail_screen_caches_dev_status_and_edit_fields_across_reopens(tm
 
 
 @pytest.mark.asyncio
+async def test_detail_screen_shows_epic_children_from_index_items_without_scanning_disk(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Regression: opening Detail on a parentless issue used to always
+    # re-scan every locally synced issue from disk (child_issues) just to
+    # find its children -- even though IndexScreen already has every item's
+    # shadow-correct "epic" field in memory. Opening from the index must
+    # reuse that instead.
+    import jira_workbench.view as view_module
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-740/issue.json",
+        {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0", "issuetype": {"name": "Epic"}}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-9/issue.json",
+        {
+            "key": "SAT-9",
+            "fields": {
+                "summary": "First child",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "parent": {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0"}},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    def fail_child_issues(*args, **kwargs):
+        raise AssertionError("child_issues should not be called when Detail is opened from the index")
+
+    monkeypatch.setattr(view_module, "child_issues", fail_child_issues)
+
+    async with app.run_test() as pilot:
+        index = app.screen
+        assert isinstance(index, IndexScreen)
+        table = index.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-740"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, DetailScreen)
+        header = str(app.screen.query_one("#detail-header").render())
+        assert "Epic: SAT-740 RELEASE_V1.2.0" in header
+        assert "SAT-9" in header
+
+
+@pytest.mark.asyncio
+async def test_initial_key_opens_detail_with_index_items_without_scanning_disk(tmp_path: Path, monkeypatch) -> None:
+    # `jira-wb view SAT-740`-style launch (App's own initial_key) must get
+    # the same fast path as opening Detail by hand from the index -- it used
+    # to push DetailScreen before IndexScreen's items were ever loaded, so
+    # it always fell back to the slow whole-tree child_issues scan for the
+    # very first issue shown.
+    import jira_workbench.view as view_module
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-740/issue.json",
+        {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0", "issuetype": {"name": "Epic"}}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-9/issue.json",
+        {
+            "key": "SAT-9",
+            "fields": {
+                "summary": "First child",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "parent": {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0"}},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+
+    def fail_child_issues(*args, **kwargs):
+        raise AssertionError("child_issues should not be called when opened via initial_key")
+
+    monkeypatch.setattr(view_module, "child_issues", fail_child_issues)
+
+    app = JiraWorkbenchApp(tmp_path, component_field="components", initial_key="SAT-740")
+
+    async with app.run_test():
+        assert isinstance(app.screen, DetailScreen)
+        header = str(app.screen.query_one("#detail-header").render())
+        assert "Epic: SAT-740 RELEASE_V1.2.0" in header
+        assert "SAT-9" in header
+
+
+@pytest.mark.asyncio
 async def test_detail_screen_shows_due_date_and_custom_labels_field_once_edit_meta_loads(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     _set_issue_id(jira_dir, "SAT-1", "78547")
@@ -493,6 +583,114 @@ async def test_detail_screen_renders_labels_fix_versions_and_components_as_pills
         assert str(table.get_cell("fixVersions", "value")) == " helm-chart-sa 3.4.4 "
         assert str(table.get_cell("customfield_10071", "value")) == " API Team "
         assert str(table.get_cell("labels", "value")) == " urgent   flaky "
+
+
+def test_option_picker_screen_hides_toggle_binding_unless_on_toggle_is_given() -> None:
+    from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+
+    plain = OptionPickerScreen("Priority:", ["High", "Low"])
+    assert plain.check_action("toggle_extra", ()) is False
+
+    toggleable = OptionPickerScreen("Version:", ["a"], on_toggle=lambda include: ["a", "b"])
+    assert toggleable.check_action("toggle_extra", ()) is True
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_version_picker_is_scoped_to_project_and_component_filter(tmp_path: Path) -> None:
+    from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+
+    jira_dir = synced_jira_dir(tmp_path)  # SAT-1's component is "API Team"
+    write_json(
+        jira_dir / "meta/SAT/versions.json",
+        {
+            "versions": [
+                {"id": "1", "name": "api-team-sa 2026.07"},
+                {"id": "2", "name": "unrelated-sa 2026.07"},
+            ]
+        },
+    )
+    write_json(jira_dir / "meta/PLAT/versions.json", {"versions": [{"id": "3", "name": "PLAT 2026.08"}]})
+    app = JiraWorkbenchApp(
+        jira_dir,
+        component_field="customfield_10071",
+        version_filters_by_component={"SAT": {"api team": "api-team-sa"}},
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+        table = app.screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("fixVersions"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        picker = app.screen
+        assert isinstance(picker, OptionPickerScreen)
+        assert picker._options == ["(none)", "api-team-sa 2026.07"]
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_version_picker_toggle_reveals_released_but_not_archived(tmp_path: Path) -> None:
+    from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+
+    jira_dir = synced_jira_dir(tmp_path)  # SAT-1
+    write_json(
+        jira_dir / "meta/SAT/versions.json",
+        {
+            "versions": [
+                {"id": "1", "name": "helm-chart-sa 3.4.2", "released": True},
+                {"id": "2", "name": "helm-chart-sa 3.4.4", "archived": True},
+                {"id": "3", "name": "helm-chart-sa 3.5.0", "released": False, "archived": False},
+            ]
+        },
+    )
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+        table = app.screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("fixVersions"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        picker = app.screen
+        assert isinstance(picker, OptionPickerScreen)
+        # Default: only the unreleased-and-unarchived version.
+        assert picker._options == ["(none)", "helm-chart-sa 3.5.0"]
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+
+        # Toggled: released version revealed, archived one still hidden.
+        assert picker._options == ["(none)", "helm-chart-sa 3.4.2", "helm-chart-sa 3.5.0"]
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+
+        # Toggled back off.
+        assert picker._options == ["(none)", "helm-chart-sa 3.5.0"]
+
+        # The checkbox is a real, focusable widget -- clickable with the
+        # mouse and reachable via Tab, not just the ctrl+r shortcut.
+        await pilot.click("#picker-toggle")
+        await pilot.pause()
+        assert picker._options == ["(none)", "helm-chart-sa 3.4.2", "helm-chart-sa 3.5.0"]
+        await pilot.click("#picker-toggle")
+        await pilot.pause()
+        assert picker._options == ["(none)", "helm-chart-sa 3.5.0"]
+
+        filter_input = app.screen.query_one("#picker-filter", Input)
+        filter_input.focus()
+        filter_input.value = "helm-chart-sa 3.5.0"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, DetailScreen)
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("fixVersions", "value")) == " helm-chart-sa 3.5.0 "
 
 
 @pytest.mark.asyncio
@@ -1994,6 +2192,143 @@ async def _pick_option(pilot, needle: str) -> None:
     await pilot.pause()
     await pilot.press("enter")
     await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_new_issue_screen_version_picker_is_scoped_to_project_and_component_filter(tmp_path: Path) -> None:
+    from jira_workbench.tui.screens.issue_create import IssueCreateScreen
+    from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {"versions": [{"id": "1", "name": "helm-chart-sa 3.4.0"}, {"id": "2", "name": "unrelated-sa 1.0.0"}]},
+    )
+    write_json(tmp_path / "meta/PLAT/versions.json", {"versions": [{"id": "3", "name": "PLAT 2026.08"}]})
+    client = FakeCreateIssueClient()
+    app = JiraWorkbenchApp(
+        tmp_path,
+        component_field="components",
+        jira_url="https://example.atlassian.net",
+        jira_email="user@example.com",
+        jira_api_token="token",
+        project="SAT",
+        version_filters_by_component={"SAT": {"helm-chart": "helm-chart-sa"}},
+    )
+    app.get_api_client = lambda: client  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, IndexScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-1"))
+
+        await pilot.press("c")
+        await pilot.pause()
+
+        create_screen = app.screen
+        assert isinstance(create_screen, IssueCreateScreen)
+        create_table = create_screen.query_one(DataTable)
+        create_table.move_cursor(row=create_table.get_row_index("type"))
+        await pilot.press("enter")
+        await pilot.pause()
+        await _pick_option(pilot, "Task")
+
+        create_table.move_cursor(row=create_table.get_row_index("component"))
+        await pilot.press("enter")
+        await pilot.pause()
+        await _pick_option(pilot, "helm-chart")
+        assert create_screen.values["component"] == "helm-chart"
+
+        create_table.move_cursor(row=create_table.get_row_index("version"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        picker = app.screen
+        assert isinstance(picker, OptionPickerScreen)
+        assert picker._options == ["(none)", "helm-chart-sa 3.4.0"]
+
+
+@pytest.mark.asyncio
+async def test_new_issue_screen_version_picker_toggle_reveals_released_but_not_archived(tmp_path: Path) -> None:
+    from jira_workbench.tui.screens.issue_create import IssueCreateScreen
+    from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {
+            "versions": [
+                {"id": "1", "name": "helm-chart-sa 3.4.2", "released": True},
+                {"id": "2", "name": "helm-chart-sa 3.4.4", "archived": True},
+                {"id": "3", "name": "helm-chart-sa 3.5.0", "released": False, "archived": False},
+            ]
+        },
+    )
+    client = FakeCreateIssueClient()
+    app = JiraWorkbenchApp(
+        tmp_path,
+        component_field="components",
+        jira_url="https://example.atlassian.net",
+        jira_email="user@example.com",
+        jira_api_token="token",
+        project="SAT",
+    )
+    app.get_api_client = lambda: client  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, IndexScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-1"))
+
+        await pilot.press("c")
+        await pilot.pause()
+
+        create_screen = app.screen
+        assert isinstance(create_screen, IssueCreateScreen)
+        create_table = create_screen.query_one(DataTable)
+        create_table.move_cursor(row=create_table.get_row_index("type"))
+        await pilot.press("enter")
+        await pilot.pause()
+        await _pick_option(pilot, "Task")
+
+        create_table.move_cursor(row=create_table.get_row_index("version"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        picker = app.screen
+        assert isinstance(picker, OptionPickerScreen)
+        assert picker._options == ["(none)", "helm-chart-sa 3.5.0"]
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+
+        assert picker._options == ["(none)", "helm-chart-sa 3.4.2", "helm-chart-sa 3.5.0"]
 
 
 @pytest.mark.asyncio

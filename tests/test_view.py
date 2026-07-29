@@ -34,6 +34,7 @@ from jira_workbench.view import (
     format_issue,
     format_work_item,
     full_diff_texts,
+    hierarchy_section,
     item_index_by_key,
     field_label_options,
     index_item_parent_key,
@@ -995,23 +996,138 @@ def test_fix_version_options_use_cached_versions(tmp_path: Path) -> None:
         },
     )
 
+    # Default: unreleased and unarchived only.
     assert version_options(tmp_path) == ["(none)", "helm-chart-sa 3.5.0"]
-    assert version_options(tmp_path, include_inactive=True) == [
+    # include_released reveals released-but-unarchived versions too --
+    # archived ones stay hidden either way (see version_options' own
+    # docstring: archiving is the one unambiguous "never offer this again"
+    # signal Jira gives us).
+    assert version_options(tmp_path, include_released=True) == [
         "(none)",
         "helm-chart-sa 3.4.2",
-        "helm-chart-sa 3.4.4",
         "helm-chart-sa 3.5.0",
     ]
     assert selectable_field_options(tmp_path, "fixVersions") == [
         "(none)",
         "helm-chart-sa 3.5.0",
     ]
-    assert selectable_field_options(tmp_path, "fixVersions", include_inactive_versions=True) == [
+    assert selectable_field_options(tmp_path, "fixVersions", include_released_versions=True) == [
         "(none)",
         "helm-chart-sa 3.4.2",
-        "helm-chart-sa 3.4.4",
         "helm-chart-sa 3.5.0",
     ]
+
+
+def test_version_options_never_includes_archived_even_with_include_released(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {"versions": [{"id": "1", "name": "old-archived", "archived": True, "released": True}]},
+    )
+
+    assert version_options(tmp_path, include_released=True) == ["(none)"]
+
+
+def test_version_options_scoped_to_project_excludes_other_projects_versions(tmp_path: Path) -> None:
+    # A fixVersion from a different project is something Jira refuses on
+    # push anyway -- the picker must not even offer it, regardless of the
+    # old merged-every-project behavior.
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "1", "name": "SAT 2026.07"}]})
+    write_json(tmp_path / "meta/PLAT/versions.json", {"versions": [{"id": "2", "name": "PLAT 2026.08"}]})
+
+    assert version_options(tmp_path, project="SAT") == ["(none)", "SAT 2026.07"]
+    assert version_options(tmp_path, project="PLAT") == ["(none)", "PLAT 2026.08"]
+
+
+def test_version_options_falls_back_to_every_project_when_project_unknown(tmp_path: Path) -> None:
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "1", "name": "SAT 2026.07"}]})
+    write_json(tmp_path / "meta/PLAT/versions.json", {"versions": [{"id": "2", "name": "PLAT 2026.08"}]})
+
+    assert version_options(tmp_path) == ["(none)", "PLAT 2026.08", "SAT 2026.07"]
+
+
+def test_version_options_narrows_by_configured_component_filter(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {
+            "versions": [
+                {"id": "1", "name": "helm-chart-sa 3.4.0"},
+                {"id": "2", "name": "terraform-infra 1.0.0"},
+            ]
+        },
+    )
+
+    filters = {"SAT": {"helm-chart": "helm-chart-sa"}}
+
+    assert version_options(tmp_path, project="SAT", component="helm-chart", version_filters_by_component=filters) == [
+        "(none)",
+        "helm-chart-sa 3.4.0",
+    ]
+    # A component without a configured filter sees every version in its
+    # project, unfiltered.
+    assert version_options(tmp_path, project="SAT", component="terraform", version_filters_by_component=filters) == [
+        "(none)",
+        "helm-chart-sa 3.4.0",
+        "terraform-infra 1.0.0",
+    ]
+
+
+def test_version_options_component_filter_is_scoped_per_project(tmp_path: Path) -> None:
+    # The same component name can mean (and be versioned) completely
+    # differently across two different configured projects -- a filter
+    # configured for one project's "helm-chart" must never leak into
+    # another project's own "helm-chart".
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "1", "name": "helm-chart-sa 3.4.0"}]})
+    write_json(tmp_path / "meta/PLAT/versions.json", {"versions": [{"id": "2", "name": "plat-helm 9.0.0"}]})
+
+    filters = {"SAT": {"helm-chart": "helm-chart-sa"}}
+
+    assert version_options(tmp_path, project="SAT", component="helm-chart", version_filters_by_component=filters) == [
+        "(none)",
+        "helm-chart-sa 3.4.0",
+    ]
+    # PLAT has no entry in filters at all -- falls back to unfiltered.
+    assert version_options(tmp_path, project="PLAT", component="helm-chart", version_filters_by_component=filters) == [
+        "(none)",
+        "plat-helm 9.0.0",
+    ]
+
+
+def test_version_options_component_filter_lookup_is_case_insensitive(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {"versions": [{"id": "1", "name": "helm-chart-sa 3.4.0"}, {"id": "2", "name": "other 1.0.0"}]},
+    )
+
+    filters = {"SAT": {"Helm-Chart": "helm-chart-sa"}}
+
+    assert version_options(tmp_path, project="SAT", component="helm-chart", version_filters_by_component=filters) == [
+        "(none)",
+        "helm-chart-sa 3.4.0",
+    ]
+
+
+def test_selectable_field_options_fix_versions_derives_project_and_component_from_current_issue(
+    tmp_path: Path,
+) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {"versions": [{"id": "1", "name": "helm-chart-sa 3.4.0"}, {"id": "2", "name": "other 1.0.0"}]},
+    )
+    write_json(tmp_path / "meta/PLAT/versions.json", {"versions": [{"id": "3", "name": "PLAT 2026.08"}]})
+    issue = {
+        "key": "SAT-1",
+        "fields": {"project": {"key": "SAT"}, "customfield_10071": {"value": "helm-chart"}},
+    }
+
+    options = selectable_field_options(
+        tmp_path,
+        "fixVersions",
+        "customfield_10071",
+        current_issue=issue,
+        version_filters_by_component={"SAT": {"helm-chart": "helm-chart-sa"}},
+    )
+
+    assert options == ["(none)", "helm-chart-sa 3.4.0"]
 
 
 def test_label_options_collect_distinct_labels_from_local_issues(tmp_path: Path) -> None:
@@ -1227,6 +1343,79 @@ def test_format_work_item_shows_epic_children_hierarchy(tmp_path: Path) -> None:
         "|- SAT-10 Middle numeric child\n"
         "|- SAT-100 Last numeric child\n\n"
     )
+
+
+def test_hierarchy_section_with_items_finds_children_without_scanning_disk(tmp_path: Path, monkeypatch) -> None:
+    # Regression: hierarchy_section used to always call child_issues, a
+    # whole-tree disk scan (every synced issue's own issue.json + shadow),
+    # to check for an epic's children -- even when the caller (Detail,
+    # opened from an already-loaded Index) already has every item's shadow-
+    # correct "epic" field sitting in memory. Passing `items` must use that
+    # instead and never touch child_issues at all.
+    import jira_workbench.view as view_module
+
+    epic = {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0", "issuetype": {"name": "Epic"}}}
+    write_json(tmp_path / "components/helm-chart/SAT-740/issue.json", epic)
+
+    def fail_child_issues(*args, **kwargs):
+        raise AssertionError("child_issues should not be called when items is provided")
+
+    monkeypatch.setattr(view_module, "child_issues", fail_child_issues)
+
+    items = [
+        {"key": "SAT-740", "summary": "RELEASE_V1.2.0", "component": "", "epic": ""},
+        {"key": "SAT-9", "summary": "First child", "component": "helm-chart", "epic": "SAT-740"},
+        {"key": "SAT-10", "summary": "Second child", "component": "", "epic": "SAT-740"},
+        {"key": "SAT-99", "summary": "Unrelated item", "component": "", "epic": "OTHER-1"},
+    ]
+
+    lines = hierarchy_section(tmp_path, epic, "components", items=items)
+
+    assert lines == [
+        "Epic: SAT-740 RELEASE_V1.2.0",
+        "|- SAT-9 [helm-chart] First child",
+        "|- SAT-10 Second child",
+        "",
+    ]
+
+
+def test_hierarchy_section_without_items_falls_back_to_disk_scan(tmp_path: Path) -> None:
+    epic = {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0", "issuetype": {"name": "Epic"}}}
+    child = {
+        "key": "SAT-9",
+        "fields": {"summary": "First child", "parent": {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0"}}},
+    }
+    write_json(tmp_path / "components/helm-chart/SAT-740/issue.json", epic)
+    write_json(tmp_path / "components/helm-chart/SAT-9/issue.json", child)
+
+    lines = hierarchy_section(tmp_path, epic, "components")
+
+    assert lines == ["Epic: SAT-740 RELEASE_V1.2.0", "|- SAT-9 First child", ""]
+
+
+def test_hierarchy_section_child_issue_never_calls_child_issues_regardless_of_items(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A non-epic issue's own hierarchy line never needs `children` at all --
+    # this must short-circuit before any scan, with or without `items`.
+    import jira_workbench.view as view_module
+
+    child = {
+        "key": "SAT-9",
+        "fields": {
+            "summary": "First child",
+            "parent": {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0"}},
+        },
+    }
+
+    def fail_child_issues(*args, **kwargs):
+        raise AssertionError("child_issues should not be called for an issue that already has a parent")
+
+    monkeypatch.setattr(view_module, "child_issues", fail_child_issues)
+
+    lines = hierarchy_section(tmp_path, child, "components")
+
+    assert lines == ["Epic: SAT-740 RELEASE_V1.2.0", "|- SAT-9 First child", ""]
 
 
 def test_format_work_item_epic_children_show_component(tmp_path: Path) -> None:

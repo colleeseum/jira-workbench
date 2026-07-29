@@ -152,6 +152,17 @@ class IndexScreen(Screen[None]):
             self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
         )
         self._rebuild_table()
+        if self.app.initial_key:
+            # Opened here (after self.items is loaded), not from the App's
+            # own on_mount, specifically so this can pass `items=self.items`
+            # through -- constructing it there would only ever see the
+            # not-yet-populated initial `[]` (screens mount asynchronously,
+            # so the App's on_mount runs before this one), forcing Detail
+            # back onto its slow whole-tree-scan hierarchy fallback for the
+            # very first issue a `jira-wb view SAT-123`-style launch opens.
+            from .detail import DetailScreen
+
+            self.app.push_screen(DetailScreen(key=self.app.initial_key, mode=self.app.initial_mode, items=self.items))
 
     def _visible_items(self) -> list[dict[str, Any]]:
         modified_keys = modified_issue_keys(self.app.jira_dir)
@@ -821,7 +832,7 @@ class IndexScreen(Screen[None]):
     def _open_detail(self, key: str) -> None:
         from .detail import DetailScreen
 
-        self.app.push_screen(DetailScreen(key=key), callback=self._on_detail_closed)
+        self.app.push_screen(DetailScreen(key=key, items=self.items), callback=self._on_detail_closed)
 
     def _on_detail_closed(self, _result: None) -> None:
         refresh_stale_index_items(

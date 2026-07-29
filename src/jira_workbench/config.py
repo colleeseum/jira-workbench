@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,7 @@ class WorkbenchConfig:
     view_preview_lines: int | None = None
     view_hide_done_after_days: int | None = None
     versions_filter: str | None = None
+    version_filters_by_component: dict[str, dict[str, str]] = field(default_factory=dict)
     issue_default_type: str | None = None
     host: str | None = None
     port: int | None = None
@@ -165,6 +167,7 @@ def load_config(path: Path) -> WorkbenchConfig:
         view_preview_lines=optional_int(view, "preview_lines", expanded),
         view_hide_done_after_days=optional_int(view, "hide_done_after_days", expanded),
         versions_filter=optional_string(versions, "filter", expanded),
+        version_filters_by_component=parse_version_filters_by_component(versions.get("by_component"), expanded),
         issue_default_type=optional_string(issue, "default_type", expanded),
         host=optional_string(serve, "host", expanded),
         port=optional_int(serve, "port", expanded),
@@ -207,6 +210,47 @@ def optional_string(data: dict[str, Any], key: str, path: Path) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"invalid config file {path}: {key} must be a non-empty string")
     return value
+
+
+def parse_version_filters_by_component(value: Any, path: Path) -> dict[str, dict[str, str]]:
+    """`[versions.by_component.<PROJECT>]` -- a regex fix-version filter per
+    component, scoped per project (the same component name can mean
+    completely different things -- and be versioned completely differently
+    -- across two different configured projects), used by the fix-version
+    picker (see view.py's version_options). A component with no entry here
+    instead falls back to strict project scoping (see version_options' own
+    docstring), not to this being empty vs. missing -- so an empty table and
+    a missing key behave identically.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"invalid config file {path}: versions.by_component must be a table")
+    result: dict[str, dict[str, str]] = {}
+    for project, components in value.items():
+        if not isinstance(project, str) or not project.strip():
+            raise ConfigError(f"invalid config file {path}: versions.by_component keys must be non-empty project keys")
+        if not isinstance(components, dict):
+            raise ConfigError(f"invalid config file {path}: versions.by_component.{project} must be a table")
+        project_filters: dict[str, str] = {}
+        for component, pattern in components.items():
+            if not isinstance(component, str) or not component.strip():
+                raise ConfigError(
+                    f"invalid config file {path}: versions.by_component.{project} keys must be non-empty strings"
+                )
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ConfigError(
+                    f"invalid config file {path}: versions.by_component.{project}[{component!r}] must be a non-empty string"
+                )
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ConfigError(
+                    f"invalid config file {path}: versions.by_component.{project}[{component!r}] is not a valid regex: {exc}"
+                ) from exc
+            project_filters[component] = pattern
+        result[project] = project_filters
+    return result
 
 
 def optional_string_tuple(data: dict[str, Any], key: str, path: Path) -> tuple[str, ...] | None:
