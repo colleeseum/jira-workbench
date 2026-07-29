@@ -8,10 +8,12 @@ from jira_workbench.metadata import (
     MetadataError,
     add_component_api,
     add_component_field_option_api,
+    add_local_board,
     add_version_api,
     archive_version_api,
     cache_is_fresh,
     check_jira_api_config,
+    delete_local_board,
     delete_version_api,
     ensure_versions,
     field_clause_names,
@@ -21,11 +23,15 @@ from jira_workbench.metadata import (
     format_components,
     format_component_cache,
     format_versions,
+    is_project_read_only,
+    load_all_boards_with_settings,
+    load_board_settings,
     load_boards,
     load_component_field_options,
     load_component_summary,
     load_components,
     load_field_names,
+    load_project_registry,
     load_versions,
     normalize_boards,
     normalize_components,
@@ -33,12 +39,18 @@ from jira_workbench.metadata import (
     refresh_boards_api,
     refresh_component_field_options_api,
     release_version_api,
+    rename_local_board,
     rename_version_api,
     refresh_components_api,
     refresh_versions_api,
     remember_field_names,
     resolve_version_id,
+    set_board_active,
+    set_local_board_filters,
+    write_board_settings,
+    write_project_registry,
 )
+from jira_workbench.config import ProjectSettings
 from jira_workbench.sync import write_json
 
 
@@ -222,13 +234,217 @@ def test_remember_field_names_ignores_an_empty_dict(tmp_path: Path) -> None:
     assert load_field_names(tmp_path) == {}
 
 
+def test_load_project_registry_returns_empty_when_missing(tmp_path: Path) -> None:
+    assert load_project_registry(tmp_path) == {}
+
+
+def test_write_project_registry_round_trips(tmp_path: Path) -> None:
+    write_project_registry(
+        tmp_path,
+        (
+            ProjectSettings(key="SAT", default=True),
+            ProjectSettings(key="OTHERPROJ", read_only=True),
+        ),
+    )
+
+    assert load_project_registry(tmp_path) == {
+        "SAT": {"readOnly": False, "default": True},
+        "OTHERPROJ": {"readOnly": True, "default": False},
+    }
+
+
+def test_is_project_read_only_true_for_a_registered_read_only_project(tmp_path: Path) -> None:
+    write_project_registry(tmp_path, (ProjectSettings(key="OTHERPROJ", read_only=True),))
+
+    assert is_project_read_only(tmp_path, "OTHERPROJ") is True
+    assert is_project_read_only(tmp_path, "SAT") is False
+
+
+def test_is_project_read_only_permissive_when_registry_missing_or_project_unknown(tmp_path: Path) -> None:
+    assert is_project_read_only(tmp_path, "SAT") is False
+    assert is_project_read_only(tmp_path, None) is False
+
+
+def test_load_board_settings_permissive_when_missing(tmp_path: Path) -> None:
+    assert load_board_settings(tmp_path) == {"localBoards": [], "disabledBoardIds": []}
+
+
+def test_write_board_settings_round_trips(tmp_path: Path) -> None:
+    settings = {
+        "localBoards": [{"name": "My Filter", "active": True, "fieldFilters": {"project": "PLAT"}, "pattern": None}],
+        "disabledBoardIds": ["10032"],
+    }
+
+    write_board_settings(tmp_path, settings)
+
+    assert load_board_settings(tmp_path) == settings
+
+
+def test_add_local_board_then_load_all_boards_with_settings_tags_it_local(tmp_path: Path) -> None:
+    add_local_board(tmp_path, "My PLAT Filter", {"project": "PLAT"}, "urgent")
+
+    boards = load_all_boards_with_settings(tmp_path)
+
+    assert boards == [
+        {
+            "name": "My PLAT Filter",
+            "active": True,
+            "fieldFilters": {"project": "PLAT"},
+            "pattern": "urgent",
+            "activeFilter": None,
+            "kind": "local",
+        }
+    ]
+
+
+def test_add_local_board_rejects_empty_name(tmp_path: Path) -> None:
+    try:
+        add_local_board(tmp_path, "   ", {}, None)
+    except MetadataError as exc:
+        assert "non-empty" in str(exc)
+    else:
+        raise AssertionError("expected MetadataError")
+
+
+def test_add_local_board_rejects_name_collision_with_existing_local_board(tmp_path: Path) -> None:
+    add_local_board(tmp_path, "My Filter", {}, None)
+
+    try:
+        add_local_board(tmp_path, "my filter", {}, None)
+    except MetadataError as exc:
+        assert "already exists" in str(exc)
+    else:
+        raise AssertionError("expected MetadataError")
+
+
+def test_add_local_board_rejects_name_collision_with_a_jira_board(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/boards.json",
+        {"project": "SAT", "fetchedAt": "now", "boards": [{"id": 32, "name": "SAT board", "type": "simple"}]},
+    )
+
+    try:
+        add_local_board(tmp_path, "SAT board", {}, None)
+    except MetadataError as exc:
+        assert "already exists" in str(exc)
+    else:
+        raise AssertionError("expected MetadataError")
+
+
+def test_rename_local_board_updates_name(tmp_path: Path) -> None:
+    add_local_board(tmp_path, "Old Name", {"project": "PLAT"}, None)
+
+    rename_local_board(tmp_path, "Old Name", "New Name")
+
+    boards = load_board_settings(tmp_path)["localBoards"]
+    assert boards[0]["name"] == "New Name"
+    assert boards[0]["fieldFilters"] == {"project": "PLAT"}
+
+
+def test_rename_local_board_missing_raises(tmp_path: Path) -> None:
+    try:
+        rename_local_board(tmp_path, "Nope", "New Name")
+    except MetadataError as exc:
+        assert "not found" in str(exc)
+    else:
+        raise AssertionError("expected MetadataError")
+
+
+def test_set_local_board_filters_updates_filters_and_pattern(tmp_path: Path) -> None:
+    add_local_board(tmp_path, "My Filter", {"project": "SAT"}, None)
+
+    set_local_board_filters(tmp_path, "My Filter", {"project": "PLAT", "assignee": "Alex Epic"}, "urgent")
+
+    board = load_board_settings(tmp_path)["localBoards"][0]
+    assert board["fieldFilters"] == {"project": "PLAT", "assignee": "Alex Epic"}
+    assert board["pattern"] == "urgent"
+
+
+def test_add_local_board_stores_active_filter(tmp_path: Path) -> None:
+    active_filter = {"fieldFilters": {"status": ["To Do", "In Progress"]}, "pattern": None}
+    add_local_board(tmp_path, "My Filter", {"project": ["PLAT"]}, None, active_filter)
+
+    board = load_board_settings(tmp_path)["localBoards"][0]
+    assert board["activeFilter"] == active_filter
+
+
+def test_set_local_board_filters_updates_active_filter(tmp_path: Path) -> None:
+    add_local_board(tmp_path, "My Filter", {"project": ["SAT"]}, None)
+
+    active_filter = {"fieldFilters": {"status": ["Done"]}, "pattern": None}
+    set_local_board_filters(tmp_path, "My Filter", {"project": ["SAT"]}, None, active_filter)
+
+    board = load_board_settings(tmp_path)["localBoards"][0]
+    assert board["activeFilter"] == active_filter
+
+    set_local_board_filters(tmp_path, "My Filter", {"project": ["SAT"]}, None, None)
+    board = load_board_settings(tmp_path)["localBoards"][0]
+    assert board["activeFilter"] is None
+
+
+def test_delete_local_board_removes_it(tmp_path: Path) -> None:
+    add_local_board(tmp_path, "My Filter", {}, None)
+
+    delete_local_board(tmp_path, "My Filter")
+
+    assert load_board_settings(tmp_path)["localBoards"] == []
+
+
+def test_delete_local_board_missing_raises(tmp_path: Path) -> None:
+    try:
+        delete_local_board(tmp_path, "Nope")
+    except MetadataError as exc:
+        assert "not found" in str(exc)
+    else:
+        raise AssertionError("expected MetadataError")
+
+
+def test_set_board_active_toggles_local_board(tmp_path: Path) -> None:
+    add_local_board(tmp_path, "My Filter", {}, None)
+
+    set_board_active(tmp_path, "local", "My Filter", False)
+
+    assert load_board_settings(tmp_path)["localBoards"][0]["active"] is False
+
+
+def test_set_board_active_toggles_jira_board_via_disabled_ids(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/boards.json",
+        {"project": "SAT", "fetchedAt": "now", "boards": [{"id": 32, "name": "SAT board", "type": "simple"}]},
+    )
+
+    set_board_active(tmp_path, "jira", 32, False)
+    boards = load_all_boards_with_settings(tmp_path)
+    assert next(b for b in boards if b["name"] == "SAT board")["active"] is False
+
+    set_board_active(tmp_path, "jira", 32, True)
+    boards = load_all_boards_with_settings(tmp_path)
+    assert next(b for b in boards if b["name"] == "SAT board")["active"] is True
+
+
+def test_load_all_boards_with_settings_merges_jira_and_local(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/boards.json",
+        {"project": "SAT", "fetchedAt": "now", "boards": [{"id": 32, "name": "SAT board", "type": "simple"}]},
+    )
+    add_local_board(tmp_path, "My PLAT Filter", {"project": "PLAT"}, None)
+
+    boards = load_all_boards_with_settings(tmp_path)
+
+    by_name = {board["name"]: board for board in boards}
+    assert by_name["SAT board"]["kind"] == "jira"
+    assert by_name["SAT board"]["active"] is True
+    assert by_name["My PLAT Filter"]["kind"] == "local"
+    assert by_name["My PLAT Filter"]["active"] is True
+
+
 def test_refresh_versions_api_writes_cache(tmp_path: Path) -> None:
     client = ApiClient()
 
     cache = refresh_versions_api(tmp_path, "SAT", client)
 
     assert cache["versions"][0]["name"] == "helm-chart-sa 3.4.0"
-    assert load_versions(tmp_path) == cache
+    assert load_versions(tmp_path, "SAT") == cache
     assert ("get_project_versions", "SAT") in client.calls
 
 
@@ -282,7 +498,7 @@ def test_refresh_components_api_writes_cache(tmp_path: Path) -> None:
     cache = refresh_components_api(tmp_path, "SAT", client)
 
     assert cache["components"][0]["name"] == "helm-chart"
-    assert load_components(tmp_path) == cache
+    assert load_components(tmp_path, "SAT") == cache
     assert ("get_project_components", "SAT") in client.calls
 
 
@@ -313,13 +529,13 @@ def test_refresh_boards_api_writes_cache_with_compiled_predicates_and_backlog(tm
 
     cache = refresh_boards_api(tmp_path, "SAT", client, "customfield_10071")
 
-    assert load_boards(tmp_path) == cache
+    assert load_boards(tmp_path, "SAT") == cache
     boards = {board["name"]: board for board in cache["boards"]}
 
     sat_board = boards["SAT board"]
     assert sat_board["type"] == "simple"
     assert sat_board["unsupportedReason"] is None
-    assert sat_board["predicate"] == {"op": "true"}
+    assert sat_board["predicate"] == {"op": "eq", "field": "project", "value": "SAT"}
     assert sat_board["backlogKeys"] == [f"SAT-{i}" for i in range(150)]
 
     ps_tools = boards["PS Tools"]
@@ -328,6 +544,30 @@ def test_refresh_boards_api_writes_cache_with_compiled_predicates_and_backlog(tm
     assert ps_tools["predicate"] is not None
     # scrum boards are out of scope for the active/backlog split
     assert ps_tools["backlogKeys"] is None
+
+
+def test_refresh_boards_api_implicitly_scopes_a_project_less_filter_to_its_own_project(tmp_path: Path) -> None:
+    # A board's saved filter doesn't have to mention "project" at all --
+    # Jira itself still only ever shows that board's own project's issues,
+    # so the compiled predicate must be scoped the same way even though
+    # the JQL text alone never says so.
+    class ProjectLessFilterClient(ApiClient):
+        def get(self, path: str, params: dict[str, object] | None = None) -> object:
+            if path == "rest/api/2/filter/10089":
+                return {"jql": '"Components[Dropdown]" = helm-chart ORDER BY Rank ASC'}
+            return super().get(path, params)
+
+    cache = refresh_boards_api(tmp_path, "SAT", ProjectLessFilterClient(), "customfield_10071")
+
+    sat_board = next(board for board in cache["boards"] if board["name"] == "SAT board")
+    assert sat_board["unsupportedReason"] is None
+    assert sat_board["predicate"] == {
+        "op": "and",
+        "clauses": [
+            {"op": "eq", "field": "project", "value": "SAT"},
+            {"op": "eq", "field": "component", "value": "helm-chart"},
+        ],
+    }
 
 
 def test_refresh_boards_api_wraps_client_errors(tmp_path: Path) -> None:
@@ -385,7 +625,7 @@ def test_refresh_component_field_options_api_writes_cache(tmp_path: Path) -> Non
 
     assert cache["field"] == "customfield_10071"
     assert cache["options"][0]["value"] == "helm-chart"
-    assert load_component_field_options(tmp_path, "customfield_10071") == cache
+    assert load_component_field_options(tmp_path, "SAT", "customfield_10071") == cache
     assert ("issue_createmeta", ("SAT", "projects.issuetypes.fields")) in client.calls
 
 
@@ -512,7 +752,7 @@ def test_add_component_field_option_api_fails_when_option_not_available_after_ad
 
 def test_ensure_versions_uses_fresh_cache(tmp_path: Path) -> None:
     write_json(
-        tmp_path / "meta/versions.json",
+        tmp_path / "meta/SAT/versions.json",
         {
             "project": "SAT",
             "fetchedAt": "2026-07-21T06:00:00Z",
@@ -530,7 +770,7 @@ def test_ensure_versions_uses_fresh_cache(tmp_path: Path) -> None:
 
 def test_ensure_versions_falls_back_to_stale_cache(tmp_path: Path) -> None:
     write_json(
-        tmp_path / "meta/versions.json",
+        tmp_path / "meta/SAT/versions.json",
         {
             "project": "SAT",
             "fetchedAt": "2020-01-01T00:00:00Z",
@@ -612,3 +852,24 @@ def test_load_and_format_component_summary(tmp_path: Path) -> None:
     assert "total" in output
     assert "helm-chart" in output
     assert "_unassigned" in output
+
+
+def test_load_component_summary_uses_real_status_category_not_hardcoded_names(tmp_path: Path) -> None:
+    # Regression: a custom workflow status ("Solved") that Jira classifies
+    # as Done must count as done here too, even though the old code's
+    # hardcoded name list never recognized it.
+    write_json(
+        tmp_path / "manifest.json",
+        {
+            "components": [{"component": "helm-chart", "count": 2}],
+            "workItems": [
+                {"key": "SAT-1", "component": "helm-chart", "status": "Solved", "statusCategory": "done"},
+                {"key": "SAT-2", "component": "helm-chart", "status": "In Review", "statusCategory": "indeterminate"},
+            ],
+        },
+    )
+
+    components = load_component_summary(tmp_path)
+
+    assert components[0]["active"] == 1
+    assert components[0]["total"] == 2

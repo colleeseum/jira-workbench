@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from rich.text import Text
@@ -24,13 +25,37 @@ from ...cli import (
     rename_meta_version,
     version_identifier,
 )
-from ...metadata import MetadataError, version_name
+from ...metadata import (
+    MetadataError,
+    add_local_board,
+    delete_local_board,
+    rename_local_board,
+    set_board_active,
+    set_local_board_filters,
+    version_name,
+)
 from ...shadow import ShadowError, refresh_local_issue_after_push, set_field
 from ...sync import issue_key_sort_key
-from ...view import as_dict, as_list, display_name, label_counts, load_manifest_items, local_issues
+from ...view import (
+    FILTER_ANY,
+    as_dict,
+    as_list,
+    display_name,
+    distinct_field_values,
+    label_counts,
+    load_cached_boards,
+    load_manifest_items,
+    local_issues,
+)
 from ..render import render_pills
-from ..widgets.prompts import ConfirmScreen, ConfirmWithInputScreen, TextPromptScreen
+from ..widgets.prompts import (
+    ConfirmScreen,
+    ConfirmWithInputScreen,
+    MultiOptionPickerScreen,
+    TextPromptScreen,
+)
 from ..widgets.tables import ClickableRowDataTable
+from .filters import BOARD_KEY, BOARD_SCOPE_KEY, PATTERN_KEY, FILTER_FIELDS, FilterField
 
 ACTIONS = [
     ("Versions", "List fix versions"),
@@ -59,9 +84,16 @@ class MetaScreen(Screen[None]):
         Binding("escape", "close", "Back"),
     ]
 
-    def __init__(self, *, standalone: bool = True) -> None:
+    def __init__(self, *, standalone: bool = True, items: list[dict[str, Any]] | None = None) -> None:
         super().__init__()
         self.standalone = standalone
+        # Reuses IndexScreen's already-loaded (and incrementally kept fresh)
+        # item list when opened via `M` from the index, instead of Boards/
+        # Labels each re-scanning every locally synced issue from scratch --
+        # that rescan is what made opening a local board's editor feel slow.
+        # None (the standalone `jira-wb meta` entry point, which has no such
+        # list) falls back to each screen's own on-demand load.
+        self._items = items
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -84,7 +116,7 @@ class MetaScreen(Screen[None]):
             self.app.push_screen(VersionsScreen(default_filter=self.app.versions_filter))
             return
         if index == 2:
-            self.app.push_screen(BoardsScreen())
+            self.app.push_screen(BoardsScreen(items=self._items))
             return
         if index == 3:
             self.app.push_screen(LabelsScreen())
@@ -111,6 +143,9 @@ class MetaScreen(Screen[None]):
             return
         if index == 3:
             self.notify("Open Labels (Enter) to add, rename, or delete a label")
+            return
+        if self.app.is_project_read_only(self.app.project):
+            self.notify(f"cannot modify metadata: project {self.app.project} is read-only", severity="warning")
             return
         label = "version" if index == 0 else "component"
         name = await self.app.push_screen_wait(TextPromptScreen(f"Add {label}:"))
@@ -263,8 +298,16 @@ class VersionsScreen(Screen[None]):
         self.current_filter = None
         self._rebuild_table()
 
+    def _check_not_read_only(self) -> bool:
+        if self.app.is_project_read_only(self.app.project):
+            self.notify(f"cannot modify metadata: project {self.app.project} is read-only", severity="warning")
+            return False
+        return True
+
     @work
     async def action_add(self) -> None:
+        if not self._check_not_read_only():
+            return
         name = await self.app.push_screen_wait(TextPromptScreen("Add version:"))
         if not name:
             return
@@ -285,6 +328,8 @@ class VersionsScreen(Screen[None]):
 
     @work
     async def action_rename(self) -> None:
+        if not self._check_not_read_only():
+            return
         version = self._current_version()
         if version is None:
             self.notify("no versions found")
@@ -348,6 +393,8 @@ class VersionsScreen(Screen[None]):
 
     @work
     async def action_release(self) -> None:
+        if not self._check_not_read_only():
+            return
         version = self._current_version()
         if version is None:
             self.notify("no versions found")
@@ -373,6 +420,8 @@ class VersionsScreen(Screen[None]):
 
     @work
     async def action_archive(self) -> None:
+        if not self._check_not_read_only():
+            return
         version = self._current_version()
         if version is None:
             self.notify("no versions found")
@@ -399,6 +448,8 @@ class VersionsScreen(Screen[None]):
 
     @work
     async def action_delete(self) -> None:
+        if not self._check_not_read_only():
+            return
         version = self._current_version()
         if version is None:
             self.notify("no versions found")
@@ -429,28 +480,380 @@ class VersionsScreen(Screen[None]):
         self._reload()
 
     def action_reload(self) -> None:
+        # Also drops the cached item list -- same "explicit reload always
+        # means fresh" convention as everywhere else, so a manual reload
+        # actually re-scans instead of reusing a now-possibly-stale list.
+        self._items = None
         self._reload()
 
     def action_close(self) -> None:
         self.dismiss(None)
 
 
-class BoardsScreen(Screen[None]):
-    """Read-only Kanban board browser: membership (via translated JQL) and
-    active/backlog status, both cached from Jira. No add/edit here -- board
-    membership is a consequence of an issue's component/labels, so "editing
-    a board" means changing those fields on the issue itself, not this
-    screen; see the README's Boards section for why."""
+class LocalBoardEditScreen(Screen[bool]):
+    """Single-pane create/edit for a local board: name plus the same
+    filterable dimensions Filters has (component/fixVersion/assignee/
+    project/etc, minus the board/board-scope/toggle rows that don't apply
+    here) and a text pattern, matched with the exact matches_field/
+    matches_filter primitives filter_items already uses -- no JQL involved,
+    so it works regardless of what our narrow JQL compiler can or can't
+    parse. One screen owns the whole lifecycle (name and filters edited
+    together, not a name prompt followed by a separate filter picker) and
+    persists on save -- ctrl+s validates (a board needs a name) and saves,
+    q/Escape cancels without saving anything, unlike the "always returns
+    current state" convention elsewhere in Meta: a blank name has nowhere
+    sensible to fall back to, so a real cancel path is needed here."""
+
+    NAME_KEY = "name"
+    ACTIVE_FILTER_KEY = "activeFilter"
 
     BINDINGS = [
+        Binding("d", "clear_selected", "Clear"),
+        Binding("ctrl+s", "save", "Save"),
+        Binding("q", "cancel", "Cancel"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(
+        self,
+        jira_dir: Path,
+        items: list[dict[str, Any]],
+        *,
+        existing_name: str | None = None,
+        field_filters: dict[str, list[str]] | None = None,
+        pattern: str | None = None,
+        active_filter: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self._jira_dir = jira_dir
+        self._items = items
+        self._existing_name = existing_name
+        self.board_name = existing_name or ""
+        self.field_filters: dict[str, list[str]] = {k: list(v) for k, v in (field_filters or {}).items() if v}
+        self.pattern = pattern
+        self.active_filter: dict[str, Any] | None = active_filter
+
+    def _fields(self) -> list[FilterField]:
+        return [
+            spec
+            for spec in FILTER_FIELDS
+            if spec.kind in ("choice", "text") and spec.key not in (BOARD_KEY, BOARD_SCOPE_KEY)
+        ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield ClickableRowDataTable(id="local-board-edit-table", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.add_column("Field", key="field", width=16)
+        table.add_column("Value", key="value")
+        self._rebuild_rows()
+
+    def _row_value(self, spec: FilterField) -> Any:
+        if spec.key == PATTERN_KEY:
+            return self.pattern or FILTER_ANY
+        values = self.field_filters.get(spec.key)
+        if not values:
+            return FILTER_ANY
+        if spec.key in ("component", "fixVersion"):
+            return render_pills(values)
+        return ", ".join(values)
+
+    def _active_filter_summary(self) -> str:
+        if not self.active_filter:
+            return "(none)"
+        parts = []
+        for key, values in (self.active_filter.get("fieldFilters") or {}).items():
+            if values:
+                parts.append(f"{key}={','.join(values)}")
+        pattern = self.active_filter.get("pattern")
+        if pattern:
+            parts.append(f"text={pattern}")
+        return "; ".join(parts) if parts else "(matches everything)"
+
+    def _rebuild_rows(self) -> None:
+        table = self.query_one(DataTable)
+        previous = self._current_key()
+        table.clear()
+        table.add_row("Name", self.board_name or FILTER_ANY, key=self.NAME_KEY)
+        for spec in self._fields():
+            table.add_row(spec.label, self._row_value(spec), key=spec.key)
+        table.add_row("Active filter", self._active_filter_summary(), key=self.ACTIVE_FILTER_KEY)
+        valid_keys = {self.NAME_KEY, self.ACTIVE_FILTER_KEY, *(spec.key for spec in self._fields())}
+        if previous in valid_keys:
+            table.move_cursor(row=table.get_row_index(previous))
+        self.sub_title = f"editing {self.board_name}" if self._existing_name else "new local board"
+
+    def _current_key(self) -> str | None:
+        table = self.query_one(DataTable)
+        if table.row_count == 0 or table.cursor_row is None:
+            return None
+        try:
+            row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+        except Exception:
+            return None
+        return row_key.value
+
+    def _spec_for(self, key: str) -> FilterField:
+        return next(spec for spec in self._fields() if spec.key == key)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        key = event.row_key.value
+        if key is None:
+            return
+        self.action_edit(key)
+
+    @work
+    async def action_edit(self, key: str) -> None:
+        if key == self.NAME_KEY:
+            value = await self.app.push_screen_wait(TextPromptScreen("Board name:", initial=self.board_name))
+            if value and value.strip():
+                self.board_name = value.strip()
+            self._rebuild_rows()
+            return
+        if key == self.ACTIVE_FILTER_KEY:
+            current = self.active_filter or {}
+            result = await self.app.push_screen_wait(
+                LocalBoardActiveFilterScreen(
+                    self._items,
+                    field_filters=current.get("fieldFilters") or {},
+                    pattern=current.get("pattern"),
+                )
+            )
+            self.active_filter = result
+            self._rebuild_rows()
+            return
+        spec = self._spec_for(key)
+        if spec.kind == "text":
+            value = await self.app.push_screen_wait(TextPromptScreen("Text filter:", initial=self.pattern or ""))
+            self.pattern = value
+            self._rebuild_rows()
+            return
+        counts = distinct_field_values(self._items, spec.key, empty_bucket=spec.empty_bucket)
+        label_to_value: dict[str, str] = {}
+        options: list[str] = []
+        current_values = self.field_filters.get(spec.key, [])
+        selected_labels: list[str] = []
+        for value, count in counts:
+            label = f"{value} ({count})"
+            options.append(label)
+            label_to_value[label] = value
+            if value in current_values:
+                selected_labels.append(label)
+        chosen = await self.app.push_screen_wait(
+            MultiOptionPickerScreen(f"{spec.label} filter:", options, selected=selected_labels)
+        )
+        values = [label_to_value[label] for label in chosen]
+        if values:
+            self.field_filters[spec.key] = values
+        else:
+            self.field_filters.pop(spec.key, None)
+        self._rebuild_rows()
+
+    def action_clear_selected(self) -> None:
+        key = self._current_key()
+        if key is None or key == self.NAME_KEY:
+            return
+        if key == self.ACTIVE_FILTER_KEY:
+            self.active_filter = None
+            self._rebuild_rows()
+            return
+        spec = self._spec_for(key)
+        if spec.key == PATTERN_KEY:
+            self.pattern = None
+        else:
+            self.field_filters.pop(spec.key, None)
+        self._rebuild_rows()
+
+    def action_save(self) -> None:
+        clean_name = self.board_name.strip()
+        if not clean_name:
+            self.notify("board name is required", severity="warning")
+            return
+        try:
+            if self._existing_name is None:
+                add_local_board(self._jira_dir, clean_name, self.field_filters, self.pattern, self.active_filter)
+            else:
+                if clean_name != self._existing_name:
+                    rename_local_board(self._jira_dir, self._existing_name, clean_name)
+                set_local_board_filters(
+                    self._jira_dir, clean_name, self.field_filters, self.pattern, self.active_filter
+                )
+        except MetadataError as exc:
+            self.notify(f"error: {exc}", severity="error")
+            return
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class LocalBoardActiveFilterScreen(Screen[dict[str, Any] | None]):
+    """Nested sub-editor for a local board's optional "active filter" --
+    same field-filter-row editing mechanics as LocalBoardEditScreen's own
+    membership filter, minus the Name row (this only defines the
+    active/backlog split, not board membership). Always closes (q/Esc)
+    returning the current fieldFilters+pattern as a dict, never None on its
+    own -- this screen only opens once the parent's Active filter row is
+    being defined, so there's no separate cancel state to model here;
+    clearing back to "no active filter at all" is the parent row's own
+    'd' (clear) action, not this screen's job."""
+
+    BINDINGS = [
+        Binding("d", "clear_selected", "Clear"),
+        Binding("q", "close", "Done"),
+        Binding("escape", "close", "Done"),
+    ]
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        field_filters: dict[str, list[str]],
+        pattern: str | None,
+    ) -> None:
+        super().__init__()
+        self._items = items
+        self.field_filters: dict[str, list[str]] = {k: list(v) for k, v in field_filters.items() if v}
+        self.pattern = pattern
+
+    def _fields(self) -> list[FilterField]:
+        return [
+            spec
+            for spec in FILTER_FIELDS
+            if spec.kind in ("choice", "text") and spec.key not in (BOARD_KEY, BOARD_SCOPE_KEY)
+        ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield ClickableRowDataTable(id="active-filter-edit-table", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.add_column("Field", key="field", width=16)
+        table.add_column("Value", key="value")
+        self._rebuild_rows()
+
+    def _row_value(self, spec: FilterField) -> Any:
+        if spec.key == PATTERN_KEY:
+            return self.pattern or FILTER_ANY
+        values = self.field_filters.get(spec.key)
+        if not values:
+            return FILTER_ANY
+        if spec.key in ("component", "fixVersion"):
+            return render_pills(values)
+        return ", ".join(values)
+
+    def _rebuild_rows(self) -> None:
+        table = self.query_one(DataTable)
+        previous = self._current_key()
+        table.clear()
+        for spec in self._fields():
+            table.add_row(spec.label, self._row_value(spec), key=spec.key)
+        valid_keys = {spec.key for spec in self._fields()}
+        if previous in valid_keys:
+            table.move_cursor(row=table.get_row_index(previous))
+        self.sub_title = "editing active filter"
+
+    def _current_key(self) -> str | None:
+        table = self.query_one(DataTable)
+        if table.row_count == 0 or table.cursor_row is None:
+            return None
+        try:
+            row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+        except Exception:
+            return None
+        return row_key.value
+
+    def _spec_for(self, key: str) -> FilterField:
+        return next(spec for spec in self._fields() if spec.key == key)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        key = event.row_key.value
+        if key is None:
+            return
+        self.action_edit(key)
+
+    @work
+    async def action_edit(self, key: str) -> None:
+        spec = self._spec_for(key)
+        if spec.kind == "text":
+            value = await self.app.push_screen_wait(TextPromptScreen("Text filter:", initial=self.pattern or ""))
+            self.pattern = value
+            self._rebuild_rows()
+            return
+        counts = distinct_field_values(self._items, spec.key, empty_bucket=spec.empty_bucket)
+        label_to_value: dict[str, str] = {}
+        options: list[str] = []
+        current_values = self.field_filters.get(spec.key, [])
+        selected_labels: list[str] = []
+        for value, count in counts:
+            label = f"{value} ({count})"
+            options.append(label)
+            label_to_value[label] = value
+            if value in current_values:
+                selected_labels.append(label)
+        chosen = await self.app.push_screen_wait(
+            MultiOptionPickerScreen(f"{spec.label} filter:", options, selected=selected_labels)
+        )
+        values = [label_to_value[label] for label in chosen]
+        if values:
+            self.field_filters[spec.key] = values
+        else:
+            self.field_filters.pop(spec.key, None)
+        self._rebuild_rows()
+
+    def action_clear_selected(self) -> None:
+        key = self._current_key()
+        if key is None:
+            return
+        spec = self._spec_for(key)
+        if spec.key == PATTERN_KEY:
+            self.pattern = None
+        else:
+            self.field_filters.pop(spec.key, None)
+        self._rebuild_rows()
+
+    def action_close(self) -> None:
+        self.dismiss({"fieldFilters": dict(self.field_filters), "pattern": self.pattern})
+
+
+class BoardsScreen(Screen[None]):
+    """Kanban/agile board browser, unified with locally-defined "local"
+    boards (bespoke saved filters -- see LocalBoardEditScreen). Jira
+    boards are list-only here (their membership comes from a real Jira
+    board's own filter, so "editing" one means changing the underlying
+    Jira board or the issue's own fields, not this screen) -- but every
+    board, Jira or local, has a purely local "active" switch you can flip
+    to hide/show it in the Filters screen's board picker (this list always
+    shows everything, active or not, so you can find and re-enable one)."""
+
+    BINDINGS = [
+        Binding("n", "add", "New"),
+        Binding("e", "edit", "Edit"),
+        Binding("d", "delete", "Delete"),
+        Binding("a", "toggle_active", "Toggle active"),
         Binding("R", "reload", "Reload"),
         Binding("q", "close", "Back"),
         Binding("escape", "close", "Back"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, *, items: list[dict[str, Any]] | None = None) -> None:
         super().__init__()
         self.boards: list[dict[str, Any]] = []
+        # See MetaScreen's own `_items` -- reused here so New/Edit don't
+        # re-scan every locally synced issue from scratch each time; lazily
+        # populated (and cached for the rest of this screen's lifetime) when
+        # opened standalone, where no pre-loaded list exists yet.
+        self._items = items
+
+    def _manifest_items(self) -> list[dict[str, Any]]:
+        if self._items is None:
+            self._items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        return self._items
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -460,14 +863,19 @@ class BoardsScreen(Screen[None]):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.add_column("Name", key="name")
+        table.add_column("Active", key="active")
         table.add_column("Type", key="type")
         table.add_column("Status", key="status")
         table.add_column("Backlog", key="backlog")
         self._reload()
 
     def _reload(self) -> None:
+        # Ensures the *current* project's boards get live-fetched at least
+        # once (same auto-refresh-on-first-open convenience this screen has
+        # always had) -- the table itself then always shows every synced
+        # project's boards plus local ones, via load_cached_boards.
         try:
-            self.boards = load_meta_boards(
+            load_meta_boards(
                 self.app.jira_dir,
                 self.app.project,
                 self.app.component_field,
@@ -477,25 +885,124 @@ class BoardsScreen(Screen[None]):
             )
         except MetadataError as exc:
             self.notify(f"error: {exc}", severity="error")
-            self.boards = []
+        self.boards = load_cached_boards(self.app.jira_dir)
         self._rebuild_table()
+
+    def _row_key(self, board: dict[str, Any]) -> str:
+        if board.get("kind") == "local":
+            return f"local:{board.get('name') or ''}"
+        return f"jira:{board.get('id') or board.get('name') or ''}"
 
     def _rebuild_table(self) -> None:
         table = self.query_one(DataTable)
+        previous = self._current_key()
         table.clear()
         for board in self.boards:
-            reason = board.get("unsupportedReason")
-            status = f"unsupported: {reason}" if reason else "ok"
-            backlog_keys = board.get("backlogKeys")
-            backlog = f"{len(backlog_keys)} issues" if isinstance(backlog_keys, list) else "n/a"
+            if board.get("kind") == "local":
+                board_type = "local"
+                status = "-"
+                backlog = "-"
+            else:
+                reason = board.get("unsupportedReason")
+                board_type = "jira unsupported" if reason else "jira"
+                status = f"unsupported: {reason}" if reason else "ok"
+                backlog_keys = board.get("backlogKeys")
+                backlog = f"{len(backlog_keys)} issues" if isinstance(backlog_keys, list) else "n/a"
             table.add_row(
                 str(board.get("name") or ""),
-                str(board.get("type") or ""),
+                "yes" if board.get("active", True) else "",
+                board_type,
                 status,
                 backlog,
-                key=str(board.get("id") or board.get("name") or ""),
+                key=self._row_key(board),
             )
+        valid_keys = {self._row_key(board) for board in self.boards}
+        if table.row_count and previous in valid_keys:
+            table.move_cursor(row=table.get_row_index(previous))
         self.sub_title = f"{table.row_count} boards"
+
+    def _current_key(self) -> str | None:
+        table = self.query_one(DataTable)
+        if table.row_count == 0 or table.cursor_row is None:
+            return None
+        try:
+            row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+        except Exception:
+            return None
+        return row_key.value
+
+    def _current_board(self) -> dict[str, Any] | None:
+        key = self._current_key()
+        if key is None:
+            return None
+        return next((board for board in self.boards if self._row_key(board) == key), None)
+
+    @work
+    async def action_add(self) -> None:
+        items = self._manifest_items()
+        saved = await self.app.push_screen_wait(
+            LocalBoardEditScreen(self.app.jira_dir, items, existing_name=None, field_filters={}, pattern=None)
+        )
+        if saved:
+            self._reload()
+
+    @work
+    async def action_edit(self) -> None:
+        board = self._current_board()
+        if board is None:
+            self.notify("no boards found")
+            return
+        if board.get("kind") != "local":
+            self.notify("Jira boards can't be edited locally")
+            return
+        items = self._manifest_items()
+        saved = await self.app.push_screen_wait(
+            LocalBoardEditScreen(
+                self.app.jira_dir,
+                items,
+                existing_name=str(board.get("name") or ""),
+                field_filters=board.get("fieldFilters") or {},
+                pattern=board.get("pattern"),
+                active_filter=board.get("activeFilter"),
+            )
+        )
+        if saved:
+            self._reload()
+
+    @work
+    async def action_delete(self) -> None:
+        board = self._current_board()
+        if board is None:
+            self.notify("no boards found")
+            return
+        if board.get("kind") != "local":
+            self.notify("Jira boards can't be deleted locally")
+            return
+        name = str(board.get("name") or "")
+        confirmed = await self.app.push_screen_wait(ConfirmScreen(f"Delete local board {name}?"))
+        if not confirmed:
+            return
+        try:
+            delete_local_board(self.app.jira_dir, name)
+        except MetadataError as exc:
+            self.notify(f"error: {exc}", severity="error")
+            return
+        self._reload()
+
+    @work
+    async def action_toggle_active(self) -> None:
+        board = self._current_board()
+        if board is None:
+            self.notify("no boards found")
+            return
+        kind = str(board.get("kind") or "jira")
+        identifier = board.get("name") if kind == "local" else board.get("id")
+        try:
+            set_board_active(self.app.jira_dir, kind, identifier, not board.get("active", True))
+        except MetadataError as exc:
+            self.notify(f"error: {exc}", severity="error")
+            return
+        self._reload()
 
     def action_reload(self) -> None:
         self._reload()
@@ -597,6 +1104,18 @@ class LabelsScreen(Screen[None]):
         affected = [item for item in items if label in (item.get("labels") or [])]
         if not affected:
             self.notify(f"no issues currently have label '{label}'")
+            self._reload()
+            return
+
+        skipped = [item for item in affected if self.app.is_project_read_only(item.get("project"))]
+        if skipped:
+            affected = [item for item in affected if item not in skipped]
+            skipped_projects = sorted({item.get("project") for item in skipped if item.get("project")})
+            self.notify(
+                f"skipping {len(skipped)} issue(s) in read-only project(s) {', '.join(skipped_projects)}",
+                severity="warning",
+            )
+        if not affected:
             self._reload()
             return
 

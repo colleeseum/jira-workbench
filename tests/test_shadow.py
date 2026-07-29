@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from jira_workbench.config import ProjectSettings
+from jira_workbench.metadata import write_project_registry
 from jira_workbench.shadow import (
+    ShadowError,
     add_comment,
     commit_shadow,
     conflicting_fields,
@@ -18,6 +23,7 @@ from jira_workbench.shadow import (
     shadow_path,
     shadow_status,
     undelete_comment,
+    unset_field,
 )
 from jira_workbench.sync import SyncConfig, read_json, sync_project, write_json
 from test_sync import FakeJiraClient
@@ -284,6 +290,62 @@ def test_conflicting_fields_ignores_status_field(tmp_path: Path) -> None:
     remote_issue = {"key": "SAT-1", "fields": {"status": {"name": "In Progress"}}}
 
     assert conflicting_fields(jira_dir, "SAT-1", shadow, remote_issue) == []
+
+
+def test_set_field_blocked_for_a_read_only_project(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)  # SAT-1 belongs to project "SAT"
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+
+    with pytest.raises(ShadowError):
+        set_field(jira_dir, "SAT-1", "summary", "New summary")
+
+
+def test_unset_field_blocked_for_a_read_only_project(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+
+    with pytest.raises(ShadowError):
+        unset_field(jira_dir, "SAT-1", "summary")
+
+
+def test_set_status_change_blocked_for_a_read_only_project(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+
+    with pytest.raises(ShadowError):
+        set_status_change(jira_dir, "SAT-1", resolution="Done")
+
+
+def test_add_comment_still_allowed_for_a_read_only_project(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+
+    add_comment(jira_dir, "SAT-1", "still allowed")
+
+    shadow = load_shadow(jira_dir, "SAT-1")
+    assert shadow is not None
+    assert shadow["comments"][0]["body"] == "still allowed"
+
+
+def test_set_field_allowed_for_a_read_write_project(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=False),))
+
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+
+    shadow = load_shadow(jira_dir, "SAT-1")
+    assert shadow is not None
+    assert shadow["fields"]["summary"] == "New summary"
+
+
+def test_set_field_allowed_when_no_registry_exists_at_all(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)  # no write_project_registry call at all
+
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+
+    shadow = load_shadow(jira_dir, "SAT-1")
+    assert shadow is not None
+    assert shadow["fields"]["summary"] == "New summary"
 
 
 def test_push_applies_supported_fields_and_comments(tmp_path: Path) -> None:

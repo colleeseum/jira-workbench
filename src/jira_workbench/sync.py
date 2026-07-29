@@ -55,6 +55,14 @@ class SyncConfig:
     jira_dir: Path
     component_field: str = "components"
     force: bool = False
+    # None means unbounded (sync everything, today's default). Set to bound
+    # how far back Done issues are pulled in -- a project with thousands of
+    # ancient closed tickets doesn't need to keep re-fetching all of them on
+    # every sync. Currently-open issues are never excluded regardless of age;
+    # only issues already in Jira's Done status category are subject to this.
+    # Issues that age out (or that a newly-added cutoff excludes) are simply
+    # left alone on disk, not deleted -- see build_index_jql.
+    history_months: int | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +71,7 @@ class SyncResult:
     changed_count: int
     skipped_count: int
     version_count: int = 0
+    backfilled_parent_count: int = 0
 
 
 def utc_now() -> str:
@@ -154,6 +163,57 @@ def issue_key_sort_key(key: str) -> tuple[str, int, str]:
     return (key.upper(), -1, key)
 
 
+def issue_project_key(issue: dict[str, Any]) -> str | None:
+    """The Jira project an issue belongs to, e.g. "SAT" for issue "SAT-123".
+
+    Prefers the issue's own synced fields.project.key (present since a sync
+    fetches fields="*all"); falls back to the issue key's own letter prefix
+    if that field is ever missing. Lives here (the lowest layer both
+    shadow.py and view.py already depend on) rather than in either -- pure,
+    operates on an already-loaded issue dict, no I/O.
+    """
+    fields = issue.get("fields")
+    if isinstance(fields, dict):
+        project = fields.get("project")
+        if isinstance(project, dict):
+            key = project.get("key")
+            if isinstance(key, str) and key:
+                return key
+    key = issue.get("key")
+    if isinstance(key, str):
+        match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_]*)-\d+", key)
+        if match:
+            return match.group(1)
+    return None
+
+
+def status_category_key(status: Any) -> str | None:
+    """Jira's real status classification (statusCategory.key: "new" /
+    "indeterminate" / "done"), not the display name -- a project's
+    workflow can name its statuses anything ("Solved", "Verified",
+    "Shipped"), but every one of them still belongs to one of these three
+    fixed system categories. Returns None if `status` isn't a full status
+    dict (e.g. it's been shadow-overwritten to a bare name, or predates
+    this app syncing statusCategory at all)."""
+    if not isinstance(status, dict):
+        return None
+    category = status.get("statusCategory")
+    if not isinstance(category, dict):
+        return None
+    key = category.get("key")
+    return key if isinstance(key, str) and key else None
+
+
+# Last-resort fallback only, for a status whose real statusCategory isn't
+# known yet (a manifest/issue.json synced before status_category_key
+# existed, or -- for a bare shadow-overwritten status name -- one that's
+# never been observed anywhere else in the locally synced instance
+# either). A custom workflow status not covered by these literal English
+# words is exactly the bug this whole mechanism exists to avoid; this is
+# only a stopgap until the next sync repopulates the real category.
+FALLBACK_DONE_STATUS_NAMES = {"close", "closed", "done", "resolved"}
+
+
 def issue_path_sort_key(path: Path) -> tuple[str, int, str]:
     return issue_key_sort_key(path.parent.name)
 
@@ -166,9 +226,29 @@ def find_existing_issue(components_dir: Path, key: str) -> Path | None:
     return None
 
 
-def fetch_work_item_index(project: str, client: JiraSyncClient) -> list[dict[str, Any]]:
+def build_index_jql(project: str, history_months: int | None = None) -> str:
+    """The JQL used to list a project's issues for syncing.
+
+    With no cutoff, every issue in the project is listed (today's default).
+    With a cutoff, currently-open issues are still listed regardless of age
+    -- only issues Jira already considers Done are excluded, and only once
+    they've been in that status for longer than the cutoff. This uses
+    statuscategorychangedate (how long an issue has sat in its current
+    status), the same field [view].hide_done_after_days already keys off of,
+    rather than `updated` -- an unrelated bulk edit (e.g. relabeling) bumps
+    `updated` without meaning the issue is any less stale.
+    """
+    if history_months is None:
+        return f"project={project} ORDER BY key"
+    days = history_months * 30
+    return f"project={project} AND (statusCategory != Done OR statuscategorychangedate >= -{days}d) ORDER BY key"
+
+
+def fetch_work_item_index(
+    project: str, client: JiraSyncClient, *, history_months: int | None = None
+) -> list[dict[str, Any]]:
     payload = client.enhanced_jql_get_list_of_tickets(
-        f"project={project} ORDER BY key",
+        build_index_jql(project, history_months),
         fields=["issuetype", "key", "updated"],
     )
     return normalize_work_items(payload)
@@ -227,9 +307,11 @@ def issue_summary(component: str, key: str, issue_path: Path, base_dir: Path) ->
         "assignee": assignee.get("displayName") if isinstance(assignee, dict) else None,
         "summary": fields.get("summary") if isinstance(fields.get("summary"), str) else None,
         "status": status.get("name") if isinstance(status, dict) else None,
+        "statusCategory": status_category_key(status),
         "type": issue_type.get("name") if isinstance(issue_type, dict) else None,
         "updated": updated_at(issue) if isinstance(issue, dict) else None,
         "path": directory.relative_to(base_dir).as_posix(),
+        "project": issue_project_key(issue) if isinstance(issue, dict) else None,
     }
 
 
@@ -261,6 +343,86 @@ def build_manifest(jira_dir: Path) -> dict[str, Any]:
     return manifest
 
 
+def backfill_missing_parents(
+    jira_dir: Path,
+    project: str,
+    client: JiraSyncClient,
+    component_field: str,
+    *,
+    progress: Progress | None = None,
+) -> int:
+    """Ensure every locally synced issue's parent is itself synced, even
+    one a history_months cutoff would otherwise exclude -- any parent
+    (Epic, Story, Task, whatever `fields.parent` points at -- this isn't
+    Epic-specific) closed over a year ago can still have a child that's
+    open right now (or was itself touched more recently), and a child
+    whose own parent was never fetched is exactly what forces the index's
+    swimlane header to fall back to a denormalized (and possibly very
+    long) cached summary instead of a real, resolvable issue.
+
+    Loops until a pass finds nothing new to backfill, so a multi-level gap
+    (e.g. a subtask's parent Story, and that Story's own parent Epic, both
+    missing) gets fully resolved, not just one hop of it. Only backfills
+    same-project parents: a parent that lives in a different project needs
+    that project configured and synced too, which this can't do on its
+    own. Each pass re-reads every locally cached issue (same full-directory
+    walk build_manifest already does every sync, so no new order of
+    magnitude of I/O), so this also reconciles gaps left over from before
+    this existed, not just ones from this run.
+    """
+    components_dir = jira_dir / "components"
+    if not components_dir.exists():
+        return 0
+
+    backfilled = 0
+    unfetchable: set[str] = set()
+    while True:
+        missing_keys: dict[str, None] = {}
+        for issue_path in components_dir.glob("*/*/issue.json"):
+            issue = read_json(issue_path)
+            if not isinstance(issue, dict):
+                continue
+            fields = issue.get("fields")
+            parent = fields.get("parent") if isinstance(fields, dict) else None
+            parent_key = parent.get("key") if isinstance(parent, dict) else None
+            if not isinstance(parent_key, str) or not parent_key or parent_key in unfetchable:
+                continue
+            if issue_project_key({"key": parent_key}) != project:
+                continue
+            if find_existing_issue(components_dir, parent_key) is not None:
+                continue
+            missing_keys[parent_key] = None
+
+        if not missing_keys:
+            break
+
+        total = len(missing_keys)
+        progressed = False
+        for index, key in enumerate(missing_keys, start=1):
+            if progress:
+                progress(f"[4/6] Backfilling parents excluded by the history cutoff... {index}/{total} {key}")
+            try:
+                issue = normalize_issue(client.get_issue(key, fields="*all"), key)
+            except Exception as exc:
+                unfetchable.add(key)
+                if progress:
+                    progress(f"could not backfill parent {key}: {exc}")
+                continue
+            component = component_slug(issue, component_field)
+            dest = components_dir / component / key
+            dest.mkdir(parents=True, exist_ok=True)
+            write_json(dest / "issue.json", issue)
+            write_json(dest / "comments.json", fetch_issue_comments(client, key))
+            write_json(dest / "attachments.json", issue_attachments(issue))
+            write_json(dest / "sync.json", {"key": key, "component": component, "syncedAt": utc_now()})
+            backfilled += 1
+            progressed = True
+
+        if not progressed:
+            break
+    return backfilled
+
+
 def sync_project(
     config: SyncConfig,
     client: JiraSyncClient,
@@ -272,7 +434,7 @@ def sync_project(
     components_dir.mkdir(parents=True, exist_ok=True)
 
     if progress:
-        progress("[1/5] Refreshing project metadata...")
+        progress("[1/6] Refreshing project metadata...")
     from .issue import fetch_all_field_names
     from .metadata import refresh_versions_api, remember_field_names
 
@@ -296,12 +458,12 @@ def sync_project(
             progress(f"field name refresh skipped: {exc}")
 
     if progress:
-        progress("[2/5] Refreshing project index...")
-    work_items = fetch_work_item_index(config.project, client)
+        progress("[2/6] Refreshing project index...")
+    work_items = fetch_work_item_index(config.project, client, history_months=config.history_months)
     write_json(jira_dir / "project.json", work_items)
 
     if progress:
-        progress("[3/5] Syncing changed issues...")
+        progress("[3/6] Syncing changed issues...")
     changed = 0
     skipped = 0
     total = len(work_items)
@@ -312,7 +474,7 @@ def sync_project(
 
         if progress:
             progress(
-                f"[3/5] Syncing changed issues... {index}/{total} {key} "
+                f"[3/6] Syncing changed issues... {index}/{total} {key} "
                 f"changed={changed} unchanged={skipped}"
             )
 
@@ -356,13 +518,18 @@ def sync_project(
         changed += 1
 
     if progress:
-        progress("[4/5] Building manifest...")
+        progress("[4/6] Backfilling parents excluded by the history cutoff...")
+    backfilled = backfill_missing_parents(jira_dir, config.project, client, config.component_field, progress=progress)
+
+    if progress:
+        progress("[5/6] Building manifest...")
     build_manifest(jira_dir)
     if progress:
-        progress("[5/5] Done.")
+        progress("[6/6] Done.")
     return SyncResult(
         work_item_count=len(work_items),
         changed_count=changed,
         skipped_count=skipped,
         version_count=version_count,
+        backfilled_parent_count=backfilled,
     )

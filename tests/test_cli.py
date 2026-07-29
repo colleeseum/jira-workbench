@@ -22,8 +22,13 @@ from jira_workbench.shadow import load_shadow
 from jira_workbench.sync import write_json
 
 
-def test_cli_help(capsys) -> None:
-    assert main([]) == 0
+def test_cli_help(tmp_path: Path, capsys) -> None:
+    # Explicit --config keeps this isolated from whatever real config.toml
+    # (if any) exists on the machine running the tests -- main([]) with no
+    # subcommand still loads config before printing help, so an invalid
+    # real config would otherwise fail this test for a reason that has
+    # nothing to do with what it's actually checking.
+    assert main(["--config", str(tmp_path / "missing.conf")]) == 0
     captured = capsys.readouterr()
     assert "jira-wb" in captured.out
 
@@ -83,38 +88,87 @@ def test_sync_missing_api_config_prints_friendly_error(tmp_path: Path, capsys) -
     assert "Traceback" not in captured.err
 
 
-def test_sync_requires_config_or_flags(tmp_path: Path, capsys) -> None:
+def test_sync_requires_project(tmp_path: Path, capsys) -> None:
     code = main(["--config", str(tmp_path / "missing.conf"), "sync"])
 
     captured = capsys.readouterr()
     assert code == 2
-    assert "missing required configuration: project, jira_dir" in captured.err
+    assert "missing required configuration: project" in captured.err
+
+
+def test_sync_uses_default_jira_dir_when_unset(tmp_path: Path, monkeypatch) -> None:
+    from jira_workbench.config import DEFAULT_JIRA_DIR
+
+    captured_configs = []
+
+    def fake_sync_project(config, client, progress=None):
+        captured_configs.append(config)
+        from jira_workbench.sync import SyncResult
+
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                'project = "SAT"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "sync"]) == 0
+
+    assert captured_configs[0].jira_dir == DEFAULT_JIRA_DIR
+
+
+class _FakeStream:
+    def __init__(self) -> None:
+        self.output = ""
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, text: str) -> None:
+        self.output += text
+
+    def flush(self) -> None:
+        pass
 
 
 def test_sync_progress_printer_rewrites_issue_progress_on_tty() -> None:
-    class Stream:
-        def __init__(self) -> None:
-            self.output = ""
-
-        def isatty(self) -> bool:
-            return True
-
-        def write(self, text: str) -> None:
-            self.output += text
-
-        def flush(self) -> None:
-            pass
-
-    stream = Stream()
+    stream = _FakeStream()
     progress = sync_progress_printer(stream)
 
-    progress("[3/5] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0")
-    progress("[3/5] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0")
-    progress("[4/5] Building manifest...")
+    progress("[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0")
+    progress("[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0")
+    progress("[4/6] Building manifest...")
 
-    assert "\r[3/5] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in stream.output
-    assert "\r[3/5] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in stream.output
-    assert "\n[4/5] Building manifest...\n" in stream.output
+    assert "\r[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in stream.output
+    assert "\r[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in stream.output
+    assert "\n[4/6] Building manifest...\n" in stream.output
+
+
+def test_sync_progress_printer_prefixes_every_line_with_the_project() -> None:
+    stream = _FakeStream()
+    progress = sync_progress_printer(stream, project="PLAT")
+
+    progress("[1/6] Refreshing project metadata...")
+
+    assert stream.output == "PLAT [1/6] Refreshing project metadata...\n"
+
+
+def test_sync_progress_printer_project_prefix_also_applies_to_tty_rewrite() -> None:
+    stream = _FakeStream()
+    progress = sync_progress_printer(stream, project="PLAT")
+
+    progress("[3/6] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0")
+
+    assert "\rPLAT [3/6] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0" in stream.output
 
 
 def test_sync_force_flag_threads_through_to_sync_config(tmp_path: Path, monkeypatch) -> None:
@@ -190,6 +244,246 @@ def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys, monke
     assert code == 0
     assert client.jqls == ["project=FLAG ORDER BY key"]
     assert "Synced 0 work items" in captured.out
+
+
+def test_sync_with_no_explicit_project_syncs_every_configured_project(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    from jira_workbench.metadata import load_project_registry
+    from jira_workbench.sync import SyncResult
+
+    synced_projects: list[str] = []
+
+    def fake_sync_project(config, client, progress=None):
+        synced_projects.append(config.project)
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "[[projects]]",
+                'key = "OTHERPROJ"',
+                "read_only = true",
+            ]
+        )
+    )
+
+    code = main(["--config", str(config_path), "sync"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert synced_projects == ["SAT", "OTHERPROJ"]
+    assert "Synced SAT: 0 work items" in captured.out
+    assert "Synced OTHERPROJ: 0 work items" in captured.out
+    assert load_project_registry(jira_dir) == {
+        "SAT": {"readOnly": False, "default": True},
+        "OTHERPROJ": {"readOnly": True, "default": False},
+    }
+
+
+def test_sync_multi_project_run_prefixes_progress_lines_with_the_project(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    from jira_workbench.sync import SyncResult
+
+    def fake_sync_project(config, client, progress=None):
+        if progress:
+            progress("[1/6] Refreshing project metadata...")
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{tmp_path / "jira"}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "[[projects]]",
+                'key = "OTHERPROJ"',
+            ]
+        )
+    )
+
+    code = main(["--config", str(config_path), "sync"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "SAT [1/6] Refreshing project metadata..." in captured.err
+    assert "OTHERPROJ [1/6] Refreshing project metadata..." in captured.err
+
+
+def test_sync_single_project_run_does_not_prefix_progress_lines(tmp_path: Path, capsys, monkeypatch) -> None:
+    from jira_workbench.sync import SyncResult
+
+    def fake_sync_project(config, client, progress=None):
+        if progress:
+            progress("[1/6] Refreshing project metadata...")
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                'project = "SAT"',
+                f'jira_dir = "{tmp_path / "jira"}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+            ]
+        )
+    )
+
+    code = main(["--config", str(config_path), "sync"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "[1/6] Refreshing project metadata...\n" in captured.err
+    assert "SAT [1/6]" not in captured.err
+
+
+def test_sync_writes_project_registry_even_for_a_single_project_sync(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from jira_workbench.metadata import load_project_registry
+    from jira_workbench.sync import SyncResult
+
+    def fake_sync_project(config, client, progress=None):
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                'project = "SAT"',
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "sync"]) == 0
+
+    assert load_project_registry(jira_dir) == {"SAT": {"readOnly": False, "default": True}}
+
+
+def test_sync_uses_per_project_history_months_falling_back_to_the_global_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from jira_workbench.sync import SyncResult
+
+    captured_configs = []
+
+    def fake_sync_project(config, client, progress=None):
+        captured_configs.append(config)
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "sync_history_months = 24",
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "[[projects]]",
+                'key = "HUGEPROJ"',
+                "history_months = 6",
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "sync"]) == 0
+
+    by_project = {config.project: config for config in captured_configs}
+    assert by_project["SAT"].history_months == 24
+    assert by_project["HUGEPROJ"].history_months == 6
+
+
+def test_sync_history_months_flag_overrides_config_for_every_project(tmp_path: Path, monkeypatch) -> None:
+    from jira_workbench.sync import SyncResult
+
+    captured_configs = []
+
+    def fake_sync_project(config, client, progress=None):
+        captured_configs.append(config)
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "sync_history_months = 24",
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "[[projects]]",
+                'key = "HUGEPROJ"',
+                "history_months = 6",
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "sync", "--history-months", "3"]) == 0
+
+    assert all(config.history_months == 3 for config in captured_configs)
+
+
+def test_sync_rejects_non_positive_history_months_flag(tmp_path: Path, capsys) -> None:
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "sync",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(tmp_path / "jira"),
+            "--history-months",
+            "0",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "--history-months must be a positive integer" in captured.err
 
 
 def test_shadow_diff_can_export_to_file(tmp_path: Path, capsys) -> None:
@@ -418,9 +712,9 @@ def test_view_reads_default_component_and_filter_from_config(tmp_path: Path, mon
     assert code == 0
     assert calls[0][0][0] == jira_dir
     assert calls[0][1]["component_field"] == "customfield_10071"
-    assert calls[0][1]["component"] == "helm-chart"
-    assert calls[0][1]["fix_version"] == "2026.07"
-    assert calls[0][1]["assignee"] == "you@example.com"
+    assert calls[0][1]["component"] == ("helm-chart",)
+    assert calls[0][1]["fix_version"] == ("2026.07",)
+    assert calls[0][1]["assignee"] == ("you@example.com",)
     assert calls[0][1]["board"] == "SAT board"
     assert calls[0][1]["board_scope"] == "active"
     assert calls[0][1]["pattern"] == "prometheus"
@@ -430,6 +724,40 @@ def test_view_reads_default_component_and_filter_from_config(tmp_path: Path, mon
     assert calls[0][1]["config_path"] == config_path
     assert calls[0][1]["nerd_font"] is True
     assert calls[0][1]["dev_status_field"] == "customfield_10099"
+
+
+def test_view_resolves_default_project_from_projects_array(tmp_path: Path, monkeypatch) -> None:
+    # A [[projects]] config (no legacy top-level `project = "..."` key) must
+    # still resolve a project for the TUI -- otherwise self.app.project stays
+    # None and Meta > Boards/Versions wrongly report "no cached boards found
+    # and live metadata access is not configured" even though a default
+    # project is clearly configured and already synced.
+    config_path = tmp_path / "jira-wb.conf"
+    jira_dir = tmp_path / "jira"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "[[projects]]",
+                'key = "OTHERPROJ"',
+            ]
+        )
+        + "\n"
+    )
+    calls = []
+
+    def fake_open_interactive_view(*args, **kwargs) -> None:
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(jira_workbench.cli, "open_interactive_view", fake_open_interactive_view)
+
+    code = main(["--config", str(config_path), "view"])
+
+    assert code == 0
+    assert calls[0][1]["project"] == "SAT"
 
 
 def test_view_nerd_font_defaults_to_false_when_unset(tmp_path: Path, monkeypatch) -> None:
@@ -574,6 +902,39 @@ def test_issue_create_dry_run_uses_configured_component_field(tmp_path: Path, ca
     assert code == 0
     assert "customfield_10071: {'value': 'resource-as-code'}" in captured.out
     assert "reporter: {'accountId': 'me'}" in captured.out
+
+
+def test_issue_create_blocked_for_a_read_only_project(tmp_path: Path, capsys, monkeypatch) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    class Client:
+        def issue_createmeta(self, project: str) -> dict[str, object]:
+            raise AssertionError("should not fetch createmeta for a read-only project")
+
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: Client())
+    jira_dir = tmp_path / "jira"
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                'project = "SAT"',
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+            ]
+        )
+    )
+
+    code = main(
+        ["--config", str(config_path), "issue", "create", "--summary", "New issue", "--type", "Task"]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "project SAT is read-only" in captured.err
 
 
 def test_issue_create_requires_type_when_no_flag_or_config_default(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -814,7 +1175,7 @@ def test_filter_versions_reports_invalid_regex() -> None:
 def test_meta_versions_can_list_cached_versions(tmp_path: Path, capsys) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
-        jira_dir / "meta/versions.json",
+        jira_dir / "meta/SAT/versions.json",
         {
             "project": "SAT",
             "fetchedAt": "2026-07-21T06:00:00Z",
@@ -842,7 +1203,7 @@ def test_meta_versions_can_list_cached_versions(tmp_path: Path, capsys) -> None:
 def test_meta_boards_can_list_cached_boards(tmp_path: Path, capsys) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
-        jira_dir / "meta/boards.json",
+        jira_dir / "meta/SAT/boards.json",
         {
             "project": "SAT",
             "fetchedAt": "2026-07-21T06:00:00Z",
@@ -1000,7 +1361,7 @@ def test_meta_components_lists_cached_manifest_components(tmp_path: Path, capsys
 def test_meta_versions_output_uses_cached_versions(tmp_path: Path) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
-        jira_dir / "meta/versions.json",
+        jira_dir / "meta/SAT/versions.json",
         {
             "project": "SAT",
             "fetchedAt": "2026-07-21T06:00:00Z",
@@ -1022,7 +1383,7 @@ def test_meta_versions_output_uses_cached_versions(tmp_path: Path) -> None:
 def test_meta_components_output_uses_cached_component_metadata(tmp_path: Path) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
-        jira_dir / "meta/components.json",
+        jira_dir / "meta/SAT/components.json",
         {
             "project": "SAT",
             "fetchedAt": "2026-07-21T06:00:00Z",
@@ -1039,7 +1400,7 @@ def test_meta_components_output_uses_cached_component_metadata(tmp_path: Path) -
 def test_meta_components_output_does_not_merge_native_components(tmp_path: Path) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
-        jira_dir / "meta/components.json",
+        jira_dir / "meta/SAT/components.json",
         {
             "project": "SAT",
             "fetchedAt": "2026-07-21T06:00:00Z",
@@ -1074,7 +1435,7 @@ def test_meta_components_output_does_not_merge_native_components(tmp_path: Path)
 def test_meta_component_field_options_output_uses_cached_options(tmp_path: Path) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
-        jira_dir / "meta/customfield_10071-options.json",
+        jira_dir / "meta/SAT/customfield_10071-options.json",
         {
             "project": "SAT",
             "field": "customfield_10071",
@@ -1112,7 +1473,7 @@ def test_meta_component_field_options_output_uses_cached_options(tmp_path: Path)
 def test_meta_components_output_uses_component_field_options_when_configured(tmp_path: Path) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
-        jira_dir / "meta/customfield_10071-options.json",
+        jira_dir / "meta/SAT/customfield_10071-options.json",
         {
             "project": "SAT",
             "field": "customfield_10071",
@@ -1121,7 +1482,7 @@ def test_meta_components_output_uses_component_field_options_when_configured(tmp
         },
     )
     write_json(
-        jira_dir / "meta/components.json",
+        jira_dir / "meta/SAT/components.json",
         {
             "project": "SAT",
             "fetchedAt": "2026-07-21T06:00:00Z",
@@ -1193,6 +1554,32 @@ def test_meta_version_write_commands_require_api_config(tmp_path: Path, capsys) 
 
     captured = capsys.readouterr()
     assert "missing required configuration for Jira API" in captured.err
+
+
+def test_meta_version_add_blocked_for_a_read_only_project(tmp_path: Path, capsys) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    jira_dir = tmp_path / "jira"
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "version-add",
+            "v1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "project SAT is read-only" in captured.err
 
 
 def test_meta_ctrl_c_exits_without_traceback(tmp_path: Path, monkeypatch, capsys) -> None:

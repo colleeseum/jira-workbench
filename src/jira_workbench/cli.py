@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, ConfigError, choose, load_config, secure_config_permissions
+from .config import DEFAULT_CONFIG_PATH, ConfigError, choose, load_config, resolve_jira_dir, secure_config_permissions
 from .metadata import (
     DEFAULT_METADATA_TTL_SECONDS,
     JiraApiConfig,
@@ -26,7 +26,11 @@ from .metadata import (
     format_components as format_meta_components,
     format_component_cache,
     format_versions,
+    is_project_read_only,
     jira_api_client,
+    load_all_boards,
+    load_all_components,
+    load_all_versions,
     load_boards,
     load_component_field_options,
     load_component_summary,
@@ -43,6 +47,7 @@ from .metadata import (
     refresh_components_api,
     refresh_versions_api,
     version_name,
+    write_project_registry,
 )
 from .issue import IssueError, build_create_fields, create_issue, fetch_issue_type_fields, resolve_reporter
 from .server import serve
@@ -66,9 +71,11 @@ def open_interactive_view(
     jira_dir: Path,
     *,
     component_field: str | None = None,
-    component: str | None = None,
-    fix_version: str | None = None,
-    assignee: str | None = None,
+    project_filter: str | tuple[str, ...] | None = None,
+    status_filter: str | tuple[str, ...] | None = None,
+    component: str | tuple[str, ...] | None = None,
+    fix_version: str | tuple[str, ...] | None = None,
+    assignee: str | tuple[str, ...] | None = None,
     board: str | None = None,
     board_scope: str | None = None,
     pattern: str | None = None,
@@ -92,6 +99,8 @@ def open_interactive_view(
     run_textual_view(
         jira_dir,
         component_field=component_field,
+        project_filter=project_filter,
+        status_filter=status_filter,
         component=component,
         fix_version=fix_version,
         assignee=assignee,
@@ -115,25 +124,33 @@ def open_interactive_view(
     )
 
 
-def sync_progress_printer(stream: object = sys.stderr) -> Callable[[str], None]:
+_IN_PLACE_PROGRESS_PREFIXES = (
+    "[3/6] Syncing changed issues... ",
+    "[4/6] Backfilling parents excluded by the history cutoff... ",
+)
+
+
+def sync_progress_printer(stream: object = sys.stderr, *, project: str | None = None) -> Callable[[str], None]:
     in_place = False
     last_len = 0
     is_tty = bool(getattr(stream, "isatty", lambda: False)())
+    prefix = f"{project} " if project else ""
 
     def progress(message: str) -> None:
         nonlocal in_place, last_len
-        if is_tty and message.startswith("[3/5] Syncing changed issues... "):
-            padding = " " * max(0, last_len - len(message))
-            getattr(stream, "write")(f"\r{message}{padding}")
+        full_message = f"{prefix}{message}"
+        if is_tty and message.startswith(_IN_PLACE_PROGRESS_PREFIXES):
+            padding = " " * max(0, last_len - len(full_message))
+            getattr(stream, "write")(f"\r{full_message}{padding}")
             getattr(stream, "flush")()
             in_place = True
-            last_len = len(message)
+            last_len = len(full_message)
             return
         if in_place:
             getattr(stream, "write")("\n")
             in_place = False
             last_len = 0
-        print(message, file=stream)
+        print(full_message, file=stream)
 
     return progress
 
@@ -162,6 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Re-fetch every issue regardless of its updated timestamp. Normal syncs skip an issue "
             "whose own updated timestamp hasn't changed, which misses drift caused by something else "
             "changing (e.g. a fix version renamed in Jira) -- --force refreshes everything to catch that."
+        ),
+    )
+    sync_parser.add_argument(
+        "--history-months",
+        type=int,
+        default=os.environ.get("JIRA_SYNC_HISTORY_MONTHS"),
+        help=(
+            "Only sync Done issues that have been in that status for this many months or less "
+            "(currently-open issues are always synced regardless of age). Overrides "
+            "sync_history_months/[[projects]] history_months in config for this run, for every "
+            "project being synced. Unset means unbounded, same as today."
         ),
     )
 
@@ -396,62 +424,82 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "sync":
-        project = choose(args.project, config.project)
         component_field = choose(args.component_field, config.component_field) or "components"
-        jira_dir = choose(args.jira_dir, config.jira_dir)
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
-        missing = [
-            name
-            for name, value in (
-                ("project", project),
-                ("jira_dir", jira_dir),
-            )
-            if value is None
-        ]
-        if missing:
+
+        # An explicit --project always means "just sync this one," matching
+        # the pre-multi-project CLI. Otherwise sync every project declared
+        # in config (a single flat `project = "..."` resolves to one via
+        # resolved_projects()'s own backward-compat fallback).
+        if args.project:
+            projects_to_sync = [str(args.project)]
+        else:
+            projects_to_sync = [settings.key for settings in config.resolved_projects()]
+
+        if not projects_to_sync:
             print(
                 "error: missing required configuration: "
-                f"{', '.join(missing)}. Set them in ~/.config/jira-wb/config.toml or pass flags.",
+                "project. Set it in ~/.config/jira-wb/config.toml or pass --project.",
                 file=sys.stderr,
             )
             return 2
-        try:
-            api_project, api_client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        except MetadataError as exc:
-            print(f"error: {exc}", file=sys.stderr)
+
+        if args.history_months is not None and int(args.history_months) <= 0:
+            print("error: --history-months must be a positive integer", file=sys.stderr)
             return 2
-        try:
-            result = sync_project(
-                SyncConfig(
-                    project=api_project,
-                    component_field=str(component_field),
-                    jira_dir=Path(str(jira_dir)),
-                    force=args.force,
-                ),
-                api_client,
-                progress=sync_progress_printer(sys.stderr),
+
+        exit_code = 0
+        for project in projects_to_sync:
+            try:
+                api_project, api_client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+            except MetadataError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            history_months = (
+                int(args.history_months) if args.history_months is not None else config.effective_history_months(project)
             )
-        except SyncError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        print(
-            f"Synced {result.work_item_count} work items "
-            f"({result.changed_count} changed, {result.skipped_count} unchanged, "
-            f"{result.version_count} versions cached)."
-        )
-        return 0
+            try:
+                result = sync_project(
+                    SyncConfig(
+                        project=api_project,
+                        component_field=str(component_field),
+                        jira_dir=jira_dir,
+                        force=args.force,
+                        history_months=history_months,
+                    ),
+                    api_client,
+                    progress=sync_progress_printer(
+                        sys.stderr, project=project if len(projects_to_sync) > 1 else None
+                    ),
+                )
+            except SyncError as exc:
+                print(f"error: syncing {project}: {exc}", file=sys.stderr)
+                exit_code = 1
+                continue
+            prefix = "Synced" if len(projects_to_sync) == 1 else f"Synced {project}:"
+            backfilled_note = (
+                f", {result.backfilled_parent_count} parent(s) backfilled" if result.backfilled_parent_count else ""
+            )
+            print(
+                f"{prefix} {result.work_item_count} work items "
+                f"({result.changed_count} changed, {result.skipped_count} unchanged, "
+                f"{result.version_count} versions cached{backfilled_note})."
+            )
+
+        # Keep the read-only/default registry current even when only a
+        # single project was actively re-synced (see metadata.py's
+        # write_project_registry/is_project_read_only).
+        write_project_registry(jira_dir, config.resolved_projects())
+        return exit_code
 
     if args.command == "serve":
-        jira_dir = choose(args.jira_dir, config.jira_dir)
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
         host = choose(args.host, config.host)
         port = choose(args.port, config.port)
-        missing = [
-            name
-            for name, value in (("jira_dir", jira_dir), ("serve.host", host), ("serve.port", port))
-            if value is None
-        ]
+        missing = [name for name, value in (("serve.host", host), ("serve.port", port)) if value is None]
         if missing:
             print(
                 "error: missing required configuration: "
@@ -459,12 +507,20 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        serve(Path(str(jira_dir)), str(host), int(port))
+        serve(jira_dir, str(host), int(port))
         return 0
 
     if args.command == "view":
-        jira_dir = choose(args.jira_dir, config.jira_dir)
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
         component_field = choose(args.component_field, config.component_field) or "components"
+        # config.project is only the legacy flat `project = "SAT"` key -- a
+        # [[projects]] config (see resolved_projects) needs this instead, or
+        # the TUI thinks no project is configured at all (breaks Meta boards/
+        # versions and anything else keyed off self.app.project), even
+        # though sync already resolved a real default project just fine.
+        default_project = config.default_project_key()
+        view_project = config.view_project
+        view_status = config.view_status
         view_component = choose(args.component, config.view_component)
         view_fix_version = config.view_fix_version
         view_assignee = config.view_assignee
@@ -479,22 +535,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             view_active = True
         view_nerd_font = config.view_nerd_font or False
-        if jira_dir is None:
-            print(
-                "error: missing required configuration: jira_dir. "
-                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
-                file=sys.stderr,
-            )
-            return 2
         try:
             if args.components:
-                print(format_components(Path(str(jira_dir))), end="")
+                print(format_components(jira_dir), end="")
             elif args.key:
                 mode = "diff" if args.diff else "original" if args.original else "shadow"
                 if args.read_only:
                     print(
                         format_work_item(
-                            Path(str(jira_dir)),
+                            jira_dir,
                             args.key,
                             component_field=str(component_field) if component_field else None,
                             mode=mode,
@@ -502,11 +551,13 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 else:
                     open_interactive_view(
-                        Path(str(jira_dir)),
+                        jira_dir,
                         component_field=str(component_field) if component_field else None,
-                        component=str(view_component) if view_component else None,
-                        fix_version=str(view_fix_version) if view_fix_version else None,
-                        assignee=str(view_assignee) if view_assignee else None,
+                        project_filter=view_project,
+                        status_filter=view_status,
+                        component=view_component,
+                        fix_version=view_fix_version,
+                        assignee=view_assignee,
                         board=str(view_board) if view_board else None,
                         board_scope=str(view_board_scope) if view_board_scope else None,
                         pattern=str(view_filter) if view_filter else None,
@@ -517,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
                         initial_key=args.key,
                         initial_mode=mode,
                         swimlane=str(view_swimlane),
-                        project=str(config.project) if config.project else None,
+                        project=default_project,
                         versions_filter=str(config.versions_filter) if config.versions_filter else None,
                         preview_lines=config.view_preview_lines,
                         hide_done_after_days=config.view_hide_done_after_days,
@@ -530,11 +581,13 @@ def main(argv: list[str] | None = None) -> int:
                     print("error: --diff and --original require a work item key", file=sys.stderr)
                     return 2
                 open_interactive_view(
-                    Path(str(jira_dir)),
+                    jira_dir,
                     component_field=str(component_field) if component_field else None,
-                    component=str(view_component) if view_component else None,
-                    fix_version=str(view_fix_version) if view_fix_version else None,
-                    assignee=str(view_assignee) if view_assignee else None,
+                    project_filter=view_project,
+                    status_filter=view_status,
+                    component=view_component,
+                    fix_version=view_fix_version,
+                    assignee=view_assignee,
                     board=str(view_board) if view_board else None,
                     board_scope=str(view_board_scope) if view_board_scope else None,
                     pattern=str(view_filter) if view_filter else None,
@@ -543,7 +596,7 @@ def main(argv: list[str] | None = None) -> int:
                     jira_email=str(config.jira_email) if config.jira_email else None,
                     jira_api_token=str(config.jira_api_token) if config.jira_api_token else None,
                     swimlane=str(view_swimlane),
-                    project=str(config.project) if config.project else None,
+                    project=default_project,
                     versions_filter=str(config.versions_filter) if config.versions_filter else None,
                     preview_lines=config.view_preview_lines,
                     hide_done_after_days=config.view_hide_done_after_days,
@@ -564,24 +617,17 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 parser.print_help()
             return 0
-        jira_dir = choose(args.jira_dir, config.jira_dir)
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
         project = choose(args.project, config.project)
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
         component_field = choose(args.component_field, config.component_field) or "components"
-        if jira_dir is None:
-            print(
-                "error: missing required configuration: jira_dir. "
-                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
-                file=sys.stderr,
-            )
-            return 2
         issue_type = choose(args.type, config.issue_default_type)
         try:
             return run_issue(
                 args,
-                Path(str(jira_dir)),
+                jira_dir,
                 project,
                 component_field,
                 jira_url,
@@ -603,16 +649,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.shadow_command is None:
             args.help_parser.print_help()
             return 0
-        jira_dir = choose(args.jira_dir, config.jira_dir)
-        if jira_dir is None:
-            print(
-                "error: missing required configuration: jira_dir. "
-                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
-                file=sys.stderr,
-            )
-            return 2
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
         try:
-            return run_shadow(args, Path(str(jira_dir)), config)
+            return run_shadow(args, jira_dir, config)
         except MetadataError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -621,25 +660,18 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if args.command == "meta":
-        jira_dir = choose(args.jira_dir, config.jira_dir)
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
         project = choose(args.project, config.project)
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
         component_field = choose(args.component_field, config.component_field) or "components"
         versions_filter = config.versions_filter
-        if jira_dir is None:
-            print(
-                "error: missing required configuration: jira_dir. "
-                "Set it in ~/.config/jira-wb/config.toml or pass --jira-dir.",
-                file=sys.stderr,
-            )
-            return 2
         try:
             try:
                 return run_meta(
                     args,
-                    Path(str(jira_dir)),
+                    jira_dir,
                     project,
                     jira_url,
                     jira_email,
@@ -709,6 +741,8 @@ def run_issue(
 ) -> int:
     if args.issue_command == "create":
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+        if is_project_read_only(jira_dir, api_project):
+            raise IssueError(f"cannot create an issue: project {api_project} is read-only")
         summary = str(args.summary).strip()
         if not summary:
             raise MetadataError("summary must be non-empty")
@@ -786,6 +820,22 @@ def run_meta(
             config_path=config_path,
         )
 
+    if project is not None:
+        project = str(project)
+
+    mutation_commands = {
+        "version-add",
+        "version-rename",
+        "version-release",
+        "version-archive",
+        "version-delete",
+        "native-component-add",
+        "component-field-add",
+    }
+    if args.meta_command in mutation_commands and project is not None and is_project_read_only(jira_dir, project):
+        print(f"error: cannot modify metadata: project {project} is read-only", file=sys.stderr)
+        return 2
+
     if args.meta_command == "refresh":
         refresh_versions_requested = args.versions or not (args.components or args.boards)
         if refresh_versions_requested:
@@ -808,7 +858,11 @@ def run_meta(
 
     if args.meta_command == "versions":
         if args.cached:
-            cache = load_versions(jira_dir)
+            if project is not None:
+                cache = load_versions(jira_dir, project)
+            else:
+                merged = load_all_versions(jira_dir)
+                cache = {"versions": merged} if merged else None
         else:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_versions_api(jira_dir, api_project, client)
@@ -855,7 +909,11 @@ def run_meta(
 
     if args.meta_command == "boards":
         if args.cached:
-            cache = load_boards(jira_dir)
+            if project is not None:
+                cache = load_boards(jira_dir, project)
+            else:
+                merged = load_all_boards(jira_dir)
+                cache = {"boards": merged} if merged else None
         else:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))
@@ -926,7 +984,13 @@ def run_meta(
         return 2
 
     if args.meta_command == "native-components":
-        cache = load_components(jira_dir) if args.cached else None
+        cache = None
+        if args.cached:
+            if project is not None:
+                cache = load_components(jira_dir, project)
+            else:
+                merged = load_all_components(jira_dir)
+                cache = {"components": merged} if merged else None
         if cache is None and not args.cached:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_components_api(jira_dir, api_project, client)
@@ -1002,9 +1066,14 @@ def meta_versions_output(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> str:
-    cache = load_versions(jira_dir)
-    if cache is not None:
-        return format_versions(cache)
+    if project is None:
+        merged = load_all_versions(jira_dir)
+        if merged:
+            return format_versions({"versions": merged})
+    else:
+        cache = load_versions(jira_dir, str(project))
+        if cache is not None:
+            return format_versions(cache)
     if project is not None and jira_url is not None and jira_email is not None and jira_api_token is not None:
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
         return format_versions(refresh_versions_api(jira_dir, api_project, client))
@@ -1031,9 +1100,14 @@ def meta_components_output(
     summary = load_component_summary(jira_dir)
     if summary:
         return format_meta_components(summary)
-    cache = load_components(jira_dir)
-    if cache is not None:
-        return format_component_cache(cache)
+    if project is None:
+        merged = load_all_components(jira_dir)
+        if merged:
+            return format_component_cache({"components": merged})
+    else:
+        cache = load_components(jira_dir, str(project))
+        if cache is not None:
+            return format_component_cache(cache)
     if project is not None and jira_url is not None and jira_email is not None and jira_api_token is not None:
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
         return format_component_cache(refresh_components_api(jira_dir, api_project, client))
@@ -1052,8 +1126,10 @@ def meta_component_field_options_output(
 ) -> str:
     if component_field is None:
         raise MetadataError("component_field is required to list custom component field options")
+    if project is None:
+        raise MetadataError(f"no cached options found for {component_field}")
     field_id = str(component_field)
-    cache = load_component_field_options(jira_dir, field_id)
+    cache = load_component_field_options(jira_dir, str(project), field_id)
     if cache is None and not cached:
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
         cache = refresh_component_field_options_api(jira_dir, api_project, field_id, client)
@@ -1186,9 +1262,11 @@ def load_meta_versions(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> list[dict[str, object]]:
-    cache = load_versions(jira_dir)
+    if project is None:
+        raise MetadataError("no cached versions found and live metadata access is not configured")
+    cache = load_versions(jira_dir, str(project))
     if cache is None:
-        if project is None or jira_url is None or jira_email is None or jira_api_token is None:
+        if jira_url is None or jira_email is None or jira_api_token is None:
             raise MetadataError("no cached versions found and live metadata access is not configured")
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
         cache = refresh_versions_api(jira_dir, api_project, client)
@@ -1203,9 +1281,11 @@ def load_meta_boards(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> list[dict[str, object]]:
-    cache = load_boards(jira_dir)
+    if project is None:
+        raise MetadataError("no cached boards found and live metadata access is not configured")
+    cache = load_boards(jira_dir, str(project))
     if cache is None:
-        if project is None or jira_url is None or jira_email is None or jira_api_token is None:
+        if jira_url is None or jira_email is None or jira_api_token is None:
             raise MetadataError("no cached boards found and live metadata access is not configured")
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
         cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))

@@ -5,12 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from .jql import compile_jql
-from .sync import read_json, utc_now, write_json
+from .config import ProjectSettings
+from .jql import compile_jql, scope_predicate_to_project
+from .sync import FALLBACK_DONE_STATUS_NAMES, read_json, utc_now, write_json
 
 
 DEFAULT_METADATA_TTL_SECONDS = 3600
-DONE_STATUSES = {"close", "closed", "done", "resolved"}
 
 
 @dataclass(frozen=True)
@@ -171,24 +171,32 @@ def format_doctor_checks(checks: list[DoctorCheck]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def versions_path(jira_dir: Path) -> Path:
-    return jira_dir / "meta" / "versions.json"
+def versions_path(jira_dir: Path, project: str) -> Path:
+    return jira_dir / "meta" / project / "versions.json"
 
 
-def components_path(jira_dir: Path) -> Path:
-    return jira_dir / "meta" / "components.json"
+def components_path(jira_dir: Path, project: str) -> Path:
+    return jira_dir / "meta" / project / "components.json"
 
 
-def boards_path(jira_dir: Path) -> Path:
-    return jira_dir / "meta" / "boards.json"
+def boards_path(jira_dir: Path, project: str) -> Path:
+    return jira_dir / "meta" / project / "boards.json"
 
 
-def component_field_options_path(jira_dir: Path, field_id: str) -> Path:
-    return jira_dir / "meta" / f"{field_id}-options.json"
+def component_field_options_path(jira_dir: Path, project: str, field_id: str) -> Path:
+    return jira_dir / "meta" / project / f"{field_id}-options.json"
 
 
 def field_names_path(jira_dir: Path) -> Path:
     return jira_dir / "meta" / "field-names.json"
+
+
+def project_registry_path(jira_dir: Path) -> Path:
+    return jira_dir / "meta" / "projects.json"
+
+
+def board_settings_path(jira_dir: Path) -> Path:
+    return jira_dir / "meta" / "board_settings.json"
 
 
 def manifest_path(jira_dir: Path) -> Path:
@@ -252,36 +260,111 @@ def sort_components(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(components, key=lambda component: component_name(component).lower())
 
 
-def load_versions(jira_dir: Path) -> dict[str, Any] | None:
-    path = versions_path(jira_dir)
+def load_versions(jira_dir: Path, project: str) -> dict[str, Any] | None:
+    path = versions_path(jira_dir, project)
     if not path.exists():
         return None
     value = read_json(path)
     return value if isinstance(value, dict) else None
 
 
-def load_components(jira_dir: Path) -> dict[str, Any] | None:
-    path = components_path(jira_dir)
+def load_components(jira_dir: Path, project: str) -> dict[str, Any] | None:
+    path = components_path(jira_dir, project)
     if not path.exists():
         return None
     value = read_json(path)
     return value if isinstance(value, dict) else None
 
 
-def load_boards(jira_dir: Path) -> dict[str, Any] | None:
-    path = boards_path(jira_dir)
+def load_boards(jira_dir: Path, project: str) -> dict[str, Any] | None:
+    path = boards_path(jira_dir, project)
     if not path.exists():
         return None
     value = read_json(path)
     return value if isinstance(value, dict) else None
 
 
-def load_component_field_options(jira_dir: Path, field_id: str) -> dict[str, Any] | None:
-    path = component_field_options_path(jira_dir, field_id)
+def load_component_field_options(jira_dir: Path, project: str, field_id: str) -> dict[str, Any] | None:
+    path = component_field_options_path(jira_dir, project, field_id)
     if not path.exists():
         return None
     value = read_json(path)
     return value if isinstance(value, dict) else None
+
+
+def load_all_versions(jira_dir: Path) -> list[dict[str, Any]]:
+    """Every synced project's cached versions, merged and deduped by id.
+
+    Version ids are unique across a whole Jira instance, not scoped per
+    project, so merging them all together is always safe/correct -- this is
+    what lets view.py's per-item lookups (fix-version name resolution, the
+    version picker) stay project-agnostic even though the caches themselves
+    are now namespaced per project.
+    """
+    meta_dir = jira_dir / "meta"
+    if not meta_dir.is_dir():
+        return []
+    merged: dict[str, dict[str, Any]] = {}
+    unidentified: list[dict[str, Any]] = []
+    for project_dir in sorted(meta_dir.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        cache = load_versions(jira_dir, project_dir.name)
+        if cache is None:
+            continue
+        for version in normalize_versions(cache.get("versions")):
+            version_id = version.get("id")
+            if isinstance(version_id, str) and version_id:
+                merged[version_id] = version
+            else:
+                # No id to dedupe by (shouldn't happen for real Jira data,
+                # but test fixtures and hand-authored caches sometimes omit
+                # it) -- still include it rather than silently dropping it.
+                unidentified.append(version)
+    return sort_versions([*merged.values(), *unidentified])
+
+
+def load_all_components(jira_dir: Path) -> list[dict[str, Any]]:
+    """Every synced project's cached native components, merged.
+
+    Unlike versions/boards, components have no globally-unique id to dedupe
+    by, so this reuses merge_components' existing name-based merge instead.
+    """
+    meta_dir = jira_dir / "meta"
+    if not meta_dir.is_dir():
+        return []
+    sources: list[list[dict[str, Any]]] = []
+    for project_dir in sorted(meta_dir.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        cache = load_components(jira_dir, project_dir.name)
+        if cache is not None:
+            sources.append(normalize_components(cache.get("components")))
+    return merge_components(*sources) if sources else []
+
+
+def load_all_boards(jira_dir: Path) -> list[dict[str, Any]]:
+    """Every synced project's cached boards, merged and deduped by id (see
+    load_all_versions -- board ids are likewise instance-wide, not
+    per-project)."""
+    meta_dir = jira_dir / "meta"
+    if not meta_dir.is_dir():
+        return []
+    merged: dict[object, dict[str, Any]] = {}
+    unidentified: list[dict[str, Any]] = []
+    for project_dir in sorted(meta_dir.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        cache = load_boards(jira_dir, project_dir.name)
+        if cache is None:
+            continue
+        for board in normalize_boards(cache.get("boards")):
+            board_id = board.get("id")
+            if board_id is not None:
+                merged[board_id] = board
+            else:
+                unidentified.append(board)
+    return [*merged.values(), *unidentified]
 
 
 def load_field_names(jira_dir: Path) -> dict[str, str]:
@@ -307,6 +390,186 @@ def remember_field_names(jira_dir: Path, names: dict[str, str]) -> None:
     write_json(field_names_path(jira_dir), {"names": existing})
 
 
+def write_project_registry(jira_dir: Path, projects: tuple[ProjectSettings, ...]) -> None:
+    """Snapshot the config's [[projects]] declarations (default/read-only)
+    into jira_dir itself. Unlike every other meta/*.json cache, this isn't
+    data fetched from Jira -- it's local config, mirrored here so shadow.py
+    can enforce read-only status from just a jira_dir, the one thing it
+    already has at every call site, instead of threading a new parameter
+    through every set_field/push_key caller across the CLI and TUI."""
+    write_json(
+        project_registry_path(jira_dir),
+        {"projects": {p.key: {"readOnly": p.read_only, "default": p.default} for p in projects}},
+    )
+
+
+def load_project_registry(jira_dir: Path) -> dict[str, dict[str, bool]]:
+    # Missing/malformed -> {} (fully permissive -- nothing read-only, same
+    # as a jira_dir synced before this feature existed, or one that's never
+    # had `jira-wb sync` write this file yet).
+    path = project_registry_path(jira_dir)
+    if not path.exists():
+        return {}
+    value = read_json(path)
+    projects = value.get("projects") if isinstance(value, dict) else None
+    if not isinstance(projects, dict):
+        return {}
+    result: dict[str, dict[str, bool]] = {}
+    for key, entry in projects.items():
+        if isinstance(key, str) and isinstance(entry, dict):
+            result[key] = {
+                "readOnly": bool(entry.get("readOnly")),
+                "default": bool(entry.get("default")),
+            }
+    return result
+
+
+def is_project_read_only(jira_dir: Path, project_key: str | None) -> bool:
+    if not project_key:
+        return False
+    return bool(load_project_registry(jira_dir).get(project_key, {}).get("readOnly"))
+
+
+def load_board_settings(jira_dir: Path) -> dict[str, Any]:
+    """Local, user-owned board data -- bespoke "local" board definitions
+    (name/fieldFilters/pattern, matched the same way filter_items matches
+    any other item, no JQL involved) plus which Jira board ids the user has
+    toggled off in the picker. Unlike every other meta/*.json cache, none of
+    this is fetched from Jira -- it's never touched by a sync/refresh."""
+    path = board_settings_path(jira_dir)
+    default: dict[str, Any] = {"localBoards": [], "disabledBoardIds": []}
+    if not path.exists():
+        return default
+    value = read_json(path)
+    if not isinstance(value, dict):
+        return default
+    local_boards = value.get("localBoards")
+    disabled_ids = value.get("disabledBoardIds")
+    return {
+        "localBoards": [board for board in local_boards if isinstance(board, dict)]
+        if isinstance(local_boards, list)
+        else [],
+        "disabledBoardIds": [str(item) for item in disabled_ids if isinstance(item, (str, int))]
+        if isinstance(disabled_ids, list)
+        else [],
+    }
+
+
+def write_board_settings(jira_dir: Path, settings: dict[str, Any]) -> None:
+    write_json(board_settings_path(jira_dir), settings)
+
+
+def _all_board_names(jira_dir: Path, settings: dict[str, Any]) -> set[str]:
+    names = {str(board.get("name") or "").strip().lower() for board in load_all_boards(jira_dir)}
+    names.update(str(board.get("name") or "").strip().lower() for board in settings["localBoards"])
+    names.discard("")
+    return names
+
+
+def add_local_board(
+    jira_dir: Path,
+    name: str,
+    field_filters: dict[str, list[str]],
+    pattern: str | None = None,
+    active_filter: dict[str, Any] | None = None,
+) -> None:
+    clean_name = name.strip()
+    if not clean_name:
+        raise MetadataError("board name must be non-empty")
+    settings = load_board_settings(jira_dir)
+    if clean_name.lower() in _all_board_names(jira_dir, settings):
+        raise MetadataError(f"a board named {clean_name} already exists")
+    settings["localBoards"].append(
+        {
+            "name": clean_name,
+            "active": True,
+            "fieldFilters": dict(field_filters),
+            "pattern": pattern,
+            "activeFilter": active_filter,
+        }
+    )
+    write_board_settings(jira_dir, settings)
+
+
+def rename_local_board(jira_dir: Path, name: str, new_name: str) -> None:
+    clean_new = new_name.strip()
+    if not clean_new:
+        raise MetadataError("board name must be non-empty")
+    settings = load_board_settings(jira_dir)
+    board = next((b for b in settings["localBoards"] if b.get("name") == name), None)
+    if board is None:
+        raise MetadataError(f"local board {name} not found")
+    if clean_new.lower() != name.strip().lower() and clean_new.lower() in _all_board_names(jira_dir, settings):
+        raise MetadataError(f"a board named {clean_new} already exists")
+    board["name"] = clean_new
+    write_board_settings(jira_dir, settings)
+
+
+def set_local_board_filters(
+    jira_dir: Path,
+    name: str,
+    field_filters: dict[str, list[str]],
+    pattern: str | None,
+    active_filter: dict[str, Any] | None = None,
+) -> None:
+    settings = load_board_settings(jira_dir)
+    board = next((b for b in settings["localBoards"] if b.get("name") == name), None)
+    if board is None:
+        raise MetadataError(f"local board {name} not found")
+    board["fieldFilters"] = dict(field_filters)
+    board["pattern"] = pattern
+    board["activeFilter"] = active_filter
+    write_board_settings(jira_dir, settings)
+
+
+def delete_local_board(jira_dir: Path, name: str) -> None:
+    settings = load_board_settings(jira_dir)
+    remaining = [b for b in settings["localBoards"] if b.get("name") != name]
+    if len(remaining) == len(settings["localBoards"]):
+        raise MetadataError(f"local board {name} not found")
+    settings["localBoards"] = remaining
+    write_board_settings(jira_dir, settings)
+
+
+def set_board_active(jira_dir: Path, kind: str, identifier: str, active: bool) -> None:
+    """Toggle the local, purely-cosmetic "shown in the board picker" switch
+    -- identifier is a board id for kind="jira" (stable across renames) or
+    a board name for kind="local" (which has no separate id). Never affects
+    matching for a board that's already selected -- only the Filters
+    screen's picker options are filtered by this."""
+    identifier = str(identifier)
+    settings = load_board_settings(jira_dir)
+    if kind == "local":
+        board = next((b for b in settings["localBoards"] if b.get("name") == identifier), None)
+        if board is None:
+            raise MetadataError(f"local board {identifier} not found")
+        board["active"] = active
+    else:
+        disabled = set(settings["disabledBoardIds"])
+        if active:
+            disabled.discard(identifier)
+        else:
+            disabled.add(identifier)
+        settings["disabledBoardIds"] = sorted(disabled)
+    write_board_settings(jira_dir, settings)
+
+
+def load_all_boards_with_settings(jira_dir: Path) -> list[dict[str, Any]]:
+    """Every synced project's Jira boards (see load_all_boards) plus every
+    locally-defined board, tagged with kind ("jira"/"local") and active (a
+    purely local on/off switch -- independent of whether the board's own
+    filter is supported, see its unsupportedReason). This is the one list
+    both the Meta > Boards screen and the Filters picker consume."""
+    settings = load_board_settings(jira_dir)
+    disabled_ids = set(settings["disabledBoardIds"])
+    jira_boards = [
+        {**board, "kind": "jira", "active": str(board.get("id")) not in disabled_ids}
+        for board in load_all_boards(jira_dir)
+    ]
+    local_boards = [{**board, "kind": "local"} for board in settings["localBoards"]]
+    return [*jira_boards, *local_boards]
+
+
 def refresh_versions_api(
     jira_dir: Path,
     project: str,
@@ -321,7 +584,7 @@ def refresh_versions_api(
         "fetchedAt": utc_now(),
         "versions": sort_versions(normalize_versions(versions)),
     }
-    write_json(versions_path(jira_dir), cache)
+    write_json(versions_path(jira_dir, project), cache)
     return cache
 
 
@@ -331,7 +594,7 @@ def cache_versions(jira_dir: Path, project: str, versions: list[dict[str, Any]])
         "fetchedAt": utc_now(),
         "versions": sort_versions(versions),
     }
-    write_json(versions_path(jira_dir), cache)
+    write_json(versions_path(jira_dir, project), cache)
     return cache
 
 
@@ -349,7 +612,7 @@ def refresh_components_api(
         "fetchedAt": utc_now(),
         "components": sort_components(normalize_components(components)),
     }
-    write_json(components_path(jira_dir), cache)
+    write_json(components_path(jira_dir, project), cache)
     return cache
 
 
@@ -438,6 +701,13 @@ def refresh_boards_api(
                 reason = "board has no filter JQL"
             else:
                 predicate, reason = compile_jql(jql, component_field_names=component_field_names)
+                if predicate is not None:
+                    # A board only ever shows issues from its own project,
+                    # even when its saved filter doesn't literally say so
+                    # (that's real Jira behavior, not a JQL quirk) -- so an
+                    # unscoped filter is implicitly AND-ed with this board's
+                    # own project rather than matching every project.
+                    predicate = scope_predicate_to_project(predicate, project)
 
         backlog_keys: list[str] | None = None
         if board_type != "scrum":
@@ -459,7 +729,7 @@ def refresh_boards_api(
         )
 
     cache = {"project": project, "fetchedAt": utc_now(), "boards": boards}
-    write_json(boards_path(jira_dir), cache)
+    write_json(boards_path(jira_dir, project), cache)
     return cache
 
 
@@ -515,7 +785,7 @@ def refresh_component_field_options_api(
         "fetchedAt": utc_now(),
         "options": component_field_options_from_createmeta(metadata, field_id),
     }
-    write_json(component_field_options_path(jira_dir, field_id), cache)
+    write_json(component_field_options_path(jira_dir, project, field_id), cache)
     return cache
 
 
@@ -747,7 +1017,7 @@ def ensure_versions(
     *,
     max_age_seconds: int = DEFAULT_METADATA_TTL_SECONDS,
 ) -> MetadataResult:
-    cache = load_versions(jira_dir)
+    cache = load_versions(jira_dir, project)
     if cache is not None and cache_is_fresh(cache, project, max_age_seconds):
         return MetadataResult(cache=cache, refreshed=False)
     try:
@@ -841,8 +1111,13 @@ def load_component_summary(jira_dir: Path) -> list[dict[str, Any]]:
             continue
         counts = by_component.setdefault(component.lower(), {"active": 0, "total": 0})
         counts["total"] += 1
-        status = str(item.get("status") or "").strip().lower()
-        if status not in DONE_STATUSES:
+        category = item.get("statusCategory")
+        is_done = (
+            category == "done"
+            if isinstance(category, str)
+            else str(item.get("status") or "").strip().lower() in FALLBACK_DONE_STATUS_NAMES
+        )
+        if not is_done:
             counts["active"] += 1
     enriched = []
     for component in summaries:

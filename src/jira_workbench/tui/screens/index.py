@@ -19,6 +19,7 @@ from ...metadata import MetadataError
 from ...sync import issue_key_sort_key
 from ...view import (
     VIRTUAL_NONE,
+    assignee_first_name_map,
     cycle_swimlane,
     dev_status_indicator,
     display_component,
@@ -47,6 +48,17 @@ from ..widgets.tables import ClickableRowDataTable
 from .filters import FILTER_FIELDS
 
 LANE_ROW_PREFIX = "__lane__::"
+
+
+def _seed_values(value: str | tuple[str, ...] | None) -> list[str]:
+    """Normalize a constructor filter-seed value (a bare string from a CLI
+    flag, or a tuple from a multi-value config entry) into a field_filters
+    list -- unset/empty stays unset, matching every other field's semantics."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
 
 COLUMNS = ("", "Key", "State", "Component", "Summary", "Priority", "Assignee", "Version", "Dev")
 # Priority now shows an icon rather than text (see _add_item_row) -- keeping the
@@ -87,9 +99,11 @@ class IndexScreen(Screen[None]):
     def __init__(
         self,
         *,
-        component: str | None = None,
-        fix_version: str | None = None,
-        assignee: str | None = None,
+        project: str | tuple[str, ...] | None = None,
+        status: str | tuple[str, ...] | None = None,
+        component: str | tuple[str, ...] | None = None,
+        fix_version: str | tuple[str, ...] | None = None,
+        assignee: str | tuple[str, ...] | None = None,
         board: str | None = None,
         board_scope: str | None = None,
         pattern: str | None = None,
@@ -98,13 +112,17 @@ class IndexScreen(Screen[None]):
     ) -> None:
         super().__init__()
         self.items: list[dict[str, Any]] = []
-        self.field_filters: dict[str, str] = {}
-        if component:
-            self.field_filters["component"] = component
-        if fix_version:
-            self.field_filters["fixVersion"] = fix_version
-        if assignee:
-            self.field_filters["assignee"] = assignee
+        self.field_filters: dict[str, list[str]] = {}
+        for key, value in (
+            ("project", project),
+            ("status", status),
+            ("component", component),
+            ("fixVersion", fix_version),
+            ("assignee", assignee),
+        ):
+            values = _seed_values(value)
+            if values:
+                self.field_filters[key] = values
         self.current_filter = pattern
         self.active_only = active
         self.modified_only = False
@@ -204,6 +222,7 @@ class IndexScreen(Screen[None]):
         self._row_keys = []
         modified_keys = modified_issue_keys(self.app.jira_dir)
         visible = self._visible_items()
+        assignee_names = assignee_first_name_map([display_name(item.get("assignee")) for item in visible])
         lane_counts = (
             Counter(self._lane_identity(item) for item in visible) if self.current_swimlane != "none" else Counter()
         )
@@ -228,6 +247,7 @@ class IndexScreen(Screen[None]):
                         lane_key,
                         modified_keys,
                         seen_item_keys,
+                        assignee_names,
                         collapsed=current_lane_collapsed,
                         count=lane_counts[lane_key],
                     )
@@ -242,7 +262,7 @@ class IndexScreen(Screen[None]):
             # Every non-epic-head row is indented under its lane in epic
             # mode -- including the "(none)" lane, for visual consistency.
             indent = self.current_swimlane == "epic" and not is_epic_lane_head
-            self._add_item_row(table, item, modified_keys, bold=is_epic_lane_head, indent=indent)
+            self._add_item_row(table, item, modified_keys, assignee_names, bold=is_epic_lane_head, indent=indent)
         self._select_key(previous_key)
         self._update_subtitle(len(visible))
 
@@ -253,6 +273,7 @@ class IndexScreen(Screen[None]):
         lane_key: str,
         modified_keys: set[str],
         seen_item_keys: set[str],
+        assignee_names: dict[str, str],
         *,
         collapsed: bool,
         count: int,
@@ -271,17 +292,23 @@ class IndexScreen(Screen[None]):
             )
             if "summary" in epic_item:
                 seen_item_keys.add(lane_key)
-                self._add_item_row(table, epic_item, modified_keys, bold=True, indent=False)
+                self._add_item_row(table, epic_item, modified_keys, assignee_names, bold=True, indent=False)
                 return
         lane_text = swimlane_label(item, self.current_swimlane) or VIRTUAL_NONE
         arrow = "▶" if collapsed else "▼"
         label = f"{arrow} {lane_text}  ({count})" if collapsed else f"{arrow} {lane_text}"
         table.add_row(
             "",
+            "",
+            "",
+            "",
+            # Summary, not Key -- an epic-swimlane label is the epic's own
+            # summary text (can run 100+ chars), and Key has no fixed width
+            # (it auto-sizes to content, and a DataTable column never
+            # shrinks back down once widened). Summary already needs to be
+            # wide for real issue summaries, so growing it a bit further is
+            # far less jarring than blowing out the narrow Key column.
             Text(label, style="bold"),
-            "",
-            "",
-            "",
             "",
             "",
             "",
@@ -290,7 +317,14 @@ class IndexScreen(Screen[None]):
         )
 
     def _add_item_row(
-        self, table: DataTable, item: dict[str, Any], modified_keys: set[str], *, bold: bool, indent: bool
+        self,
+        table: DataTable,
+        item: dict[str, Any],
+        modified_keys: set[str],
+        assignee_names: dict[str, str],
+        *,
+        bold: bool,
+        indent: bool,
     ) -> None:
         key_value = display_name(item.get("key"))
         display_key = f"{key_value}*" if key_value in modified_keys else key_value
@@ -330,7 +364,7 @@ class IndexScreen(Screen[None]):
             render_pills(pill_values(display_component(item.get("component")))),
             cell(display_name(item.get("summary"))),
             priority_cell,
-            cell(display_name(item.get("assignee"))),
+            cell(assignee_names.get(display_name(item.get("assignee")), display_name(item.get("assignee")))),
             render_pills(pill_values(item.get("fixVersion"))),
             dev_cell,
             key=key_value,
@@ -342,9 +376,9 @@ class IndexScreen(Screen[None]):
         for spec in FILTER_FIELDS:
             if spec.kind != "choice":
                 continue
-            value = self.field_filters.get(spec.key)
-            if value:
-                parts.append(f"{spec.key}={value}")
+            values = self.field_filters.get(spec.key)
+            if values:
+                parts.append(f"{spec.key}={','.join(values)}")
         if self.current_filter:
             parts.append(f"filter={self.current_filter}")
         if self.modified_only:
@@ -474,9 +508,11 @@ class IndexScreen(Screen[None]):
             save_view_defaults(
                 self.app.config_path,
                 {
-                    "component": self.field_filters.get("component"),
-                    "fix_version": self.field_filters.get("fixVersion"),
-                    "assignee": self.field_filters.get("assignee"),
+                    "project": self.field_filters.get("project", []),
+                    "status": self.field_filters.get("status", []),
+                    "component": self.field_filters.get("component", []),
+                    "fix_version": self.field_filters.get("fixVersion", []),
+                    "assignee": self.field_filters.get("assignee", []),
                     "board": self.board,
                     "board_scope": self.board_scope,
                     "filter": self.current_filter,
@@ -540,7 +576,11 @@ class IndexScreen(Screen[None]):
     async def action_filters(self) -> None:
         from .filters import FiltersScreen
 
-        boards = [board["name"] for board in load_cached_boards(self.app.jira_dir) if board.get("name")]
+        boards = [
+            board["name"]
+            for board in load_cached_boards(self.app.jira_dir)
+            if board.get("name") and board.get("active", True)
+        ]
         result = await self.app.push_screen_wait(
             FiltersScreen(
                 self.items,
@@ -569,6 +609,9 @@ class IndexScreen(Screen[None]):
         project = self.app.project
         if not project:
             self.notify("cannot create: no project configured", severity="warning")
+            return
+        if self.app.is_project_read_only(project):
+            self.notify(f"cannot create: project {project} is read-only", severity="warning")
             return
         try:
             client = self.app.get_api_client()
@@ -736,7 +779,7 @@ class IndexScreen(Screen[None]):
     def action_open_meta(self) -> None:
         from .meta import MetaScreen
 
-        self.app.push_screen(MetaScreen(standalone=False), callback=self._on_meta_closed)
+        self.app.push_screen(MetaScreen(standalone=False, items=self.items), callback=self._on_meta_closed)
 
     def _on_meta_closed(self, _result: None) -> None:
         # Most Meta actions (versions, boards) don't touch item-level data,

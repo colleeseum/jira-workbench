@@ -80,6 +80,23 @@ def synced_jira_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_app_is_project_read_only_reflects_the_registry_written_at_sync(tmp_path: Path) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    write_project_registry(
+        tmp_path,
+        (ProjectSettings(key="SAT", default=True), ProjectSettings(key="OTHERPROJ", read_only=True)),
+    )
+
+    app = JiraWorkbenchApp(tmp_path, component_field="customfield_10071")
+
+    assert app.is_project_read_only("OTHERPROJ") is True
+    assert app.is_project_read_only("SAT") is False
+    assert app.is_project_read_only(None) is False
+    assert app.is_project_read_only("UNKNOWN") is False
+
+
 @pytest.mark.asyncio
 async def test_index_screen_lists_synced_items(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
@@ -91,6 +108,39 @@ async def test_index_screen_lists_synced_items(tmp_path: Path) -> None:
         table = screen.query_one(DataTable)
         assert table.row_count == 2
         assert screen._row_keys == ["SAT-1", "SAT-2"]
+
+
+def _write_assignee_test_item(tmp_path: Path, key: str, assignee_name: str | None) -> None:
+    fields: dict[str, Any] = {"summary": key, "issuetype": {"name": "Task"}, "status": {"name": "To Do"}}
+    if assignee_name is not None:
+        fields["assignee"] = {"displayName": assignee_name}
+    write_json(tmp_path / f"components/_unassigned/{key}/issue.json", {"key": key, "fields": fields})
+
+
+@pytest.mark.asyncio
+async def test_index_screen_shows_first_name_only_when_assignee_first_names_are_unique(tmp_path: Path) -> None:
+    _write_assignee_test_item(tmp_path, "SAT-1", "Alex Epic")
+    _write_assignee_test_item(tmp_path, "SAT-2", "Jordan Chen")
+    build_manifest(tmp_path)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    async with app.run_test():
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("SAT-1", "Assignee")) == "Alex"
+        assert str(table.get_cell("SAT-2", "Assignee")) == "Jordan"
+
+
+@pytest.mark.asyncio
+async def test_index_screen_shows_full_name_when_assignee_first_names_collide(tmp_path: Path) -> None:
+    _write_assignee_test_item(tmp_path, "SAT-1", "Alex Smith")
+    _write_assignee_test_item(tmp_path, "SAT-2", "Alex Jones")
+    build_manifest(tmp_path)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    async with app.run_test():
+        table = app.screen.query_one(DataTable)
+        assert str(table.get_cell("SAT-1", "Assignee")) == "Alex Smith"
+        assert str(table.get_cell("SAT-2", "Assignee")) == "Alex Jones"
 
 
 @pytest.mark.asyncio
@@ -291,6 +341,39 @@ async def test_detail_screen_survives_dev_status_fetch_failure(tmp_path: Path) -
         assert dev_widget.display is False
 
 
+@pytest.mark.asyncio
+async def test_detail_screen_blocks_field_edits_but_allows_comments_for_a_read_only_project(
+    tmp_path: Path,
+) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    jira_dir = synced_jira_dir(tmp_path)
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    client = DevStatusClient()
+    app = _app_with_client(jira_dir, client)
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+        table = app.screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("priority"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, DetailScreen)  # blocked, no editor opened
+        assert load_shadow(jira_dir, "SAT-1") is None
+
+        table.move_cursor(row=table.get_row_index("comments"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        from jira_workbench.tui.screens.comments import CommentsScreen
+
+        assert isinstance(app.screen, CommentsScreen)
+
+
 CUSTOM_LABELS_FIELD_EDITMETA = {
     "fields": {
         "duedate": {"name": "Due date", "schema": {"type": "date"}},
@@ -416,7 +499,7 @@ async def test_detail_screen_renders_labels_fix_versions_and_components_as_pills
 async def test_detail_screen_fix_version_pill_shows_current_name_not_stale_embedded_one(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     _set_issue_fields(jira_dir, "SAT-1", {"fixVersions": [{"id": "10000", "name": "helm-chart-sa 3.4.4"}]})
-    write_json(jira_dir / "meta/versions.json", {"versions": [{"id": "10000", "name": "helm-chart-sa 3.5.0"}]})
+    write_json(jira_dir / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "helm-chart-sa 3.5.0"}]})
     app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
 
     async with app.run_test() as pilot:
@@ -1152,7 +1235,7 @@ async def test_toggle_lane_collapses_and_expands_component_swimlane(tmp_path: Pa
         await pilot.pause()
 
         assert table.row_count == 3  # helm-chart's 2 items now hidden, terraform lane untouched
-        assert str(table.get_cell("__lane__::helm-chart", "Key")) == "▶ helm-chart  (2)"
+        assert str(table.get_cell("__lane__::helm-chart", "Summary")) == "▶ helm-chart  (2)"
         # cursor stays on the collapsed lane's own header row
         row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
         assert row_key.value == "__lane__::helm-chart"
@@ -1160,7 +1243,7 @@ async def test_toggle_lane_collapses_and_expands_component_swimlane(tmp_path: Pa
         await pilot.press("z")
         await pilot.pause()
         assert table.row_count == 5
-        assert str(table.get_cell("__lane__::helm-chart", "Key")) == "▼ helm-chart"
+        assert str(table.get_cell("__lane__::helm-chart", "Summary")) == "▼ helm-chart"
 
 
 @pytest.mark.asyncio
@@ -1181,7 +1264,7 @@ async def test_toggle_lane_from_an_item_row_collapses_its_own_lane(tmp_path: Pat
         await pilot.pause()
 
         assert table.row_count == 3
-        assert str(table.get_cell("__lane__::helm-chart", "Key")) == "▶ helm-chart  (2)"
+        assert str(table.get_cell("__lane__::helm-chart", "Summary")) == "▶ helm-chart  (2)"
 
 
 @pytest.mark.asyncio
@@ -1243,14 +1326,14 @@ async def test_toggle_all_lanes_collapses_and_expands_every_lane(tmp_path: Path)
         await pilot.pause()
 
         assert table.row_count == 2  # only the two lane headers remain
-        assert str(table.get_cell("__lane__::helm-chart", "Key")) == "▶ helm-chart  (2)"
-        assert str(table.get_cell("__lane__::terraform", "Key")) == "▶ terraform  (1)"
+        assert str(table.get_cell("__lane__::helm-chart", "Summary")) == "▶ helm-chart  (2)"
+        assert str(table.get_cell("__lane__::terraform", "Summary")) == "▶ terraform  (1)"
 
         await pilot.press("Z")
         await pilot.pause()
 
         assert table.row_count == 5
-        assert str(table.get_cell("__lane__::helm-chart", "Key")) == "▼ helm-chart"
+        assert str(table.get_cell("__lane__::helm-chart", "Summary")) == "▼ helm-chart"
 
 
 @pytest.mark.asyncio
@@ -1276,7 +1359,7 @@ async def test_toggle_all_lanes_collapses_remaining_lanes_when_one_already_colla
         await pilot.pause()
 
         assert table.row_count == 2
-        assert str(table.get_cell("__lane__::terraform", "Key")) == "▶ terraform  (1)"
+        assert str(table.get_cell("__lane__::terraform", "Summary")) == "▶ terraform  (1)"
 
 
 @pytest.mark.asyncio
@@ -1328,9 +1411,9 @@ def test_index_screen_seeds_filters_from_constructor_params() -> None:
     )
 
     assert screen.field_filters == {
-        "component": "helm-chart",
-        "fixVersion": "2026.07",
-        "assignee": "you@example.com",
+        "component": ["helm-chart"],
+        "fixVersion": ["2026.07"],
+        "assignee": ["you@example.com"],
     }
     assert screen.board == "SAT board"
     assert screen.board_scope == "active"
@@ -1356,7 +1439,7 @@ async def test_save_filter_writes_current_state_and_round_trips(tmp_path: Path) 
     async with app.run_test() as pilot:
         screen = app.screen
         assert isinstance(screen, IndexScreen)
-        screen.field_filters = {"component": "helm-chart"}
+        screen.field_filters = {"component": ["helm-chart"], "project": ["SAT"], "status": ["To Do", "In Progress"]}
         screen.board = "SAT board"
         screen.board_scope = "active"
         screen.current_filter = "prometheus"
@@ -1371,7 +1454,9 @@ async def test_save_filter_writes_current_state_and_round_trips(tmp_path: Path) 
     assert 'jira_api_token = "secret"' in text
 
     config = load_config(config_path)
-    assert config.view_component == "helm-chart"
+    assert config.view_component == ("helm-chart",)
+    assert config.view_project == ("SAT",)
+    assert config.view_status == ("To Do", "In Progress")
     assert config.view_board == "SAT board"
     assert config.view_board_scope == "active"
     assert config.view_filter == "prometheus"
@@ -1380,6 +1465,8 @@ async def test_save_filter_writes_current_state_and_round_trips(tmp_path: Path) 
     assert config.view_preview_lines == 10
 
     restored = IndexScreen(
+        project=config.view_project,
+        status=config.view_status,
         component=config.view_component,
         fix_version=config.view_fix_version,
         assignee=config.view_assignee,
@@ -1389,7 +1476,11 @@ async def test_save_filter_writes_current_state_and_round_trips(tmp_path: Path) 
         active=config.view_active,
         swimlane=config.view_swimlane,
     )
-    assert restored.field_filters == {"component": "helm-chart"}
+    assert restored.field_filters == {
+        "component": ["helm-chart"],
+        "project": ["SAT"],
+        "status": ["To Do", "In Progress"],
+    }
     assert restored.board == "SAT board"
     assert restored.board_scope == "active"
     assert restored.current_filter == "prometheus"
@@ -1556,6 +1647,27 @@ async def test_new_issue_screen_caches_createmeta_and_current_user_across_reopen
         # user instead of fetching them again.
         assert client.createmeta_calls == 1
         assert client.myself_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_new_issue_blocked_for_a_read_only_project(tmp_path: Path) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    _write_epic_test_items(tmp_path)
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+    client = FakeCreateIssueClient()
+    app = _issue_create_app(tmp_path, client)
+
+    async with app.run_test() as pilot:
+        table = app.screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-6"))
+
+        await pilot.press("c")
+        await pilot.pause()
+
+        assert isinstance(app.screen, IndexScreen)  # blocked, no create screen opened
+        assert client.createmeta_calls == 0
 
 
 @pytest.mark.asyncio
@@ -2151,6 +2263,45 @@ async def test_epic_swimlane_groups_by_epic_key_despite_stale_cached_summary(tmp
 
 
 @pytest.mark.asyncio
+async def test_epic_swimlane_lane_label_lives_in_summary_not_key(tmp_path: Path) -> None:
+    # Regression: a lane header's label used to be rendered into the Key
+    # column, which has no fixed width and never shrinks back down once a
+    # DataTable widens it -- a long epic summary would blow out the Key
+    # column for every row, real issue keys included. This happens whenever
+    # the epic itself was never independently synced (only referenced via
+    # a child's own cached parent.fields.summary, real-world-observed at
+    # 100+ chars) -- if the epic *is* locally synced, its row is a normal
+    # bold item row instead, not this lane-header label path. The label
+    # belongs in Summary, which already has to accommodate long text.
+    long_summary = "A" * 100
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "Child one",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "parent": {"key": "SAT-100", "fields": {"summary": long_summary}},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    async with app.run_test():
+        screen = app.screen
+        assert isinstance(screen, IndexScreen)
+        screen.current_swimlane = "epic"
+        screen._rebuild_table()
+
+        table = screen.query_one(DataTable)
+        lane_key = "__lane__::SAT-100"
+        assert str(table.get_cell(lane_key, "Key")) == ""
+        assert long_summary in str(table.get_cell(lane_key, "Summary"))
+
+
+@pytest.mark.asyncio
 async def test_toggle_lane_on_epic_head_hides_children_but_keeps_the_epic_row(tmp_path: Path) -> None:
     write_json(
         tmp_path / "components/helm-chart/SAT-100/issue.json",
@@ -2223,7 +2374,7 @@ async def test_epic_lane_shows_full_row_even_when_component_filter_excludes_epic
         screen = app.screen
         assert isinstance(screen, IndexScreen)
         screen.current_swimlane = "epic"
-        screen.field_filters["component"] = "helm-chart"
+        screen.field_filters["component"] = ["helm-chart"]
         screen._rebuild_table()
 
         assert "SAT-100" in screen._row_keys
@@ -2711,6 +2862,8 @@ async def test_filters_screen_component_filter_narrows_index(tmp_path: Path) -> 
         filter_input.value = "helm-chart"
         await pilot.press("enter")
         await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
 
         assert isinstance(app.screen, FiltersScreen)
         assert str(table.get_cell("component", "value")) == " helm-chart "
@@ -2718,7 +2871,7 @@ async def test_filters_screen_component_filter_narrows_index(tmp_path: Path) -> 
         await pilot.pause()
 
         assert isinstance(app.screen, IndexScreen)
-        assert index.field_filters == {"component": "helm-chart"}
+        assert index.field_filters == {"component": ["helm-chart"]}
         index_table = index.query_one(DataTable)
         assert index_table.row_count == 1
 
@@ -2746,11 +2899,76 @@ async def test_filters_screen_assignee_filter_narrows_index(tmp_path: Path) -> N
         filter_input.value = "Jane Doe"
         await pilot.press("enter")
         await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
         await pilot.press("q")
         await pilot.pause()
 
         assert isinstance(app.screen, IndexScreen)
-        assert index.field_filters == {"assignee": "Jane Doe"}
+        assert index.field_filters == {"assignee": ["Jane Doe"]}
+        index_table = index.query_one(DataTable)
+        assert index_table.row_count == 1
+        assert index_table.get_cell("SAT-2", "Key") == "SAT-2"
+
+
+@pytest.mark.asyncio
+async def test_filters_screen_status_filter_narrows_index(tmp_path: Path) -> None:
+    # Status has zero bespoke wiring beyond a FILTER_FIELDS entry, same as
+    # project/assignee -- proves the generic registry-driven design covers
+    # it too.
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-2/issue.json",
+        {
+            "key": "SAT-2",
+            "fields": {
+                "summary": "Two",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "In Progress"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    async with app.run_test() as pilot:
+        index = app.screen
+        assert isinstance(index, IndexScreen)
+        assert index.query_one(DataTable).row_count == 2
+
+        await pilot.press("f")
+        screen = app.screen
+        assert isinstance(screen, FiltersScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("status"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        filter_input = app.screen.query_one("#picker-filter", Input)
+        filter_input.value = "In Progress"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert isinstance(app.screen, FiltersScreen)
+        await pilot.press("q")
+        await pilot.pause()
+
+        assert isinstance(app.screen, IndexScreen)
+        assert index.field_filters == {"status": ["In Progress"]}
         index_table = index.query_one(DataTable)
         assert index_table.row_count == 1
         assert index_table.get_cell("SAT-2", "Key") == "SAT-2"
@@ -2758,7 +2976,7 @@ async def test_filters_screen_assignee_filter_narrows_index(tmp_path: Path) -> N
 
 def _write_board_cache(tmp_path: Path) -> None:
     write_json(
-        tmp_path / "meta/boards.json",
+        tmp_path / "meta/SAT/boards.json",
         {
             "project": "SAT",
             "fetchedAt": "now",
@@ -2773,6 +2991,74 @@ def _write_board_cache(tmp_path: Path) -> None:
             ],
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_filters_screen_project_filter_narrows_index(tmp_path: Path) -> None:
+    _write_filter_test_items(tmp_path)
+    write_json(
+        tmp_path / "components/_unassigned/PLAT-1/issue.json",
+        {
+            "key": "PLAT-1",
+            "fields": {"summary": "Platform item", "issuetype": {"name": "Task"}, "status": {"name": "To Do"}},
+        },
+    )
+    build_manifest(tmp_path)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    async with app.run_test() as pilot:
+        index = app.screen
+        assert isinstance(index, IndexScreen)
+        assert index.query_one(DataTable).row_count == 3
+
+        await pilot.press("f")
+        screen = app.screen
+        assert isinstance(screen, FiltersScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("project"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        filter_input = app.screen.query_one("#picker-filter", Input)
+        filter_input.value = "PLAT"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert isinstance(app.screen, FiltersScreen)
+        assert str(table.get_cell("project", "value")) == "PLAT"
+        await pilot.press("q")
+        await pilot.pause()
+
+        assert isinstance(app.screen, IndexScreen)
+        index_table = index.query_one(DataTable)
+        assert index_table.row_count == 1
+        assert index_table.get_cell("PLAT-1", "Key") == "PLAT-1"
+
+
+@pytest.mark.asyncio
+async def test_filters_screen_board_picker_excludes_inactive_boards(tmp_path: Path) -> None:
+    from jira_workbench.metadata import set_board_active
+    from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+
+    _write_filter_test_items(tmp_path)
+    _write_board_cache(tmp_path)
+    set_board_active(tmp_path, "jira", 32, False)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    async with app.run_test() as pilot:
+        await pilot.press("f")
+        screen = app.screen
+        assert isinstance(screen, FiltersScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("board"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        picker = app.screen
+        assert isinstance(picker, OptionPickerScreen)
+        assert picker._options == ["(any)"]
 
 
 @pytest.mark.asyncio
@@ -2899,7 +3185,7 @@ async def test_hide_done_after_days_applies_only_to_active_board_scope(tmp_path:
     )
     build_manifest(tmp_path)
     write_json(
-        tmp_path / "meta/boards.json",
+        tmp_path / "meta/SAT/boards.json",
         {
             "project": "SAT",
             "fetchedAt": "now",
@@ -2957,23 +3243,22 @@ async def test_filters_screen_none_bucket_is_distinct_from_any(tmp_path: Path) -
         filter_input.value = "(none)"
         await pilot.press("enter")
         await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
         await pilot.press("q")
         await pilot.pause()
 
-        assert index.field_filters == {"fixVersion": "(none)"}
+        assert index.field_filters == {"fixVersion": ["(none)"]}
         index_table = index.query_one(DataTable)
         assert index_table.row_count == 1
         assert index_table.get_cell("SAT-2", "Key") == "SAT-2"
 
-        # Reopen and clear back to "(any)" -- both items return.
+        # Reopen and clear back to "(any)" via the "d" clear action -- a
+        # multi-select picker has no "(any)" option of its own to pick.
         await pilot.press("f")
         table = app.screen.query_one(DataTable)
         table.move_cursor(row=table.get_row_index("fixVersion"))
-        await pilot.press("enter")
-        await pilot.pause()
-        filter_input = app.screen.query_one("#picker-filter", Input)
-        filter_input.value = "(any)"
-        await pilot.press("enter")
+        await pilot.press("d")
         await pilot.pause()
         await pilot.press("q")
         await pilot.pause()
@@ -3150,13 +3435,41 @@ async def test_meta_screen_opens_versions_and_renames(tmp_path: Path, monkeypatc
         await pilot.pause()
 
         assert client.versions[0]["name"] == "v1-renamed"
-        cache = load_versions(tmp_path)
+        cache = load_versions(tmp_path, "SAT")
         assert cache is not None
         assert cache["versions"][0]["name"] == "v1-renamed"
 
         await pilot.press("escape")
         await pilot.pause()
         assert isinstance(app.screen, MetaScreen)
+
+
+@pytest.mark.asyncio
+async def test_versions_screen_blocks_mutations_for_a_read_only_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+    client = FakeMetaClient()
+    app = meta_app(tmp_path, client, monkeypatch)
+
+    async with app.run_test() as pilot:
+        assert isinstance(app.screen, MetaScreen)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, VersionsScreen)
+
+        await pilot.press("n")
+        await pilot.pause()
+        # blocked before any TextPromptScreen was even opened
+        assert isinstance(app.screen, VersionsScreen)
+
+        await pilot.press("e")
+        await pilot.pause()
+        assert isinstance(app.screen, VersionsScreen)
+        assert client.versions[0]["name"] == "v1"
 
 
 class VersionRenamePropagationClient(FakeMetaClient):
@@ -3255,9 +3568,11 @@ async def test_meta_screen_opens_boards_read_only(tmp_path: Path, monkeypatch: p
         assert isinstance(app.screen, BoardsScreen)
         table = app.screen.query_one(DataTable)
         assert table.row_count == 1
-        assert str(table.get_cell("32", "name")) == "SAT board"
-        assert str(table.get_cell("32", "status")) == "ok"
-        assert str(table.get_cell("32", "backlog")) == "1 issues"
+        assert str(table.get_cell("jira:32", "name")) == "SAT board"
+        assert str(table.get_cell("jira:32", "active")) == "yes"
+        assert str(table.get_cell("jira:32", "type")) == "jira"
+        assert str(table.get_cell("jira:32", "status")) == "ok"
+        assert str(table.get_cell("jira:32", "backlog")) == "1 issues"
 
         # "Boards" is read-only -- 'n' (add) should not attempt to create anything.
         await pilot.press("escape")
@@ -3268,6 +3583,348 @@ async def test_meta_screen_opens_boards_read_only(tmp_path: Path, monkeypatch: p
         await pilot.press("n")
         await pilot.pause()
         assert isinstance(app.screen, MetaScreen)
+
+
+@pytest.mark.asyncio
+async def test_boards_screen_creates_edits_and_deletes_a_local_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = FakeMetaClient()
+    app = meta_app(tmp_path, client, monkeypatch)
+
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, BoardsScreen)
+        boards_screen = app.screen
+
+        await pilot.press("n")
+        await pilot.pause()
+
+        from jira_workbench.tui.screens.meta import LocalBoardEditScreen
+
+        edit_screen = app.screen
+        assert isinstance(edit_screen, LocalBoardEditScreen)
+
+        # cursor starts on the Name row -- Enter opens a text prompt for it.
+        await pilot.press("enter")
+        await pilot.pause()
+        input_widget = app.screen.query_one(Input)
+        input_widget.value = "My Local Board"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.screen is edit_screen
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        assert app.screen is boards_screen
+        table = boards_screen.query_one(DataTable)
+        assert str(table.get_cell("local:My Local Board", "type")) == "local"
+        assert str(table.get_cell("local:My Local Board", "active")) == "yes"
+
+        # toggle active off
+        table.move_cursor(row=table.get_row_index("local:My Local Board"))
+        await pilot.press("a")
+        await pilot.pause()
+        assert str(table.get_cell("local:My Local Board", "active")) == ""
+
+        # deleting a jira board is rejected
+        table.move_cursor(row=table.get_row_index("jira:32"))
+        await pilot.press("d")
+        await pilot.pause()
+        assert table.row_count == 2
+
+        # delete the local board
+        table.move_cursor(row=table.get_row_index("local:My Local Board"))
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")  # confirm
+        await pilot.pause()
+
+        assert table.row_count == 1
+
+
+@pytest.mark.asyncio
+async def test_local_board_edit_screen_cancel_discards_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_manifest(tmp_path)
+    client = FakeMetaClient()
+    app = meta_app(tmp_path, client, monkeypatch)
+
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        boards_screen = app.screen
+        assert isinstance(boards_screen, BoardsScreen)
+
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        input_widget = app.screen.query_one(Input)
+        input_widget.value = "Never Saved"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        await pilot.press("escape")  # cancel, not save
+        await pilot.pause()
+
+        assert app.screen is boards_screen
+        from jira_workbench.metadata import load_board_settings
+
+        assert load_board_settings(tmp_path)["localBoards"] == []
+
+
+@pytest.mark.asyncio
+async def test_local_board_edit_screen_save_requires_a_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_manifest(tmp_path)
+    client = FakeMetaClient()
+    app = meta_app(tmp_path, client, monkeypatch)
+
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        await pilot.press("n")
+        await pilot.pause()
+
+        from jira_workbench.tui.screens.meta import LocalBoardEditScreen
+
+        edit_screen = app.screen
+        assert isinstance(edit_screen, LocalBoardEditScreen)
+
+        await pilot.press("ctrl+s")  # no name set yet
+        await pilot.pause()
+
+        assert app.screen is edit_screen  # blocked, still open
+
+        from jira_workbench.metadata import load_board_settings
+
+        assert load_board_settings(tmp_path)["localBoards"] == []
+
+
+@pytest.mark.asyncio
+async def test_boards_screen_edit_updates_name_and_filters_in_one_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jira_workbench.metadata import add_local_board, load_board_settings
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "components": [{"name": "helm-chart"}],
+                "assignee": {"displayName": "Alex Epic"},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    add_local_board(tmp_path, "Old Name", {}, None)
+    client = FakeMetaClient()
+    app = meta_app(tmp_path, client, monkeypatch)
+
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        boards_screen = app.screen
+        assert isinstance(boards_screen, BoardsScreen)
+        table = boards_screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("local:Old Name"))
+
+        await pilot.press("e")
+        await pilot.pause()
+
+        from jira_workbench.tui.screens.meta import LocalBoardEditScreen
+
+        edit_screen = app.screen
+        assert isinstance(edit_screen, LocalBoardEditScreen)
+        edit_table = edit_screen.query_one(DataTable)
+        assert str(edit_table.get_cell("name", "value")) == "Old Name"
+
+        edit_table.move_cursor(row=edit_table.get_row_index("name"))
+        await pilot.press("enter")
+        await pilot.pause()
+        input_widget = app.screen.query_one(Input)
+        input_widget.value = "New Name"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        edit_table.move_cursor(row=edit_table.get_row_index("assignee"))
+        await pilot.press("enter")
+        await pilot.pause()
+        filter_input = app.screen.query_one("#picker-filter", Input)
+        filter_input.value = "Alex Epic"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        assert app.screen is boards_screen
+        boards = load_board_settings(tmp_path)["localBoards"]
+        assert boards[0]["name"] == "New Name"
+        assert boards[0]["fieldFilters"] == {"assignee": ["Alex Epic"]}
+
+
+@pytest.mark.asyncio
+async def test_boards_screen_reuses_index_items_instead_of_rescanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Opening Meta > Boards > New/Edit from the index used to re-scan every
+    # locally synced issue from scratch each time (load_manifest_items),
+    # which is what made it feel slow -- it should now reuse IndexScreen's
+    # own already-loaded (and incrementally kept fresh) item list instead.
+    import jira_workbench.tui.screens.meta as meta_module
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    app = JiraWorkbenchApp(tmp_path, component_field="components")
+
+    calls = []
+    real_load = meta_module.load_manifest_items
+    monkeypatch.setattr(
+        meta_module,
+        "load_manifest_items",
+        lambda *a, **k: calls.append(1) or real_load(*a, **k),
+    )
+
+    async with app.run_test() as pilot:
+        index = app.screen
+        assert isinstance(index, IndexScreen)
+
+        await pilot.press("M")
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, BoardsScreen)
+
+        await pilot.press("n")
+        await pilot.pause()
+
+        from jira_workbench.tui.screens.meta import LocalBoardEditScreen
+
+        assert isinstance(app.screen, LocalBoardEditScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_local_board_edit_screen_active_filter_row_opens_nested_sub_editor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "In Progress"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    from jira_workbench.metadata import add_local_board, load_board_settings
+
+    add_local_board(tmp_path, "My Filter", {}, None)
+    client = FakeMetaClient()
+    app = meta_app(tmp_path, client, monkeypatch)
+
+    async with app.run_test() as pilot:
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+        boards_screen = app.screen
+        assert isinstance(boards_screen, BoardsScreen)
+        table = boards_screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("local:My Filter"))
+
+        await pilot.press("e")
+        await pilot.pause()
+
+        from jira_workbench.tui.screens.meta import LocalBoardActiveFilterScreen, LocalBoardEditScreen
+
+        edit_screen = app.screen
+        assert isinstance(edit_screen, LocalBoardEditScreen)
+        edit_table = edit_screen.query_one(DataTable)
+        assert str(edit_table.get_cell("activeFilter", "value")) == "(none)"
+
+        edit_table.move_cursor(row=edit_table.get_row_index("activeFilter"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        sub_screen = app.screen
+        assert isinstance(sub_screen, LocalBoardActiveFilterScreen)
+        sub_table = sub_screen.query_one(DataTable)
+        sub_table.move_cursor(row=sub_table.get_row_index("status"))
+        await pilot.press("enter")
+        await pilot.pause()
+        filter_input = app.screen.query_one("#picker-filter", Input)
+        filter_input.value = "In Progress"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert app.screen is edit_screen
+        assert str(edit_table.get_cell("activeFilter", "value")) == "status=In Progress"
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+    boards = load_board_settings(tmp_path)["localBoards"]
+    assert boards[0]["activeFilter"] == {"fieldFilters": {"status": ["In Progress"]}, "pattern": None}
 
 
 class FakeLabelsPushClient:
@@ -3419,6 +4076,69 @@ async def test_labels_screen_delete_removes_from_all_issues_and_pushes(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_labels_screen_delete_skips_issues_in_a_read_only_project(tmp_path: Path) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    _write_labels_test_items(tmp_path)
+    write_json(
+        tmp_path / "components/helm-chart/OTHERPROJ-1/issue.json",
+        {
+            "key": "OTHERPROJ-1",
+            "fields": {
+                "summary": "Other project",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "labels": ["helm"],
+                "updated": "2026-01-01T00:00:00.000+0000",
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    write_project_registry(
+        tmp_path,
+        (ProjectSettings(key="SAT", default=True), ProjectSettings(key="OTHERPROJ", read_only=True)),
+    )
+    issues = {
+        "SAT-1": {"key": "SAT-1", "fields": {"summary": "One", "labels": ["infra", "helm"], "updated": "2026-01-01T00:00:00.000+0000"}},
+        "SAT-2": {"key": "SAT-2", "fields": {"summary": "Two", "labels": ["helm"], "updated": "2026-01-01T00:00:00.000+0000"}},
+        "OTHERPROJ-1": {
+            "key": "OTHERPROJ-1",
+            "fields": {"summary": "Other project", "labels": ["helm"], "updated": "2026-01-01T00:00:00.000+0000"},
+        },
+    }
+    client = FakeLabelsPushClient(issues)
+    app = _labels_app(tmp_path, client)
+
+    async with app.run_test() as pilot:
+        await pilot.press("M")
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        labels_screen = app.screen
+        assert isinstance(labels_screen, LabelsScreen)
+        table = labels_screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("helm"))  # on SAT-1, SAT-2, and OTHERPROJ-1
+
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")  # confirm
+        await pilot.pause()
+
+        await pilot.press("enter")  # close push progress screen
+        await pilot.pause()
+
+        assert "OTHERPROJ-1" not in client.update_calls
+        assert client.update_calls["SAT-1"]["labels"] == ["infra"]
+        assert client.update_calls["SAT-2"]["labels"] == []
+        assert not (tmp_path / "components/helm-chart/OTHERPROJ-1/shadow.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_labels_screen_rename_renames_on_all_issues_and_pushes(tmp_path: Path) -> None:
     _write_labels_test_items(tmp_path)
     issues = {
@@ -3559,6 +4279,52 @@ async def test_index_screen_opens_meta_via_keybinding_and_returns(tmp_path: Path
         # If MetaScreen had called app.exit() instead of dismiss(), the app would
         # be shutting down here rather than showing the index again.
         assert isinstance(app.screen, IndexScreen)
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_status_change_recognizes_custom_done_status_via_category(tmp_path: Path) -> None:
+    # Regression: a custom workflow status ("Solved") that Jira classifies
+    # as Done must still trigger the resolution prompt, even though its
+    # name isn't one of the hardcoded English words the old code guessed
+    # from -- as long as it's been observed (with a real statusCategory)
+    # on some locally synced issue anywhere in this jira_dir.
+    from textual.widgets import OptionList
+
+    from jira_workbench.tui.widgets.prompts import StatusChangeScreen
+
+    jira_dir = synced_jira_dir(tmp_path)
+    write_json(
+        jira_dir / "components/_unassigned/SAT-99/issue.json",
+        {
+            "key": "SAT-99",
+            "fields": {"summary": "Other", "status": {"name": "Solved", "statusCategory": {"key": "done"}}},
+        },
+    )
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+        table = app.screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("status"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        screen = app.screen
+        assert isinstance(screen, StatusChangeScreen)
+        status_options = screen.query_one("#status-options", OptionList)
+        solved_index = next(
+            index
+            for index in range(status_options.option_count)
+            if str(status_options.get_option_at_index(index).prompt) == "Solved"
+        )
+        status_options.highlighted = solved_index
+        await pilot.press("enter")
+        await pilot.pause()
+
+        resolution_options = screen.query_one("#resolution-options", OptionList)
+        assert resolution_options.display is True
 
 
 @pytest.mark.asyncio

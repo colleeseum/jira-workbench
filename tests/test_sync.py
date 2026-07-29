@@ -6,12 +6,17 @@ from typing import Any
 from jira_workbench.sync import (
     SyncConfig,
     SyncError,
+    backfill_missing_parents,
+    build_index_jql,
     build_manifest,
     component_slug,
     issue_key_sort_key,
+    issue_project_key,
+    issue_summary,
     normalize_issue,
     normalize_work_items,
     read_json,
+    status_category_key,
     sync_project,
     write_json,
 )
@@ -51,6 +56,14 @@ class FakeJiraClient:
     ) -> Any:
         self.calls.append(("get_issue", issue_id_or_key, fields))
         key = issue_id_or_key
+        if key == "SAT-100":
+            # SAT-1's parent, deliberately never one of this fixture's own
+            # work items -- simulates a parent that isn't independently
+            # fetchable (e.g. permissions), so backfill_missing_parents
+            # skips it gracefully instead of adding a 3rd synced issue that
+            # every test relying on this fixture's "2 issues" shape would
+            # otherwise have to account for.
+            raise RuntimeError("simulated: SAT-100 is not fetchable in this fixture")
         component = "API Team" if key == "SAT-1" else None
         return {
             "key": key,
@@ -135,6 +148,84 @@ def test_issue_key_sort_key_sorts_by_numeric_suffix() -> None:
     assert sorted(keys, key=issue_key_sort_key) == ["SAT-2", "SAT-9", "SAT-10", "SAT-100"]
 
 
+def test_issue_project_key_prefers_synced_fields_project() -> None:
+    issue = {"key": "SAT-1", "fields": {"project": {"key": "SAT", "name": "Solution Architecture Team"}}}
+
+    assert issue_project_key(issue) == "SAT"
+
+
+def test_issue_project_key_falls_back_to_key_prefix_when_project_field_missing() -> None:
+    assert issue_project_key({"key": "OTHERPROJ-45", "fields": {}}) == "OTHERPROJ"
+    assert issue_project_key({"key": "OTHERPROJ-45"}) == "OTHERPROJ"
+
+
+def test_issue_project_key_none_when_unresolvable() -> None:
+    assert issue_project_key({}) is None
+    assert issue_project_key({"key": "not-a-jira-key"}) is None
+
+
+def test_status_category_key_reads_the_real_category_not_the_name() -> None:
+    # Regression: a custom workflow status like "Solved" belongs to Jira's
+    # "Done" category without ever being *named* "done"/"closed"/"resolved"
+    # -- must read statusCategory.key, not guess from the display name.
+    status = {"name": "Solved", "statusCategory": {"key": "done", "name": "Done", "colorName": "green"}}
+
+    assert status_category_key(status) == "done"
+
+
+def test_status_category_key_none_when_unavailable() -> None:
+    assert status_category_key({"name": "Solved"}) is None  # no statusCategory at all
+    assert status_category_key("Solved") is None  # shadow-overwritten to a bare name
+    assert status_category_key(None) is None
+
+
+def test_issue_summary_includes_status_category(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "Custom workflow issue",
+                "status": {"name": "Solved", "statusCategory": {"key": "done", "name": "Done"}},
+            },
+        },
+    )
+    issue_path = tmp_path / "components/helm-chart/SAT-1/issue.json"
+
+    summary = issue_summary("helm-chart", "SAT-1", issue_path, tmp_path)
+
+    assert summary["status"] == "Solved"
+    assert summary["statusCategory"] == "done"
+
+
+def test_build_index_jql_unbounded_by_default() -> None:
+    assert build_index_jql("SAT") == "project=SAT ORDER BY key"
+    assert build_index_jql("SAT", None) == "project=SAT ORDER BY key"
+
+
+def test_build_index_jql_excludes_old_done_issues_but_keeps_open_ones() -> None:
+    assert build_index_jql("SAT", 12) == (
+        "project=SAT AND (statusCategory != Done OR statuscategorychangedate >= -360d) ORDER BY key"
+    )
+
+
+def test_sync_project_threads_history_months_into_the_index_jql(tmp_path: Path) -> None:
+    client = FakeJiraClient()
+
+    sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path, history_months=6),
+        client,
+        progress=None,
+    )
+
+    assert (
+        "enhanced_jql_get_list_of_tickets",
+        "project=SAT AND (statusCategory != Done OR statuscategorychangedate >= -180d) ORDER BY key",
+        ["issuetype", "key", "updated"],
+        None,
+    ) in client.calls
+
+
 def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> None:
     client = FakeJiraClient()
     progress: list[str] = []
@@ -151,7 +242,7 @@ def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> No
     assert ("get_project_versions", "SAT") in client.calls
     assert ("enhanced_jql_get_list_of_tickets", "project=SAT ORDER BY key", ["issuetype", "key", "updated"], None) in client.calls
     assert ("get_issue", "SAT-1", "*all") in client.calls
-    assert (tmp_path / "meta/versions.json").exists()
+    assert (tmp_path / "meta/SAT/versions.json").exists()
     assert (tmp_path / "components/api-team/SAT-1/issue.json").exists()
     assert (tmp_path / "components/_unassigned/SAT-2/issue.json").exists()
     assert read_json(tmp_path / "components/api-team/SAT-1/attachments.json") == [{"filename": "notes.txt"}]
@@ -162,8 +253,169 @@ def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> No
     assert manifest["workItems"][0]["priority"] == "Medium"
     assert manifest["workItems"][0]["assignee"] == "Serge Colle"
     assert manifest["workItems"][0]["epic"] == "SAT-100"
-    assert "[3/5] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in progress
-    assert "[3/5] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in progress
+    assert "[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in progress
+    assert "[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in progress
+
+
+class FakeJiraClientWithFetchableEpic(FakeJiraClient):
+    """FakeJiraClient, but SAT-1's parent (SAT-100) can actually be
+    fetched -- simulates an epic excluded by a history_months cutoff (or
+    just never independently synced) while a child stays in scope."""
+
+    def get_issue(self, issue_id_or_key: str, fields: Any = None, **kwargs: Any) -> Any:
+        self.calls.append(("get_issue", issue_id_or_key, fields))
+        if issue_id_or_key == "SAT-100":
+            return {
+                "key": "SAT-100",
+                "fields": {
+                    "summary": "The real epic",
+                    "issuetype": {"name": "Epic"},
+                    "status": {"name": "Done"},
+                    "updated": "2020-01-01T00:00:00.000+0000",
+                },
+            }
+        return super().get_issue(issue_id_or_key, fields, **kwargs)
+
+    def issue_get_comments(self, issue_id: str) -> Any:
+        return {"comments": []} if issue_id == "SAT-100" else super().issue_get_comments(issue_id)
+
+
+def test_sync_project_backfills_a_parent_excluded_by_the_history_cutoff(tmp_path: Path) -> None:
+    client = FakeJiraClientWithFetchableEpic()
+    progress: list[str] = []
+
+    result = sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path, history_months=12),
+        client,
+        progress=progress.append,
+    )
+
+    assert result.backfilled_parent_count == 1
+    epic_path = next(tmp_path.glob("components/*/SAT-100/issue.json"))
+    assert read_json(epic_path)["fields"]["summary"] == "The real epic"
+    assert any("Backfilling parents" in line for line in progress)
+    manifest = read_json(tmp_path / "manifest.json")
+    assert manifest["workItemCount"] == 3  # SAT-1, SAT-2, and the backfilled SAT-100
+
+
+class FakeParentClient:
+    """Minimal client for backfill_missing_parents tests -- serves whatever
+    issue dict `issues` maps a key to, and records get_issue calls."""
+
+    def __init__(self, issues: dict[str, dict[str, Any]], *, unfetchable: set[str] = frozenset()) -> None:
+        self.issues = issues
+        self.unfetchable = unfetchable
+        self.calls: list[str] = []
+
+    def get_issue(self, issue_id_or_key: str, fields: Any = None, **kwargs: Any) -> Any:
+        self.calls.append(issue_id_or_key)
+        if issue_id_or_key in self.unfetchable:
+            raise RuntimeError(f"cannot fetch {issue_id_or_key}")
+        return self.issues[issue_id_or_key]
+
+    def issue_get_comments(self, issue_id: str) -> Any:
+        return {"comments": []}
+
+
+def _write_local_issue(tmp_path: Path, key: str, component: str, parent_key: str | None = None) -> None:
+    fields: dict[str, Any] = {"summary": f"Summary for {key}", "issuetype": {"name": "Task"}}
+    if parent_key:
+        fields["parent"] = {"key": parent_key, "fields": {"summary": "stale cached parent summary"}}
+    write_json(tmp_path / f"components/{component}/{key}/issue.json", {"key": key, "fields": fields})
+
+
+def test_backfill_missing_parents_fetches_a_missing_same_project_parent(tmp_path: Path) -> None:
+    _write_local_issue(tmp_path, "SAT-1", "helm-chart", parent_key="SAT-100")
+    client = FakeParentClient({"SAT-100": {"key": "SAT-100", "fields": {"summary": "The epic", "issuetype": {"name": "Epic"}}}})
+
+    count = backfill_missing_parents(tmp_path, "SAT", client, "components")
+
+    assert count == 1
+    assert client.calls == ["SAT-100"]
+    epic_path = next(tmp_path.glob("components/*/SAT-100/issue.json"))
+    assert read_json(epic_path)["fields"]["summary"] == "The epic"
+
+
+def test_backfill_missing_parents_reports_a_progress_counter(tmp_path: Path) -> None:
+    _write_local_issue(tmp_path, "SAT-1", "helm-chart", parent_key="SAT-100")
+    _write_local_issue(tmp_path, "SAT-2", "helm-chart", parent_key="SAT-101")
+    client = FakeParentClient(
+        {
+            "SAT-100": {"key": "SAT-100", "fields": {"summary": "Epic one", "issuetype": {"name": "Epic"}}},
+            "SAT-101": {"key": "SAT-101", "fields": {"summary": "Epic two", "issuetype": {"name": "Epic"}}},
+        }
+    )
+    progress: list[str] = []
+
+    count = backfill_missing_parents(tmp_path, "SAT", client, "components", progress=progress.append)
+
+    assert count == 2
+    assert any(line.endswith("1/2 SAT-100") or line.endswith("2/2 SAT-100") for line in progress)
+    assert any(line.endswith("1/2 SAT-101") or line.endswith("2/2 SAT-101") for line in progress)
+
+
+def test_backfill_missing_parents_ignores_parent_type(tmp_path: Path) -> None:
+    # Not epic-specific -- a subtask's parent Story is backfilled the same way.
+    _write_local_issue(tmp_path, "SAT-2", "helm-chart", parent_key="SAT-50")
+    client = FakeParentClient({"SAT-50": {"key": "SAT-50", "fields": {"summary": "A story", "issuetype": {"name": "Story"}}}})
+
+    count = backfill_missing_parents(tmp_path, "SAT", client, "components")
+
+    assert count == 1
+    assert read_json(next(tmp_path.glob("components/*/SAT-50/issue.json")))["fields"]["issuetype"]["name"] == "Story"
+
+
+def test_backfill_missing_parents_skips_cross_project_parents(tmp_path: Path) -> None:
+    _write_local_issue(tmp_path, "PLAT-1", "helm-chart", parent_key="OTHERPROJ-5")
+    client = FakeParentClient({})
+
+    count = backfill_missing_parents(tmp_path, "PLAT", client, "components")
+
+    assert count == 0
+    assert client.calls == []
+
+
+def test_backfill_missing_parents_resolves_multi_level_chains(tmp_path: Path) -> None:
+    # SAT-1's parent (SAT-50, a Story) is itself missing, and that Story's
+    # own parent (SAT-100, an Epic) is also missing -- one call must
+    # resolve both hops, not just the first.
+    _write_local_issue(tmp_path, "SAT-1", "helm-chart", parent_key="SAT-50")
+    client = FakeParentClient(
+        {
+            "SAT-50": {
+                "key": "SAT-50",
+                "fields": {"summary": "A story", "issuetype": {"name": "Story"}, "parent": {"key": "SAT-100"}},
+            },
+            "SAT-100": {"key": "SAT-100", "fields": {"summary": "The epic", "issuetype": {"name": "Epic"}}},
+        }
+    )
+
+    count = backfill_missing_parents(tmp_path, "SAT", client, "components")
+
+    assert count == 2
+    assert sorted(client.calls) == ["SAT-100", "SAT-50"]
+    assert (tmp_path / "components/_unassigned/SAT-50/issue.json").exists() or list(
+        tmp_path.glob("components/*/SAT-50/issue.json")
+    )
+    assert list(tmp_path.glob("components/*/SAT-100/issue.json"))
+
+
+def test_backfill_missing_parents_skips_unfetchable_parents_without_crashing(tmp_path: Path) -> None:
+    _write_local_issue(tmp_path, "SAT-1", "helm-chart", parent_key="SAT-100")
+    client = FakeParentClient({}, unfetchable={"SAT-100"})
+
+    progress: list[str] = []
+    count = backfill_missing_parents(tmp_path, "SAT", client, "components", progress=progress.append)
+
+    assert count == 0
+    assert not list(tmp_path.glob("components/*/SAT-100/issue.json"))
+    assert any("could not backfill parent SAT-100" in line for line in progress)
+
+
+def test_backfill_missing_parents_returns_zero_when_nothing_missing(tmp_path: Path) -> None:
+    _write_local_issue(tmp_path, "SAT-1", "helm-chart")
+
+    assert backfill_missing_parents(tmp_path, "SAT", FakeParentClient({}), "components") == 0
 
 
 def test_sync_project_caches_field_names(tmp_path: Path) -> None:
@@ -209,7 +461,11 @@ def test_sync_project_skips_unchanged_items(tmp_path: Path) -> None:
 
     assert second.changed_count == 0
     assert second.skipped_count == 2
-    assert not any(call[0] == "get_issue" for call in client.calls)
+    # SAT-1/SAT-2 themselves are unchanged and shouldn't be re-fetched --
+    # backfill_missing_parents retrying SAT-1's still-missing parent
+    # (SAT-100, deliberately unfetchable in this fixture) every run is a
+    # separate, expected concern this test isn't about.
+    assert not any(call[0] == "get_issue" and call[1] in ("SAT-1", "SAT-2") for call in client.calls)
 
 
 def test_sync_project_force_refetches_even_when_updated_matches(tmp_path: Path) -> None:

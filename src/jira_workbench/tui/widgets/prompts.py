@@ -225,6 +225,96 @@ class OptionPickerScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class MultiOptionPickerScreen(ModalScreen[list[str]]):
+    """Filterable multi-select list: same filterable-list UX as
+    OptionPickerScreen (type to narrow, same #picker-filter input), but a
+    checkbox SelectionList instead of a single-select OptionList. Always
+    returns whatever's currently checked (never None -- an empty selection
+    is a valid "clear this filter" result, same "closing always returns
+    current state" convention FiltersScreen itself already uses, so there's
+    no separate cancel-vs-save distinction to make here)."""
+
+    DEFAULT_CSS = """
+    MultiOptionPickerScreen {
+        align: center middle;
+    }
+    MultiOptionPickerScreen > Vertical {
+        width: 70%;
+        height: 80%;
+        border: round $primary;
+        padding: 1 2;
+        background: $panel;
+    }
+    MultiOptionPickerScreen .title {
+        text-style: bold;
+    }
+    MultiOptionPickerScreen SelectionList {
+        height: 1fr;
+        margin-top: 1;
+    }
+    MultiOptionPickerScreen .dialog-buttons {
+        margin-top: 1;
+        height: auto;
+        align-horizontal: right;
+    }
+    """
+
+    BINDINGS = [("escape", "close", "Done")]
+
+    def __init__(self, label: str, options: list[str], *, selected: list[str] | None = None) -> None:
+        super().__init__()
+        self._label = label
+        self._options = options
+        self._selected = set(selected or [])
+
+    def _selection_tuples(self, options: list[str]) -> list[tuple[str, str, bool]]:
+        return [(option, option, option in self._selected) for option in options]
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(self._label, classes="title")
+            yield Input(placeholder="type to filter", id="picker-filter")
+            yield SelectionList(*self._selection_tuples(self._options), id="picker-options")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Done (Esc)", id="done-button", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#picker-filter", Input).focus()
+
+    @on(Input.Changed, "#picker-filter")
+    def _filter_changed(self, event: Input.Changed) -> None:
+        selection_list = self.query_one(SelectionList)
+        # Remember whatever's checked so far -- re-filtering rebuilds the
+        # option list from scratch, which would otherwise silently drop it.
+        self._selected = set(selection_list.selected)
+        needle = event.value.strip().lower()
+        selection_list.clear_options()
+        for option in self._options:
+            if needle in option.lower():
+                selection_list.add_option((option, option, option in self._selected))
+
+    @on(Input.Submitted, "#picker-filter")
+    def _filter_submitted(self, event: Input.Submitted) -> None:
+        # Selects the top filtered match (mirrors OptionPickerScreen's own
+        # "type to narrow, Enter to pick" convenience) but, unlike that
+        # single-select picker, doesn't close -- it clears the filter text
+        # instead, so typing+Enter again immediately picks another value.
+        selection_list = self.query_one(SelectionList)
+        if selection_list.option_count:
+            value = selection_list.get_option_at_index(0).value
+            if value not in selection_list.selected:
+                selection_list.select(value)
+            self._selected = set(selection_list.selected)
+        event.input.value = ""
+
+    @on(Button.Pressed, "#done-button")
+    def _done_pressed(self) -> None:
+        self.action_close()
+
+    def action_close(self) -> None:
+        self.dismiss(list(self.query_one(SelectionList).selected))
+
+
 class LabelsPickerScreen(ModalScreen[list[str] | None]):
     """Multi-select label picker: toggle known labels with Space (a checkbox
     list, not free text) -- avoids accidentally minting a new label via a

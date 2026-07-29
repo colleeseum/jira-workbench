@@ -37,15 +37,30 @@ Create `~/.config/jira-wb/config.toml`:
 
 ```toml
 project = "SAT"
-jira_dir = "jira"
 jira_url = "https://example.atlassian.net"
 jira_email = "you@example.com"
 jira_api_token = "..."
 
+# Optional. Where synced issues, caches, and shadows live -- like a mail
+# client's local profile, one shared store regardless of which directory you
+# happen to run jira-wb from. Defaults to $XDG_DATA_HOME/jira-wb (usually
+# ~/.local/share/jira-wb) if unset; only set this to override that default.
+jira_dir = "jira"
+
 # Optional. Defaults to Jira's native components field.
 component_field = "customfield_10071"
 
+# Optional. Only sync Done issues that have been in that status for this
+# many months or less -- see "Limiting sync history" below. Unset means
+# unbounded (sync every issue regardless of age), same as today.
+sync_history_months = 24
+
 [view]
+# project, status, component, fix_version, and assignee each accept either a
+# bare string (one value, shown here) or an array of strings (multiple
+# values, matched as "any of") -- e.g. status = ["To Do", "In Progress"].
+project = "SAT"
+status = "To Do"
 component = "helm-chart"
 fix_version = "2026.07"
 assignee = "you@example.com"
@@ -85,6 +100,73 @@ default_type = "Story"
 host = "127.0.0.1"
 port = 8765
 ```
+
+### Multiple projects
+
+`project = "SAT"` above is shorthand for a single, default, read-write project.
+To sync several projects from the same Jira Cloud site into one shared
+`jira_dir`, replace it with a `[[projects]]` array instead:
+
+```toml
+[[projects]]
+key = "SAT"
+default = true
+
+[[projects]]
+key = "OTHERPROJ"
+read_only = true
+```
+
+- Exactly one entry may set `default = true` -- this is the project the TUI
+  opens against and the one `jira-wb issue create` targets when `--project`
+  isn't passed.
+- `read_only = true` blocks field/status edits, pushes, and new-issue creation
+  for that project everywhere (CLI and TUI) -- **adding a comment still always
+  works**, even on a read-only project, since comments are never blocked.
+- All projects share the same `jira_url`/`jira_email`/`jira_api_token` --
+  multi-project support assumes one Jira Cloud site with shared credentials,
+  not several separate instances.
+- `jira-wb sync` with no `--project` syncs every configured project in turn;
+  `jira-wb sync --project X` still syncs just that one project, same as
+  before.
+
+### Limiting sync history
+
+A project with several thousand issues will have plenty that were closed a
+long time ago and aren't worth continuing to sync. `sync_history_months`
+(top-level, applies to every project) and a per-project `history_months`
+override bound how far back **Done** issues are pulled in:
+
+```toml
+sync_history_months = 24  # default: 2 years of closed-issue history
+
+[[projects]]
+key = "SAT"
+default = true
+# no override -- uses the 24-month default above
+
+[[projects]]
+key = "HUGEPROJ"
+history_months = 6  # this one project only keeps the last 6 months of Done issues
+```
+
+Currently-open issues are **never** excluded by this, regardless of how old
+they are -- only issues Jira already considers Done, and only once they've
+sat in that status longer than the cutoff. `--history-months N` on the CLI
+overrides both settings for that one sync run, across every project being
+synced.
+
+This only changes what a *future* sync fetches -- an issue that's already
+been synced and later ages out of the window is left alone on disk, not
+deleted. If a project's local storage grows too large over time, pruning
+old synced issues is a separate concern this doesn't address yet.
+
+One consequence of excluding old Done issues: a parent (Epic, Story, or
+anything else `fields.parent` can point at) might be old and Done enough to
+fall outside the cutoff while a child of it is still open, or was itself
+touched more recently. Every sync backfills these regardless of the cutoff
+-- as long as the parent lives in a project you're already syncing, its
+child never ends up pointing at a parent your local copy doesn't have.
 
 Sync the configured project:
 
@@ -172,13 +254,32 @@ A Jira board is not a field on an issue — it's a saved filter (JQL), plus, for
 - **Board membership**: each board's filter is fetched once (`jira-wb meta refresh --boards`) and compiled into a small local predicate, then evaluated against your *locally synced and shadow-edited* copy of each issue — so editing a component or label locally updates board membership immediately, without waiting for a push or another refresh, the same way every other local filter already works.
 - **Active vs. backlog** (Kanban boards only): fetched from Jira's real backlog data at refresh time and cached alongside membership. This part genuinely can't be shadow-live — it's a classification Jira computes server-side, not a field — so it reflects the state as of your last `meta refresh --boards`, the same kind of staleness this tool already accepts for versions and components between refreshes.
 
-Only a narrow, deliberately-scoped subset of JQL is supported: `field = value` / `field != value` clauses (a configured component field, or `labels`), combined with `AND`/`OR` and parentheses, with a trailing `ORDER BY` ignored. A board whose filter uses anything else (functions like `currentUser()`, date comparisons, `IN (...)`, other fields) is marked **unsupported** in `jira-wb meta boards` output rather than silently evaluated incorrectly.
+Only a narrow, deliberately-scoped subset of JQL is supported: `field = value` / `field != value` clauses (a configured component field, `labels`, or `project`), combined with `AND`/`OR` and parentheses, with a trailing `ORDER BY` ignored. A board whose filter uses anything else (functions like `currentUser()`, date comparisons, `IN (...)`, other fields) is marked **unsupported** in `jira-wb meta boards` output rather than silently evaluated incorrectly.
+
+A board only ever shows issues from its own project in Jira, even when its saved filter's JQL never says so explicitly (many board filters are just e.g. `component = helm-chart`, relying on the board's own project association) — so a filter that doesn't already reference `project` itself is implicitly scoped to whichever project the board was fetched from. A board whose filter genuinely spans several projects (an explicit `project = A OR project = B`) is left alone.
 
 **Sprints and Scrum-based backlogs are a different Jira feature and are explicitly not supported.** A Scrum board's filter membership is still evaluated (same as Kanban), but its active/backlog split is driven by Sprint field assignment, which Jira Workbench does not track — `backlogKeys` is always `null` for Scrum-type boards. Use Jira directly for sprint planning.
 
 In the interactive `view`, use `f` (Filters) to filter by board and, for Kanban boards, by active/backlog scope, or `S` (swimlane) to group by board — an item genuinely can belong to more than one board at once (board membership isn't exclusive), so its swimlane shows every matching board joined together rather than duplicating the row.
 
 "Moving an item between boards" and editing a board's filter from Jira Workbench are not supported yet — board membership follows directly from the same component/label fields you already edit via the normal shadow workflow, and the ambiguity of which field to change for an OR-based filter needs its own design before that's added.
+
+### Local boards (bespoke filters) and the active toggle
+
+`jira-wb meta` → Boards (`M` then Enter on Boards) lists every Jira board across every synced project, plus any **local** boards you've defined yourself — one unified list, one `Type` column showing `jira`, `jira unsupported`, or `local`:
+
+```
+Name            Active  Type             Status                          Backlog
+SAT board       yes     jira             ok                              12 issues
+PLAT board      no      jira unsupported unsupported: unsupported...     n/a
+My PLAT Filter  yes     local            -                               -
+```
+
+A **local** board is a named, saved combination of the same filters Filters (`f`) already has — project/status/component/fix version/assignee plus a text pattern, each multi-select — matched the same way any other local filter is (no JQL involved), so it works regardless of what the JQL compiler above can or can't parse. From the Boards screen, `n` (new) or `e` (edit) opens a single pane with the board's Name as its own row alongside every filter row — edit any of them with Enter, same as Filters — then `ctrl+s` saves (a name is required) or `q`/Esc cancels without saving anything. `d` deletes a local board. Jira boards are list-only here — `e`/`d` on one just tells you to change the underlying Jira board or the issue's own fields instead.
+
+Every board — Jira or local — has an **Active** toggle (`a`), which is purely local and independent of whether Jira's own filter is supported: it only controls whether that board is offered as an option in the Filters screen's board picker (this Meta list always shows everything, active or not, so you can find and re-enable something later). Toggling active never affects matching for a board you've already selected, e.g. via a saved `[view].board` default.
+
+A local board can also define its own **Active filter** row — a Jira board's active/backlog split always comes from Jira's own live-fetched Kanban data (see above), but a local board has no such data, so by default `board_scope` is a no-op for it. Setting an Active filter (Enter on that row opens the same kind of filter-row sub-editor, minus the Name row) changes that: whatever matches it counts as "active"; everything else already on the board counts as "backlog" — mirroring Jira's own strict two-way Kanban split, just defined locally instead of fetched. Clearing it (`d` on that row) goes back to the no-op default.
 
 ## Creating issues
 
@@ -218,7 +319,7 @@ jira-wb view SAT-1 --original
 jira-wb view SAT-1 --diff
 ```
 
-Without a work item key, `jira-wb view` opens an interactive browser built with [Textual](https://textual.textualize.io/) — mail-style index navigation with full mouse support (click a row to open it, scroll wheel on any list or table). Active-only filtering is enabled by default; pass `--all` to include closed, done, and resolved items. Configure `[view].component` and `[view].filter` to choose the default interactive subset; pass `--component` or `--filter` to override them for one run. `[view]` also accepts `fix_version`, `assignee`, `board`, `board_scope`, `swimlane`, and `active` (boolean) to set every other filter dimension's default. `[view].nerd_font` (boolean, default `false`) switches the index's type-icon column from plain Unicode shapes to Nerd Font v3 glyphs -- purely cosmetic, opt-in only, since there's no reliable way for this tool to detect whether your terminal font actually has those glyphs. Press `s` from the index to save your current filters (all of the above, but not modified-only, which is a transient toggle) as the new `[view]` defaults, written back to `config.toml` in place -- comments and unrelated settings are preserved. `[view].preview_lines` (default 10) controls how many lines of Description and Comments are each previewed in the detail table before opening the full viewer. Click a column header to sort by it (click again to reverse; an arrow marks the active sort). Use `h` for full help, `j`/`k` or arrow keys to move, Enter or click to open an item, `/` to search rows vi-style such as `SAT-612`, `n`/`N` to repeat search, `g` to go to a matching row, `v` to type and view a work item key, `a` to toggle active-only filtering, `m` to toggle modified-only filtering, `f` to open the consolidated Filters screen (component, fix version, assignee, board, board scope, and free-text — each a row you can edit, clear, or clear all at once), `c` to create a new Jira issue (see [Creating issues](#creating-issues) above), `s` to save the current filters as the default, `S` to cycle swimlane grouping (including by board), `z` to collapse or expand the lane under the cursor (shows a hidden-item count while collapsed), `Z` to collapse or expand every visible lane at once, `P` to push all local shadow changes (opens a review list first — Enter on an item shows a full side-by-side diff, `p` pushes, `q`/Esc cancels), `M` to open Jira metadata (fix versions, components) without leaving the session, `s`/`o`/`d` for the local shadow view / original synced issue / shadow diff on a work item, `r` to revert the current item shadow, `p` to push the current item shadow to Jira, and `q` to go back or quit.
+Without a work item key, `jira-wb view` opens an interactive browser built with [Textual](https://textual.textualize.io/) — mail-style index navigation with full mouse support (click a row to open it, scroll wheel on any list or table). Active-only filtering is enabled by default; pass `--all` to include closed, done, and resolved items. Configure `[view].component` and `[view].filter` to choose the default interactive subset; pass `--component` or `--filter` to override them for one run. `[view]` also accepts `project`, `status`, `fix_version`, `assignee`, `board`, `board_scope`, `swimlane`, and `active` (boolean) to set every other filter dimension's default. `project`, `status`, `component`, `fix_version`, and `assignee` each accept a bare string or an array of strings (see the config example above) — an array matches "any of" those values, the same as picking several in the Filters screen itself. `[view].nerd_font` (boolean, default `false`) switches the index's type-icon column from plain Unicode shapes to Nerd Font v3 glyphs -- purely cosmetic, opt-in only, since there's no reliable way for this tool to detect whether your terminal font actually has those glyphs. Press `s` from the index to save your current filters (all of the above, but not modified-only, which is a transient toggle) as the new `[view]` defaults, written back to `config.toml` in place -- comments and unrelated settings are preserved. `[view].preview_lines` (default 10) controls how many lines of Description and Comments are each previewed in the detail table before opening the full viewer. Click a column header to sort by it (click again to reverse; an arrow marks the active sort). Use `h` for full help, `j`/`k` or arrow keys to move, Enter or click to open an item, `/` to search rows vi-style such as `SAT-612`, `n`/`N` to repeat search, `g` to go to a matching row, `v` to type and view a work item key, `a` to toggle active-only filtering, `m` to toggle modified-only filtering, `f` to open the consolidated Filters screen (project, status, component, fix version, assignee, board, board scope, and free-text — each a row you can edit, clear, or clear all at once; every field except board/board scope is multi-select, via a checkbox picker: type to narrow, Enter picks the top match and clears the filter box so you can keep picking, Esc/Done closes), `c` to create a new Jira issue (see [Creating issues](#creating-issues) above), `s` to save the current filters as the default, `S` to cycle swimlane grouping (including by board), `z` to collapse or expand the lane under the cursor (shows a hidden-item count while collapsed), `Z` to collapse or expand every visible lane at once, `P` to push all local shadow changes (opens a review list first — Enter on an item shows a full side-by-side diff, `p` pushes, `q`/Esc cancels), `M` to open Jira metadata (fix versions, components) without leaving the session, `s`/`o`/`d` for the local shadow view / original synced issue / shadow diff on a work item, `r` to revert the current item shadow, `p` to push the current item shadow to Jira, and `q` to go back or quit.
 
 Work item detail shows local hierarchy when available. Child items show their parent epic above the title; epics show locally synced children below the epic line.
 

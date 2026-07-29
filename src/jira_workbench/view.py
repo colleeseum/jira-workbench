@@ -12,16 +12,27 @@ from pathlib import Path
 from typing import Any
 
 from .jql import evaluate_predicate
-from .metadata import load_boards, load_field_names, load_versions, normalize_boards, version_name
+from .metadata import (
+    load_all_boards_with_settings,
+    load_all_components,
+    load_all_versions,
+    load_field_names,
+    version_name,
+)
 from .shadow import load_shadow, render_diff
-from .sync import find_existing_issue, issue_key_sort_key, issue_path_sort_key, read_json
+from .sync import (
+    FALLBACK_DONE_STATUS_NAMES,
+    find_existing_issue,
+    issue_key_sort_key,
+    issue_path_sort_key,
+    issue_project_key,
+    read_json,
+    status_category_key,
+)
 
 
 class ViewError(RuntimeError):
     pass
-
-
-DONE_STATUSES = {"close", "closed", "done", "resolved"}
 DEFAULT_RESOLUTIONS = ["Done", "Won't Do", "Duplicate", "Cannot Reproduce"]
 VIRTUAL_NONE = "(none)"
 FILTER_ANY = "(any)"  # UI-only "no filter on this dimension" sentinel; never stored
@@ -61,12 +72,8 @@ def report_field_label(jira_dir: Path, field: str) -> str:
 
 
 def version_id_to_name_map(jira_dir: Path) -> dict[str, str]:
-    cache = load_versions(jira_dir)
-    versions = as_list(as_dict(cache).get("versions")) if cache else []
     result: dict[str, str] = {}
-    for version in versions:
-        if not isinstance(version, dict):
-            continue
+    for version in load_all_versions(jira_dir):
         version_id = version.get("id")
         name = version_name(version)
         if isinstance(version_id, str) and name:
@@ -180,7 +187,10 @@ BASE_EDITABLE_FIELDS = [
 
 
 def is_active_item(item: dict[str, Any]) -> bool:
-    return display_name(item.get("status")).strip().lower() not in DONE_STATUSES
+    category = item.get("statusCategory")
+    if isinstance(category, str):
+        return category != "done"
+    return display_name(item.get("status")).strip().lower() not in FALLBACK_DONE_STATUS_NAMES
 
 
 def field_value(item: dict[str, Any], field: str) -> str:
@@ -192,13 +202,19 @@ def field_value(item: dict[str, Any], field: str) -> str:
     return display_name(item.get(field)).strip()
 
 
-def matches_field(item: dict[str, Any], field: str, value: str | None) -> bool:
-    if not value:
+def matches_field(item: dict[str, Any], field: str, values: list[str] | None) -> bool:
+    """True if `item`'s own value for `field` is any one of `values` (an
+    unset/empty list always matches, same as before this became
+    multi-select) -- mirrors the list-membership check matches_board
+    already uses for boards, just against a single-valued item field
+    instead of a list-valued one."""
+    if not values:
         return True
     actual = field_value(item, field)
-    if value == VIRTUAL_NONE:
-        return not actual
-    return actual.lower() == value.strip().lower()
+    normalized = {value.strip().lower() for value in values}
+    if VIRTUAL_NONE.lower() in normalized and not actual:
+        return True
+    return actual.lower() in normalized
 
 
 def matches_filter(item: dict[str, Any], pattern: str | None) -> bool:
@@ -233,7 +249,7 @@ def is_stale_done(item: dict[str, Any], *, max_age_days: int) -> bool:
     max_age_days -- a local, explicit stand-in for the "hide old completed
     issues" behavior Jira's own Kanban board UI applies (that setting isn't
     exposed by any API, so this is our own equivalent, not a replica)."""
-    if display_name(item.get("status")).strip().lower() not in DONE_STATUSES:
+    if is_active_item(item):
         return False
     changed = item.get("statusCategoryChangeDate")
     if not isinstance(changed, str) or not changed:
@@ -249,7 +265,7 @@ def is_stale_done(item: dict[str, Any], *, max_age_days: int) -> bool:
 def filter_items(
     items: list[dict[str, Any]],
     *,
-    field_filters: dict[str, str] | None = None,
+    field_filters: dict[str, list[str]] | None = None,
     pattern: str | None = None,
     active: bool = True,
     modified_keys: set[str] | None = None,
@@ -713,9 +729,21 @@ def display_component(value: Any) -> str:
     return "" if name == "_unassigned" else name
 
 
+def assignee_first_name_map(assignee_names: list[str]) -> dict[str, str]:
+    """Full display name -> first name, but only if every currently visible
+    assignee's first name is unique -- e.g. "Alex Smith" and "Alex Jones"
+    both showing as "Alex" would be more confusing than useful. Falls back
+    to an empty map (show full names, unchanged) the moment two different
+    people would collide on the same first name."""
+    full_names = {name for name in assignee_names if name}
+    first_names = [name.split()[0] for name in full_names]
+    if len(set(first_names)) != len(full_names):
+        return {}
+    return {name: name.split()[0] for name in full_names}
+
+
 def load_cached_boards(jira_dir: Path) -> list[dict[str, Any]]:
-    cache = load_boards(jira_dir)
-    return normalize_boards(cache.get("boards")) if cache else []
+    return load_all_boards_with_settings(jira_dir)
 
 
 def load_manifest_items(
@@ -729,9 +757,17 @@ def load_manifest_items(
     if not isinstance(items, list):
         raise ViewError(f"manifest at {manifest_path} does not contain workItems")
     boards = load_cached_boards(jira_dir)
+    status_categories = observed_status_category_map(jira_dir)
     return sorted(
         (
-            with_local_index_fields(jira_dir, item, component_field, boards=boards, dev_status_field=dev_status_field)
+            with_local_index_fields(
+                jira_dir,
+                item,
+                component_field,
+                boards=boards,
+                status_categories=status_categories,
+                dev_status_field=dev_status_field,
+            )
             for item in items
             if isinstance(item, dict)
         ),
@@ -745,6 +781,7 @@ def with_local_index_fields(
     component_field: str | None = None,
     *,
     boards: list[dict[str, Any]] | None = None,
+    status_categories: dict[str, str] | None = None,
     dev_status_field: str | None = None,
 ) -> dict[str, Any]:
     enriched = dict(item)
@@ -768,6 +805,17 @@ def with_local_index_fields(
     parent_fields = as_dict(parent.get("fields"))
     enriched["summary"] = display_name(fields.get("summary"))
     enriched["status"] = display_name(status)
+    # `status` is a bare name string (not the real status dict) whenever a
+    # local shadow status-change is in effect (see apply_shadow) -- fall
+    # back to whatever category this same status name resolves to
+    # elsewhere in the locally synced instance, since the shadow itself
+    # never stores one.
+    category = status_category_key(status)
+    if category is None:
+        if status_categories is None:
+            status_categories = observed_status_category_map(jira_dir)
+        category = status_categories.get(enriched["status"])
+    enriched["statusCategory"] = category
     enriched["type"] = display_name(issue_type)
     enriched["component"] = hierarchy_component(issue, component_field) or display_name(item.get("component"))
     enriched["fixVersion"] = fix_version_names[0] if fix_version_names else ""
@@ -777,6 +825,7 @@ def with_local_index_fields(
     enriched["epicSummary"] = display_name(parent_fields.get("summary"))
     enriched["statusCategoryChangeDate"] = display_name(fields.get("statuscategorychangedate"))
     enriched["issueId"] = issue.get("id")
+    enriched["project"] = issue_project_key(issue)
     enriched["devStatus"] = parse_dev_status_summary(fields.get(dev_status_field or DEV_STATUS_FIELD_DEFAULT))
 
     labels = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
@@ -787,16 +836,37 @@ def with_local_index_fields(
     matched_boards: list[str] = []
     board_status: dict[str, str] = {}
     for board in boards:
-        predicate = board.get("predicate")
-        if not predicate:
-            continue
-        if not evaluate_predicate(predicate, component=component_value, labels=labels):
+        if board.get("kind") == "local":
+            field_filters = board.get("fieldFilters") or {}
+            matched = all(matches_field(enriched, field, value) for field, value in field_filters.items())
+            matched = matched and matches_filter(enriched, board.get("pattern"))
+        else:
+            predicate = board.get("predicate")
+            if not predicate:
+                continue
+            matched = evaluate_predicate(predicate, component=component_value, labels=labels, project=enriched["project"])
+        if not matched:
             continue
         name = str(board.get("name") or "")
         matched_boards.append(name)
-        backlog_keys = board.get("backlogKeys")
-        if isinstance(backlog_keys, list):
-            board_status[name] = "backlog" if key in backlog_keys else "active"
+        if board.get("kind") == "local":
+            # A local board has no Jira-fetched backlog data at all -- an
+            # optional user-defined "active filter" (same fieldFilters+
+            # pattern shape as the board's own membership definition) is
+            # the only way board_scope applies to one; undefined means no
+            # board_status entry, i.e. board_scope stays a no-op for it,
+            # same as today.
+            active_filter = board.get("activeFilter")
+            if active_filter:
+                active_field_filters = active_filter.get("fieldFilters") or {}
+                is_board_active = all(
+                    matches_field(enriched, field, value) for field, value in active_field_filters.items()
+                ) and matches_filter(enriched, active_filter.get("pattern"))
+                board_status[name] = "active" if is_board_active else "backlog"
+        else:
+            backlog_keys = board.get("backlogKeys")
+            if isinstance(backlog_keys, list):
+                board_status[name] = "backlog" if key in backlog_keys else "active"
     enriched["boards"] = matched_boards
     enriched["boardStatus"] = board_status
     return enriched
@@ -809,12 +879,18 @@ def refresh_index_item(
     component_field: str | None = None,
     *,
     boards: list[dict[str, Any]] | None = None,
+    status_categories: dict[str, str] | None = None,
     dev_status_field: str | None = None,
 ) -> None:
     for index, item in enumerate(items):
         if display_name(item.get("key")) == key:
             items[index] = with_local_index_fields(
-                jira_dir, item, component_field, boards=boards, dev_status_field=dev_status_field
+                jira_dir,
+                item,
+                component_field,
+                boards=boards,
+                status_categories=status_categories,
+                dev_status_field=dev_status_field,
             )
             return
 
@@ -828,8 +904,17 @@ def refresh_stale_index_items(
     dev_status_field: str | None = None,
 ) -> None:
     boards = load_cached_boards(jira_dir)
+    status_categories = observed_status_category_map(jira_dir)
     for key in sorted(keys, key=issue_key_sort_key):
-        refresh_index_item(jira_dir, items, key, component_field, boards=boards, dev_status_field=dev_status_field)
+        refresh_index_item(
+            jira_dir,
+            items,
+            key,
+            component_field,
+            boards=boards,
+            status_categories=status_categories,
+            dev_status_field=dev_status_field,
+        )
     keys.clear()
 
 
@@ -1021,6 +1106,26 @@ def observed_field_options(jira_dir: Path, field: str, *, include_empty: str | N
     return sorted_options
 
 
+def observed_status_category_map(jira_dir: Path) -> dict[str, str]:
+    """Status display name -> Jira's real statusCategory.key ("new"/
+    "indeterminate"/"done"), built from every locally synced issue's own
+    (never shadow-merged) status. A project's workflow can name its
+    statuses anything, but every one still belongs to one of these three
+    fixed system categories -- this is what lets a status a user has
+    locally changed to (shadow-stored as a bare name, with no category of
+    its own -- see apply_shadow) still be classified correctly, as long as
+    that name has been observed on some synced issue anywhere in this
+    jira_dir."""
+    categories: dict[str, str] = {}
+    for issue in local_issues(jira_dir):
+        status = as_dict(as_dict(issue.get("fields")).get("status"))
+        name = display_name(status.get("name")).strip()
+        category = status_category_key(status)
+        if name and category:
+            categories[name] = category
+    return categories
+
+
 def field_label_options(jira_dir: Path, field: str) -> list[str]:
     values: set[str] = set()
     for issue in local_issues(jira_dir):
@@ -1051,13 +1156,10 @@ def label_type_fields(edit_fields: dict[str, dict[str, Any]] | None) -> list[tup
 
 
 def component_options(jira_dir: Path) -> list[str]:
-    cached = jira_dir / "meta" / "components.json"
-    if cached.exists():
-        value = read_json(cached)
-        components = as_list(as_dict(value).get("components"))
-        names = sorted({display_name(component).strip() for component in components if display_name(component).strip()})
-        if names:
-            return names
+    components = load_all_components(jira_dir)
+    names = sorted({display_name(component).strip() for component in components if display_name(component).strip()})
+    if names:
+        return names
     return [component for component, _ in component_counts(load_manifest_items(jira_dir))]
 
 
@@ -1066,8 +1168,7 @@ def is_active_version(version: dict[str, Any]) -> bool:
 
 
 def version_options(jira_dir: Path, *, include_inactive: bool = False) -> list[str]:
-    cache = load_versions(jira_dir)
-    versions = as_list(as_dict(cache).get("versions"))
+    versions = load_all_versions(jira_dir)
     names = sorted(
         {
             version_name(version).strip()
@@ -1128,7 +1229,12 @@ def parent_options(
 
 def is_active_issue(issue: dict[str, Any]) -> bool:
     fields = as_dict(issue.get("fields"))
-    return display_name(as_dict(fields.get("status")).get("name") or fields.get("status")).strip().lower() not in DONE_STATUSES
+    status = fields.get("status")
+    category = status_category_key(status)
+    if category is not None:
+        return category != "done"
+    name = as_dict(status).get("name") or status
+    return display_name(name).strip().lower() not in FALLBACK_DONE_STATUS_NAMES
 
 
 def issue_key_option_sort_key(option: str) -> tuple[str, int, str]:
@@ -1806,5 +1912,6 @@ def detailed_shadow_report_lines(jira_dir: Path, keys: list[str]) -> list[str]:
     if lines and lines[-1] == "":
         lines.pop()
     return lines
+
 
 

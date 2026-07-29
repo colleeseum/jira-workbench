@@ -12,6 +12,7 @@ from jira_workbench.view import (
     PILL_PALETTE,
     PRIORITY_ICONS,
     TYPE_ICONS,
+    assignee_first_name_map,
     comment_body_text,
     comments_text,
     component_counts,
@@ -36,6 +37,9 @@ from jira_workbench.view import (
     item_index_by_key,
     field_label_options,
     index_item_parent_key,
+    is_active_issue,
+    is_active_item,
+    is_stale_done,
     issue_link_groups,
     label_counts,
     label_options,
@@ -43,6 +47,7 @@ from jira_workbench.view import (
     load_manifest_items,
     issue_parent_key,
     modified_issue_keys,
+    observed_status_category_map,
     parent_options,
     parse_dev_status_summary,
     pill_color,
@@ -60,6 +65,7 @@ from jira_workbench.view import (
     text_from_adf,
     type_icon,
     version_options,
+    with_local_index_fields,
     wrap_preview_lines,
 )
 from test_sync import FakeJiraClient
@@ -575,6 +581,27 @@ def test_pill_values_normalizes_lists_dicts_strings_and_none() -> None:
     assert pill_values([{"name": ""}, None]) == []
 
 
+def test_assignee_first_name_map_shortens_when_first_names_are_unique() -> None:
+    names = ["Alex Epic", "Jordan Chen", "Jordan Chen", ""]
+
+    assert assignee_first_name_map(names) == {"Alex Epic": "Alex", "Jordan Chen": "Jordan"}
+
+
+def test_assignee_first_name_map_falls_back_to_full_names_on_collision() -> None:
+    names = ["Alex Smith", "Alex Jones"]
+
+    assert assignee_first_name_map(names) == {}
+
+
+def test_assignee_first_name_map_ignores_blank_names() -> None:
+    assert assignee_first_name_map(["", "Alex Epic"]) == {"Alex Epic": "Alex"}
+    assert assignee_first_name_map([]) == {}
+
+
+def test_assignee_first_name_map_single_word_name_is_its_own_first_name() -> None:
+    assert assignee_first_name_map(["Cher", "Alex Epic"]) == {"Cher": "Cher", "Alex Epic": "Alex"}
+
+
 def test_extract_field_names_pulls_name_from_edit_fields() -> None:
     edit_fields = {
         "customfield_10082": {"name": "Customers SAT", "schema": {"custom": "...:labels"}},
@@ -612,7 +639,7 @@ def test_shadow_change_summary_shows_custom_field_display_name(tmp_path: Path) -
 
 
 def test_resolve_fix_version_names_prefers_cached_current_name_over_stale_embedded_one(tmp_path: Path) -> None:
-    write_json(tmp_path / "meta/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
 
     assert resolve_fix_version_names(tmp_path, [{"id": "10000", "name": "v1"}]) == ["v1-renamed"]
 
@@ -624,7 +651,7 @@ def test_resolve_fix_version_names_falls_back_to_embedded_name_when_id_not_cache
 
 
 def test_resolve_fix_version_names_handles_multiple_entries(tmp_path: Path) -> None:
-    write_json(tmp_path / "meta/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
 
     assert resolve_fix_version_names(tmp_path, [{"id": "10000", "name": "v1"}, {"id": "99999", "name": "v2"}]) == [
         "v1-renamed",
@@ -743,7 +770,7 @@ def _write_issue_with_stale_fix_version(jira_dir: Path) -> None:
             },
         },
     )
-    write_json(jira_dir / "meta/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+    write_json(jira_dir / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
 
 
 def test_load_manifest_items_shows_current_version_name_not_stale_embedded_one(tmp_path: Path) -> None:
@@ -912,7 +939,7 @@ def test_observed_field_options_orders_priority_by_severity(tmp_path: Path) -> N
 def test_selectable_field_options_use_cached_components_when_available(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     write_json(
-        jira_dir / "meta/components.json",
+        jira_dir / "meta/SAT/components.json",
         {"components": [{"name": "zeta"}, {"name": "helm-chart"}]},
     )
 
@@ -921,7 +948,7 @@ def test_selectable_field_options_use_cached_components_when_available(tmp_path:
 
 def test_fix_version_options_use_cached_versions(tmp_path: Path) -> None:
     write_json(
-        tmp_path / "meta/versions.json",
+        tmp_path / "meta/SAT/versions.json",
         {
             "versions": [
                 {"id": "10001", "name": "helm-chart-sa 3.4.2", "released": True},
@@ -1271,7 +1298,7 @@ def test_filter_items_filters_component_and_active_status() -> None:
         {"key": "SAT-5", "component": "helm-chart", "status": "Close"},
     ]
 
-    filtered = filter_items(items, field_filters={"component": "helm-chart"})
+    filtered = filter_items(items, field_filters={"component": ["helm-chart"]})
 
     assert [item["key"] for item in filtered] == ["SAT-1"]
 
@@ -1282,7 +1309,7 @@ def test_filter_items_can_include_closed_items() -> None:
         {"key": "SAT-2", "component": "helm-chart", "status": "Done"},
     ]
 
-    filtered = filter_items(items, field_filters={"component": "helm-chart"}, active=False)
+    filtered = filter_items(items, field_filters={"component": ["helm-chart"]}, active=False)
 
     assert [item["key"] for item in filtered] == ["SAT-1", "SAT-2"]
 
@@ -1294,7 +1321,7 @@ def test_filter_items_matches_text_pattern() -> None:
         {"key": "SAT-3", "summary": "Gateway docs", "component": "helm-chart", "status": "Done"},
     ]
 
-    filtered = filter_items(items, field_filters={"component": "helm-chart"}, pattern="prom")
+    filtered = filter_items(items, field_filters={"component": ["helm-chart"]}, pattern="prom")
 
     assert [item["key"] for item in filtered] == ["SAT-1"]
 
@@ -1306,10 +1333,10 @@ def test_filter_items_matches_fix_version_including_none() -> None:
         {"key": "SAT-3", "status": "Open"},
     ]
 
-    assert [item["key"] for item in filter_items(items, field_filters={"fixVersion": "helm-chart-sa 3.4.4"})] == [
+    assert [item["key"] for item in filter_items(items, field_filters={"fixVersion": ["helm-chart-sa 3.4.4"]})] == [
         "SAT-1"
     ]
-    assert [item["key"] for item in filter_items(items, field_filters={"fixVersion": "(none)"})] == [
+    assert [item["key"] for item in filter_items(items, field_filters={"fixVersion": ["(none)"]})] == [
         "SAT-2",
         "SAT-3",
     ]
@@ -1322,11 +1349,14 @@ def test_matches_field_and_field_value_work_generically() -> None:
     item_unassigned = {"assignee": ""}
 
     assert field_value(item_with_assignee, "assignee") == "Jane Doe"
-    assert matches_field(item_with_assignee, "assignee", "jane doe") is True
-    assert matches_field(item_with_assignee, "assignee", "Someone Else") is False
+    assert matches_field(item_with_assignee, "assignee", ["jane doe"]) is True
+    assert matches_field(item_with_assignee, "assignee", ["Someone Else"]) is False
     assert matches_field(item_with_assignee, "assignee", None) is True
-    assert matches_field(item_unassigned, "assignee", "(none)") is True
-    assert matches_field(item_with_assignee, "assignee", "(none)") is False
+    assert matches_field(item_with_assignee, "assignee", []) is True
+    assert matches_field(item_unassigned, "assignee", ["(none)"]) is True
+    assert matches_field(item_with_assignee, "assignee", ["(none)"]) is False
+    # multi-select: matches if the item's value is ANY of the selected ones
+    assert matches_field(item_with_assignee, "assignee", ["Someone Else", "Jane Doe"]) is True
 
 
 def test_distinct_field_values_counts_and_buckets_missing() -> None:
@@ -1375,7 +1405,7 @@ def test_filter_items_modified_only_combines_with_component_filter() -> None:
     modified_keys = {"SAT-1", "SAT-2"}
 
     narrowed = filter_items(
-        items, field_filters={"component": "helm-chart"}, modified_keys=modified_keys, modified_only=True
+        items, field_filters={"component": ["helm-chart"]}, modified_keys=modified_keys, modified_only=True
     )
     assert [item["key"] for item in narrowed] == ["SAT-1"]
 
@@ -1686,7 +1716,7 @@ def _write_board_issue(tmp_path: Path, key: str, component: str, labels: list[st
 
 
 def _write_boards_cache(tmp_path: Path, boards: list[dict]) -> None:
-    write_json(tmp_path / "meta" / "boards.json", {"project": "SAT", "fetchedAt": "now", "boards": boards})
+    write_json(tmp_path / "meta" / "SAT" / "boards.json", {"project": "SAT", "fetchedAt": "now", "boards": boards})
 
 
 def test_load_manifest_items_includes_labels(tmp_path: Path) -> None:
@@ -1712,6 +1742,79 @@ def test_load_manifest_items_computes_board_membership_from_predicate(tmp_path: 
     assert by_key["SAT-2"]["boards"] == []
 
 
+def test_load_manifest_items_board_membership_is_scoped_to_the_boards_own_project(tmp_path: Path) -> None:
+    # Regression: a board's real JQL filter is usually "project = X AND
+    # ...". A PLAT issue sharing the same component as a SAT issue must not
+    # show up as a member of a board whose predicate is scoped to SAT, now
+    # that more than one project can be synced into the same jira_dir.
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    _write_board_issue(tmp_path, "PLAT-1", "helm-chart")
+    _write_boards_cache(
+        tmp_path,
+        [
+            {
+                "id": 36,
+                "name": "SAT board",
+                "type": "simple",
+                "predicate": {
+                    "op": "and",
+                    "clauses": [
+                        {"op": "eq", "field": "project", "value": "SAT"},
+                        {"op": "eq", "field": "component", "value": "helm-chart"},
+                    ],
+                },
+            }
+        ],
+    )
+
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["SAT-1"]["boards"] == ["SAT board"]
+    assert by_key["PLAT-1"]["boards"] == []
+
+
+def test_load_manifest_items_computes_membership_for_a_local_board(tmp_path: Path) -> None:
+    from jira_workbench.metadata import add_local_board
+
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    _write_board_issue(tmp_path, "SAT-2", "other")
+    add_local_board(tmp_path, "My Helm Filter", {"component": ["helm-chart"]}, None)
+
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["SAT-1"]["boards"] == ["My Helm Filter"]
+    assert by_key["SAT-2"]["boards"] == []
+
+
+def test_load_manifest_items_local_board_matches_by_pattern_too(tmp_path: Path) -> None:
+    from jira_workbench.metadata import add_local_board
+
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    add_local_board(tmp_path, "My Filter", {}, "summary")
+
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["SAT-1"]["boards"] == ["My Filter"]
+
+
+def test_load_manifest_items_local_board_membership_ignores_active_flag(tmp_path: Path) -> None:
+    # Active is a purely local, picker-visibility switch -- it must never
+    # affect whether a board a user has already selected still matches.
+    from jira_workbench.metadata import add_local_board, set_board_active
+
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    add_local_board(tmp_path, "My Helm Filter", {"component": ["helm-chart"]}, None)
+    set_board_active(tmp_path, "local", "My Helm Filter", False)
+
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["SAT-1"]["boards"] == ["My Helm Filter"]
+
+
 def test_load_manifest_items_computes_board_status_active_vs_backlog(tmp_path: Path) -> None:
     _write_board_issue(tmp_path, "SAT-1", "helm-chart")
     _write_board_issue(tmp_path, "SAT-2", "helm-chart")
@@ -1733,6 +1836,60 @@ def test_load_manifest_items_computes_board_status_active_vs_backlog(tmp_path: P
 
     assert by_key["SAT-1"]["boardStatus"] == {"SAT board": "active"}
     assert by_key["SAT-2"]["boardStatus"] == {"SAT board": "backlog"}
+
+
+def test_load_manifest_items_local_board_active_filter_splits_active_vs_backlog(tmp_path: Path) -> None:
+    from jira_workbench.metadata import add_local_board
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "In Progress"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-2/issue.json",
+        {
+            "key": "SAT-2",
+            "fields": {
+                "summary": "Two",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Done"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    add_local_board(
+        tmp_path,
+        "My Helm Filter",
+        {"component": ["helm-chart"]},
+        None,
+        active_filter={"fieldFilters": {"status": ["In Progress"]}, "pattern": None},
+    )
+
+    items = load_manifest_items(tmp_path, component_field="components")
+    by_key = {item["key"]: item for item in items}
+
+    assert by_key["SAT-1"]["boardStatus"] == {"My Helm Filter": "active"}
+    assert by_key["SAT-2"]["boardStatus"] == {"My Helm Filter": "backlog"}
+
+
+def test_load_manifest_items_local_board_without_active_filter_has_no_board_status(tmp_path: Path) -> None:
+    from jira_workbench.metadata import add_local_board
+
+    _write_board_issue(tmp_path, "SAT-1", "helm-chart")
+    add_local_board(tmp_path, "My Helm Filter", {"component": ["helm-chart"]}, None)
+
+    items = load_manifest_items(tmp_path, component_field="customfield_10071")
+
+    assert items[0]["boardStatus"] == {}
 
 
 def test_board_membership_reflects_shadow_edit_immediately(tmp_path: Path) -> None:
@@ -1782,6 +1939,77 @@ def test_is_stale_done() -> None:
     assert is_stale_done({"status": "Done", "statusCategoryChangeDate": recent}, max_age_days=7) is False
     assert is_stale_done({"status": "In Progress", "statusCategoryChangeDate": old}, max_age_days=7) is False
     assert is_stale_done({"status": "Done", "statusCategoryChangeDate": None}, max_age_days=7) is False
+
+
+def test_is_active_item_uses_real_status_category_not_hardcoded_names() -> None:
+    # Regression: a custom workflow status ("Solved") that Jira classifies
+    # as Done must be treated as done, even though its *name* isn't one of
+    # the hardcoded English words the old code guessed from.
+    assert is_active_item({"status": "Solved", "statusCategory": "done"}) is False
+    assert is_active_item({"status": "Solved", "statusCategory": "indeterminate"}) is True
+    # No statusCategory at all (e.g. a manifest synced before this existed)
+    # -- falls back to the old hardcoded name list rather than crashing or
+    # always assuming active.
+    assert is_active_item({"status": "Done"}) is False
+    assert is_active_item({"status": "Solved"}) is True  # unrecognized name, no category -- assumed active
+
+
+def test_is_stale_done_uses_real_status_category() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    old = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+
+    assert is_stale_done(
+        {"status": "Solved", "statusCategory": "done", "statusCategoryChangeDate": old}, max_age_days=7
+    ) is True
+    assert is_stale_done(
+        {"status": "Solved", "statusCategory": "indeterminate", "statusCategoryChangeDate": old}, max_age_days=7
+    ) is False
+
+
+def test_is_active_issue_uses_real_status_category() -> None:
+    solved = {"fields": {"status": {"name": "Solved", "statusCategory": {"key": "done"}}}}
+    in_review = {"fields": {"status": {"name": "In Review", "statusCategory": {"key": "indeterminate"}}}}
+
+    assert is_active_issue(solved) is False
+    assert is_active_issue(in_review) is True
+
+
+def test_observed_status_category_map_scans_local_issues(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"status": {"name": "Solved", "statusCategory": {"key": "done"}}}},
+    )
+    write_json(
+        tmp_path / "components/_unassigned/SAT-2/issue.json",
+        {"key": "SAT-2", "fields": {"status": {"name": "In Review", "statusCategory": {"key": "indeterminate"}}}},
+    )
+
+    assert observed_status_category_map(tmp_path) == {"Solved": "done", "In Review": "indeterminate"}
+
+
+def test_with_local_index_fields_resolves_shadow_changed_status_category(tmp_path: Path) -> None:
+    from jira_workbench.shadow import set_field
+
+    # SAT-1 currently "To Do"; SAT-2 has already been observed with the
+    # custom "Solved" status (a status Jira classifies as Done). Shadow-
+    # editing SAT-1's status to "Solved" leaves no statusCategory on SAT-1's
+    # own (shadow-overwritten) status field -- it must be resolved via
+    # SAT-2's already-observed category instead.
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "One", "status": {"name": "To Do", "statusCategory": {"key": "new"}}}},
+    )
+    write_json(
+        tmp_path / "components/_unassigned/SAT-2/issue.json",
+        {"key": "SAT-2", "fields": {"summary": "Two", "status": {"name": "Solved", "statusCategory": {"key": "done"}}}},
+    )
+    set_field(tmp_path, "SAT-1", "status", "Solved")
+
+    enriched = with_local_index_fields(tmp_path, {"key": "SAT-1"}, "components")
+
+    assert enriched["status"] == "Solved"
+    assert enriched["statusCategory"] == "done"
 
 
 def test_filter_items_max_done_age_days() -> None:

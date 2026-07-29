@@ -10,7 +10,18 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
-from .sync import build_manifest, component_slug, find_existing_issue, issue_key_sort_key, read_json, updated_at, utc_now, write_json
+from .metadata import is_project_read_only
+from .sync import (
+    build_manifest,
+    component_slug,
+    find_existing_issue,
+    issue_key_sort_key,
+    issue_project_key,
+    read_json,
+    updated_at,
+    utc_now,
+    write_json,
+)
 
 
 API_PUSH_FIELDS = {
@@ -144,7 +155,24 @@ def ensure_shadow(jira_dir: Path, key: str) -> dict[str, Any]:
     return load_shadow(jira_dir, key) or new_shadow(jira_dir, key)
 
 
+def raise_if_project_read_only(jira_dir: Path, key: str) -> None:
+    """Blocks field/status edits for an issue whose project is marked
+    read-only in the local project registry (see metadata.py's
+    write_project_registry/is_project_read_only) -- the one enforcement
+    point shared by every field-editing caller across the CLI and TUI.
+    Comments are unaffected: add_comment/edit_comment/delete_comment/
+    remove_local_comment are separate functions and never call this.
+    """
+    issue = read_json(issue_path(jira_dir, key))
+    if not isinstance(issue, dict):
+        return
+    project = issue_project_key(issue)
+    if is_project_read_only(jira_dir, project):
+        raise ShadowError(f"{key}: project {project} is read-only (comments are still allowed)")
+
+
 def set_field(jira_dir: Path, key: str, field: str, value: Any) -> dict[str, Any]:
+    raise_if_project_read_only(jira_dir, key)
     shadow = ensure_shadow(jira_dir, key)
     fields = shadow.setdefault("fields", {})
     if not isinstance(fields, dict):
@@ -156,6 +184,7 @@ def set_field(jira_dir: Path, key: str, field: str, value: Any) -> dict[str, Any
 
 
 def unset_field(jira_dir: Path, key: str, field: str) -> dict[str, Any]:
+    raise_if_project_read_only(jira_dir, key)
     shadow = ensure_shadow(jira_dir, key)
     fields = shadow.setdefault("fields", {})
     if not isinstance(fields, dict):
@@ -266,6 +295,7 @@ def set_status_change(
     *,
     resolution: str | None = None,
 ) -> dict[str, Any]:
+    raise_if_project_read_only(jira_dir, key)
     shadow = ensure_shadow(jira_dir, key)
     if resolution:
         shadow["statusChange"] = {"resolution": resolution}

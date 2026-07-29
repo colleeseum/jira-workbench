@@ -11,7 +11,7 @@ from textual.widgets import DataTable, Footer, Header
 
 from ...view import FILTER_ANY, VIRTUAL_NONE, distinct_field_values
 from ..render import render_pills
-from ..widgets.prompts import OptionPickerScreen, TextPromptScreen
+from ..widgets.prompts import MultiOptionPickerScreen, OptionPickerScreen, TextPromptScreen
 from ..widgets.tables import ClickableRowDataTable
 
 PATTERN_KEY = "pattern"
@@ -30,9 +30,14 @@ class FilterField:
 
 
 # The single place to touch when adding a future filterable dimension.
+# Every "choice" field here except board/boardScope is multi-select (see
+# MultiOptionPickerScreen) -- a board selection stays single-value, since
+# picking a board is inherently one-at-a-time.
 FILTER_FIELDS: list[FilterField] = [
     FilterField(key="active", label="Active only", kind="toggle"),
     FilterField(key="modified", label="Modified only", kind="toggle"),
+    FilterField(key="project", label="Project", kind="choice"),
+    FilterField(key="status", label="Status", kind="choice"),
     FilterField(key="component", label="Component", kind="choice", empty_bucket="_unassigned"),
     FilterField(key="fixVersion", label="Fix version", kind="choice"),
     FilterField(key="assignee", label="Assignee", kind="choice"),
@@ -46,7 +51,7 @@ FILTER_FIELDS: list[FilterField] = [
 class FiltersResult:
     active_only: bool
     modified_only: bool
-    field_filters: dict[str, str] = field(default_factory=dict)
+    field_filters: dict[str, list[str]] = field(default_factory=dict)
     pattern: str | None = None
     board: str | None = None
     board_scope: str | None = None
@@ -74,7 +79,7 @@ class FiltersScreen(Screen[FiltersResult]):
         *,
         active_only: bool,
         modified_only: bool,
-        field_filters: dict[str, str],
+        field_filters: dict[str, list[str]],
         pattern: str | None,
         boards: list[str] | None = None,
         board: str | None = None,
@@ -85,7 +90,7 @@ class FiltersScreen(Screen[FiltersResult]):
         self._boards = list(boards or [])
         self.active_only = active_only
         self.modified_only = modified_only
-        self.field_filters: dict[str, str] = dict(field_filters)
+        self.field_filters: dict[str, list[str]] = {k: list(v) for k, v in field_filters.items() if v}
         self.pattern = pattern
         self.board = board
         self.board_scope = board_scope
@@ -111,10 +116,12 @@ class FiltersScreen(Screen[FiltersResult]):
             return self.board or FILTER_ANY
         if spec.key == BOARD_SCOPE_KEY:
             return (self.board_scope or FILTER_ANY).capitalize() if self.board_scope else FILTER_ANY
-        value = self.field_filters.get(spec.key)
-        if value and spec.key in ("component", "fixVersion"):
-            return render_pills([value])
-        return value or FILTER_ANY
+        values = self.field_filters.get(spec.key)
+        if not values:
+            return FILTER_ANY
+        if spec.key in ("component", "fixVersion"):
+            return render_pills(values)
+        return ", ".join(values)
 
     def _rebuild_rows(self) -> None:
         table = self.query_one(DataTable)
@@ -155,10 +162,16 @@ class FiltersScreen(Screen[FiltersResult]):
         self.action_edit(key)
 
     def _board_counts(self) -> list[tuple[str, int]]:
+        # Only count boards already in self._boards (the caller's known/
+        # active list) -- an item's own "boards" membership list can
+        # reference an inactive board too (active never affects matching,
+        # only the picker), and blindly counting every name seen there
+        # would silently resurrect it as a pickable option.
         counts = {name: 0 for name in self._boards}
         for item in self._items:
             for name in item.get("boards", []):
-                counts[name] = counts.get(name, 0) + 1
+                if name in counts:
+                    counts[name] += 1
         return sorted(counts.items(), key=lambda row: row[0].lower())
 
     @work
@@ -173,15 +186,21 @@ class FiltersScreen(Screen[FiltersResult]):
             self._rebuild_rows()
             return
 
+        if spec.key in (BOARD_KEY, BOARD_SCOPE_KEY):
+            await self._edit_single_select(spec)
+        else:
+            await self._edit_multi_select(spec)
+        self._rebuild_rows()
+
+    async def _edit_single_select(self, spec: FilterField) -> None:
+        # Board/board-scope stay single-value -- picking one board (or one
+        # scope) at a time is the only thing that makes sense here.
         if spec.key == BOARD_KEY:
             counts = self._board_counts()
             current_value = self.board
-        elif spec.key == BOARD_SCOPE_KEY:
+        else:
             counts = [(choice.capitalize(), 0) for choice in BOARD_SCOPE_CHOICES]
             current_value = self.board_scope.capitalize() if self.board_scope else None
-        else:
-            counts = distinct_field_values(self._items, spec.key, empty_bucket=spec.empty_bucket)
-            current_value = self.field_filters.get(spec.key)
 
         options = [FILTER_ANY]
         label_to_value: dict[str, str | None] = {FILTER_ANY: None}
@@ -202,13 +221,29 @@ class FiltersScreen(Screen[FiltersResult]):
             self.board = value
             if value is None:
                 self.board_scope = None
-        elif spec.key == BOARD_SCOPE_KEY:
-            self.board_scope = value.lower() if value else None
-        elif value is None:
-            self.field_filters.pop(spec.key, None)
         else:
-            self.field_filters[spec.key] = value
-        self._rebuild_rows()
+            self.board_scope = value.lower() if value else None
+
+    async def _edit_multi_select(self, spec: FilterField) -> None:
+        counts = distinct_field_values(self._items, spec.key, empty_bucket=spec.empty_bucket)
+        label_to_value: dict[str, str] = {}
+        options: list[str] = []
+        current_values = self.field_filters.get(spec.key, [])
+        selected_labels: list[str] = []
+        for value, count in counts:
+            label = f"{value} ({count})"
+            options.append(label)
+            label_to_value[label] = value
+            if value in current_values:
+                selected_labels.append(label)
+        chosen = await self.app.push_screen_wait(
+            MultiOptionPickerScreen(f"{spec.label} filter:", options, selected=selected_labels)
+        )
+        values = [label_to_value[label] for label in chosen]
+        if values:
+            self.field_filters[spec.key] = values
+        else:
+            self.field_filters.pop(spec.key, None)
 
     def _toggle(self, key: str) -> None:
         if key == "active":

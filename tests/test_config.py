@@ -6,7 +6,185 @@ from pathlib import Path
 
 import pytest
 
-from jira_workbench.config import ConfigError, load_config, save_view_defaults, secure_config_permissions
+from jira_workbench.config import (
+    DEFAULT_JIRA_DIR,
+    ConfigError,
+    ProjectSettings,
+    WorkbenchConfig,
+    load_config,
+    resolve_jira_dir,
+    save_view_defaults,
+    secure_config_permissions,
+)
+
+
+def test_load_config_reads_projects_array(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "",
+                "[[projects]]",
+                'key = "OTHERPROJ"',
+                "read_only = true",
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.projects == (
+        ProjectSettings(key="SAT", default=True, read_only=False),
+        ProjectSettings(key="OTHERPROJ", default=False, read_only=True),
+    )
+
+
+def test_load_config_rejects_two_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "",
+                "[[projects]]",
+                'key = "OTHERPROJ"',
+                "default = true",
+            ]
+        )
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_project_entry_without_key(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nread_only = true\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_reads_history_months(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "sync_history_months = 12",
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "",
+                "[[projects]]",
+                'key = "HUGEPROJ"',
+                "history_months = 6",
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.sync_history_months == 12
+    assert config.projects == (
+        ProjectSettings(key="SAT", default=True),
+        ProjectSettings(key="HUGEPROJ", history_months=6),
+    )
+
+
+def test_load_config_rejects_non_positive_top_level_history_months(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("sync_history_months = 0\n")
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_non_positive_project_history_months(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\nhistory_months = -1\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_effective_history_months_prefers_project_override_over_global_default() -> None:
+    config = WorkbenchConfig(
+        sync_history_months=24,
+        projects=(ProjectSettings(key="SAT"), ProjectSettings(key="HUGEPROJ", history_months=6)),
+    )
+
+    assert config.effective_history_months("HUGEPROJ") == 6
+    assert config.effective_history_months("SAT") == 24
+
+
+def test_effective_history_months_falls_back_to_global_default_for_unknown_project() -> None:
+    config = WorkbenchConfig(sync_history_months=24)
+
+    assert config.effective_history_months("SOMETHING") == 24
+
+
+def test_effective_history_months_none_when_nothing_configured() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
+
+    assert config.effective_history_months("SAT") is None
+
+
+def test_resolved_projects_falls_back_to_flat_project_key() -> None:
+    config = WorkbenchConfig(project="SAT")
+
+    assert config.resolved_projects() == (ProjectSettings(key="SAT", default=True),)
+
+
+def test_resolved_projects_empty_when_nothing_configured() -> None:
+    assert WorkbenchConfig().resolved_projects() == ()
+
+
+def test_default_project_key_prefers_explicit_default() -> None:
+    config = WorkbenchConfig(
+        projects=(ProjectSettings(key="SAT"), ProjectSettings(key="OTHERPROJ", default=True))
+    )
+
+    assert config.default_project_key() == "OTHERPROJ"
+
+
+def test_default_project_key_is_the_sole_project_when_unmarked() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
+
+    assert config.default_project_key() == "SAT"
+
+
+def test_default_project_key_is_none_when_ambiguous() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"), ProjectSettings(key="OTHERPROJ")))
+
+    assert config.default_project_key() is None
+
+
+def test_read_only_project_keys_collects_only_read_only_entries() -> None:
+    config = WorkbenchConfig(
+        projects=(
+            ProjectSettings(key="SAT", default=True),
+            ProjectSettings(key="OTHERPROJ", read_only=True),
+        )
+    )
+
+    assert config.read_only_project_keys() == frozenset({"OTHERPROJ"})
+
+
+def test_resolve_jira_dir_prefers_explicit_flag_over_config() -> None:
+    assert resolve_jira_dir("/from/flag", "/from/config") == Path("/from/flag")
+
+
+def test_resolve_jira_dir_falls_back_to_config_value() -> None:
+    assert resolve_jira_dir(None, "/from/config") == Path("/from/config")
+
+
+def test_resolve_jira_dir_defaults_to_shared_data_dir_when_unset() -> None:
+    assert resolve_jira_dir(None, None) == DEFAULT_JIRA_DIR
 
 
 @pytest.mark.skipif(os.name != "posix", reason="file permission bits are POSIX-specific")
@@ -46,8 +224,8 @@ def test_load_config_reads_new_view_fields(tmp_path: Path) -> None:
 
     config = load_config(path)
 
-    assert config.view_fix_version == "2026.07"
-    assert config.view_assignee == "you@example.com"
+    assert config.view_fix_version == ("2026.07",)
+    assert config.view_assignee == ("you@example.com",)
     assert config.view_board == "SAT board"
     assert config.view_board_scope == "active"
     assert config.view_active is False
@@ -129,7 +307,7 @@ def test_save_view_defaults_creates_file_with_restrictive_permissions(tmp_path: 
     save_view_defaults(path, {"component": "helm-chart", "active": False})
 
     config = load_config(path)
-    assert config.view_component == "helm-chart"
+    assert config.view_component == ("helm-chart",)
     assert config.view_active is False
     if os.name == "posix":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -154,7 +332,7 @@ def test_save_view_defaults_preserves_unrelated_content_and_comments(tmp_path: P
 
     config = load_config(path)
     assert config.jira_api_token == "secret"
-    assert config.view_component == "helm-chart"
+    assert config.view_component == ("helm-chart",)
     assert config.view_preview_lines == 10
     assert config.view_board == "SAT board"
     assert config.view_filter == "prometheus"
@@ -169,6 +347,76 @@ def test_save_view_defaults_clears_key_on_none(tmp_path: Path) -> None:
     config = load_config(path)
     assert config.view_board is None
     assert config.view_board_scope is None
+
+
+def test_load_config_reads_array_view_fields(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[view]\n"
+        'project = ["SAT", "PLAT"]\n'
+        'status = ["To Do", "In Progress"]\n'
+        'component = ["helm-chart", "docs"]\n'
+    )
+
+    config = load_config(path)
+
+    assert config.view_project == ("SAT", "PLAT")
+    assert config.view_status == ("To Do", "In Progress")
+    assert config.view_component == ("helm-chart", "docs")
+
+
+def test_load_config_view_project_and_status_default_to_none(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("")
+
+    config = load_config(path)
+
+    assert config.view_project is None
+    assert config.view_status is None
+
+
+def test_load_config_rejects_empty_array_view_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[view]\nproject = []\n")
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_non_string_array_entries(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[view]\nproject = [1, 2]\n")
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_non_string_non_array_view_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[view]\nproject = 42\n")
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_save_view_defaults_round_trips_list_values(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+
+    save_view_defaults(path, {"project": ["SAT", "PLAT"], "status": ["Done"]})
+
+    config = load_config(path)
+    assert config.view_project == ("SAT", "PLAT")
+    assert config.view_status == ("Done",)
+
+
+def test_save_view_defaults_clears_key_on_empty_list(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[view]\nproject = ["SAT"]\n')
+
+    save_view_defaults(path, {"project": []})
+
+    config = load_config(path)
+    assert config.view_project is None
 
 
 def test_save_view_defaults_rejects_unparseable_existing_file(tmp_path: Path) -> None:

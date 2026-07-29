@@ -111,7 +111,7 @@ class _Parser:
         field_name = field_token[1].strip().lower()
         negate = op_token[0] == "NEQ"
         if field_name == "project":
-            leaf: dict[str, Any] = {"op": "true"}
+            leaf: dict[str, Any] = {"op": "eq", "field": "project", "value": value_token[1]}
         elif field_name == "labels":
             leaf = {"op": "eq", "field": "labels", "value": value_token[1]}
         elif field_name in self._component_field_names:
@@ -146,16 +146,51 @@ def compile_jql(jql: str, *, component_field_names: list[str]) -> tuple[dict[str
     return tree, None
 
 
-def evaluate_predicate(predicate: dict[str, Any], *, component: str | None, labels: list[str]) -> bool:
+def predicate_scopes_project(predicate: dict[str, Any]) -> bool:
+    """True if this predicate tree already constrains "project" somewhere
+    -- an explicit OR of several `project = X` clauses (a genuine
+    multi-project board) counts as scoped, same as a single one."""
+    op = predicate.get("op")
+    if op == "eq":
+        return predicate.get("field") == "project"
+    if op == "not":
+        return predicate_scopes_project(predicate["clause"])
+    if op in ("and", "or"):
+        return any(predicate_scopes_project(clause) for clause in predicate["clauses"])
+    return False
+
+
+def scope_predicate_to_project(predicate: dict[str, Any], project: str) -> dict[str, Any]:
+    """A Jira board only ever shows issues from its own project, even when
+    its saved filter's JQL doesn't literally say so (a board's filter is
+    already implicitly scoped by Jira itself) -- if the compiled predicate
+    doesn't already reference "project" anywhere, AND in that implicit
+    constraint so evaluate_predicate enforces it too. A no-op if the
+    filter already scopes by project on its own (e.g. a genuine
+    multi-project board's own "project = A OR project = B" clause)."""
+    if predicate_scopes_project(predicate):
+        return predicate
+    return {"op": "and", "clauses": [{"op": "eq", "field": "project", "value": project}, predicate]}
+
+
+def evaluate_predicate(
+    predicate: dict[str, Any], *, component: str | None, labels: list[str], project: str | None = None
+) -> bool:
     op = predicate.get("op")
     if op == "true":
         return True
     if op == "and":
-        return all(evaluate_predicate(clause, component=component, labels=labels) for clause in predicate["clauses"])
+        return all(
+            evaluate_predicate(clause, component=component, labels=labels, project=project)
+            for clause in predicate["clauses"]
+        )
     if op == "or":
-        return any(evaluate_predicate(clause, component=component, labels=labels) for clause in predicate["clauses"])
+        return any(
+            evaluate_predicate(clause, component=component, labels=labels, project=project)
+            for clause in predicate["clauses"]
+        )
     if op == "not":
-        return not evaluate_predicate(predicate["clause"], component=component, labels=labels)
+        return not evaluate_predicate(predicate["clause"], component=component, labels=labels, project=project)
     if op == "eq":
         field = predicate["field"]
         value = str(predicate["value"]).lower()
@@ -163,5 +198,7 @@ def evaluate_predicate(predicate: dict[str, Any], *, component: str | None, labe
             return bool(component) and component.lower() == value
         if field == "labels":
             return any(label.lower() == value for label in labels)
+        if field == "project":
+            return bool(project) and project.lower() == value
         raise ValueError(f"unknown predicate field: {field!r}")
     raise ValueError(f"unknown predicate node: {predicate!r}")

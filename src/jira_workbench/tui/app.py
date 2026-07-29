@@ -6,7 +6,7 @@ from typing import Any
 from textual import events
 from textual.app import App
 
-from ..metadata import JiraApiConfig, MetadataError, jira_api_client
+from ..metadata import JiraApiConfig, MetadataError, jira_api_client, load_project_registry
 from ..view import DEV_STATUS_FIELD_DEFAULT, normalize_swimlane
 
 DEFAULT_PREVIEW_LINES = 10
@@ -22,9 +22,11 @@ class JiraWorkbenchApp(App):
         jira_dir: Path,
         *,
         component_field: str | None = None,
-        component: str | None = None,
-        fix_version: str | None = None,
-        assignee: str | None = None,
+        project_filter: str | tuple[str, ...] | None = None,
+        status_filter: str | tuple[str, ...] | None = None,
+        component: str | tuple[str, ...] | None = None,
+        fix_version: str | tuple[str, ...] | None = None,
+        assignee: str | tuple[str, ...] | None = None,
         board: str | None = None,
         board_scope: str | None = None,
         pattern: str | None = None,
@@ -51,6 +53,8 @@ class JiraWorkbenchApp(App):
         self.hide_done_after_days = hide_done_after_days if hide_done_after_days and hide_done_after_days > 0 else None
         self.nerd_font_enabled = nerd_font
         self.dev_status_field = dev_status_field or DEV_STATUS_FIELD_DEFAULT
+        self.initial_project_filter = project_filter
+        self.initial_status_filter = status_filter
         self.initial_component = component
         self.initial_fix_version = fix_version
         self.initial_assignee = assignee
@@ -83,6 +87,17 @@ class JiraWorkbenchApp(App):
         self.edit_fields_cache: dict[str, dict[str, dict[str, object]]] = {}
         self.dev_status_cache: dict[str, Any] = {}
         self.all_field_names_fetched = False
+        # Loaded once at startup (written by `jira-wb sync`, not expected to
+        # change mid-session) -- this is a proactive UX layer only. The real
+        # enforcement is shadow.py's raise_if_project_read_only, which every
+        # field/status edit already goes through regardless of entry point;
+        # checking here just avoids surfacing a raw ShadowError to the user.
+        self._read_only_projects = load_project_registry(self.jira_dir)
+
+    def is_project_read_only(self, project_key: str | None) -> bool:
+        if not project_key:
+            return False
+        return bool(self._read_only_projects.get(project_key, {}).get("readOnly"))
 
     def mark_changed(self, key: str) -> None:
         self._changed_keys.add(key)
@@ -125,6 +140,8 @@ class JiraWorkbenchApp(App):
 
         self.push_screen(
             IndexScreen(
+                project=self.initial_project_filter,
+                status=self.initial_status_filter,
                 component=self.initial_component,
                 fix_version=self.initial_fix_version,
                 assignee=self.initial_assignee,
@@ -157,9 +174,11 @@ def run_view(
     jira_dir: Path,
     *,
     component_field: str | None = None,
-    component: str | None = None,
-    fix_version: str | None = None,
-    assignee: str | None = None,
+    project_filter: str | tuple[str, ...] | None = None,
+    status_filter: str | tuple[str, ...] | None = None,
+    component: str | tuple[str, ...] | None = None,
+    fix_version: str | tuple[str, ...] | None = None,
+    assignee: str | tuple[str, ...] | None = None,
     board: str | None = None,
     board_scope: str | None = None,
     pattern: str | None = None,
@@ -181,6 +200,8 @@ def run_view(
     app = JiraWorkbenchApp(
         jira_dir,
         component_field=component_field,
+        project_filter=project_filter,
+        status_filter=status_filter,
         component=component,
         fix_version=fix_version,
         assignee=assignee,

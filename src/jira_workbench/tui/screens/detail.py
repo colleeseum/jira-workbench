@@ -25,9 +25,9 @@ from ...shadow import (
     set_field,
     set_status_change,
 )
+from ...sync import issue_project_key
 from ...view import (
     DEFAULT_RESOLUTIONS,
-    DONE_STATUSES,
     apply_shadow,
     as_dict,
     comma_parts,
@@ -46,6 +46,7 @@ from ...view import (
     issue_parent_key,
     label_type_fields,
     load_issue,
+    observed_status_category_map,
     other_field_rows,
     pill_values,
     resolve_fix_version_names,
@@ -100,6 +101,7 @@ class DetailScreen(Screen[None]):
         self.shadow: dict[str, Any] | None = None
         self._field_values: dict[str, str] = {}
         self.edit_fields: dict[str, dict[str, Any]] = {}
+        self._project_read_only = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -127,6 +129,7 @@ class DetailScreen(Screen[None]):
         effective = apply_shadow(issue, shadow) if shadow is not None else issue
         self.effective_issue = effective
         self.title = issue_identity(effective)
+        self._project_read_only = self.app.is_project_read_only(issue_project_key(effective))
 
         header_lines = list(hierarchy_section(jira_dir, effective, self.app.component_field))
         if shadow is not None and has_shadow_changes(shadow):
@@ -431,6 +434,9 @@ class DetailScreen(Screen[None]):
         if field == "comments":
             await self._open_comments()
             return
+        if self._project_read_only:
+            self.notify(f"{issue_project_key(self.effective_issue)} is read-only; comments are still allowed")
+            return
         if field == "description":
             await self._view_field(field)
             return
@@ -529,12 +535,19 @@ class DetailScreen(Screen[None]):
 
     async def _edit_status(self, current_value: str) -> None:
         options = selectable_field_options(self.app.jira_dir, "status")
+        # Jira's real statusCategory ("new"/"indeterminate"/"done"), not a
+        # hardcoded English name list -- a workflow's status names are
+        # fully custom per project (e.g. "Solved", "Verified"), but every
+        # status a picker can ever show here has, by construction, already
+        # been observed on some locally synced issue (see
+        # observed_field_options), so its category is always known.
+        categories = observed_status_category_map(self.app.jira_dir)
         result = await self.app.push_screen_wait(
             StatusChangeScreen(
                 options,
                 DEFAULT_RESOLUTIONS,
                 current_status=current_value,
-                is_done_status=lambda status: display_name(status).strip().lower() in DONE_STATUSES,
+                is_done_status=lambda status: categories.get(display_name(status).strip()) == "done",
             )
         )
         if result is None:
