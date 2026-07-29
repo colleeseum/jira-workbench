@@ -218,9 +218,24 @@ def issue_path_sort_key(path: Path) -> tuple[str, int, str]:
     return issue_key_sort_key(path.parent.name)
 
 
-def find_existing_issue(components_dir: Path, key: str) -> Path | None:
+def find_existing_issue(components_dir: Path, key: str, *, component_hint: str | None = None) -> Path | None:
+    """Locate a synced issue's issue.json under its component directory.
+
+    `component_hint` (e.g. a manifest item's own already-known "component",
+    which build_manifest derives directly from this same directory
+    structure -- see build_manifest) lets a caller skip the `*/{key}/...`
+    wildcard glob entirely via one direct path check. That glob has to walk
+    every component subdirectory for every single lookup, which is the
+    dominant cost of enriching a large manifest's worth of items one by
+    one -- falls back to the glob if the hint is missing or turns out
+    stale (e.g. a locally shadow-edited component doesn't move the file,
+    but nothing else should make the hint wrong either)."""
     if not components_dir.exists():
         return None
+    if component_hint:
+        direct = components_dir / component_hint / key / "issue.json"
+        if direct.exists():
+            return direct
     for path in components_dir.glob(f"*/{key}/issue.json"):
         return path
     return None

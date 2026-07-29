@@ -35,7 +35,7 @@ from ...view import (
     normalize_swimlane,
     pill_values,
     priority_icon,
-    refresh_index_item,
+    refresh_stale_index_items,
     sort_items_for_swimlane,
     SORT_FIELDS,
     swimlane_label,
@@ -561,10 +561,13 @@ class IndexScreen(Screen[None]):
         )
         for key in keys:
             self.app.mark_changed(key)
-        for key in self.app.drain_changed_keys():
-            refresh_index_item(
-                self.app.jira_dir, self.items, key, self.app.component_field, dev_status_field=self.app.dev_status_field
-            )
+        refresh_stale_index_items(
+            self.app.jira_dir,
+            self.items,
+            self.app.drain_changed_keys(),
+            self.app.component_field,
+            dev_status_field=self.app.dev_status_field,
+        )
         self._rebuild_table()
         if result is not None:
             self.notify(
@@ -786,10 +789,13 @@ class IndexScreen(Screen[None]):
         # but Labels' bulk rename/delete does -- drain and refresh the same
         # way returning from Detail already does, rather than special-casing
         # just that one path.
-        for key in self.app.drain_changed_keys():
-            refresh_index_item(
-                self.app.jira_dir, self.items, key, self.app.component_field, dev_status_field=self.app.dev_status_field
-            )
+        refresh_stale_index_items(
+            self.app.jira_dir,
+            self.items,
+            self.app.drain_changed_keys(),
+            self.app.component_field,
+            dev_status_field=self.app.dev_status_field,
+        )
         self._rebuild_table()
 
     def action_quit_app(self) -> None:
@@ -818,8 +824,11 @@ class IndexScreen(Screen[None]):
         self.app.push_screen(DetailScreen(key=key), callback=self._on_detail_closed)
 
     def _on_detail_closed(self, _result: None) -> None:
-        for key in self.app.drain_changed_keys():
-            refresh_index_item(
-                self.app.jira_dir, self.items, key, self.app.component_field, dev_status_field=self.app.dev_status_field
-            )
+        refresh_stale_index_items(
+            self.app.jira_dir,
+            self.items,
+            self.app.drain_changed_keys(),
+            self.app.component_field,
+            dev_status_field=self.app.dev_status_field,
+        )
         self._rebuild_table()

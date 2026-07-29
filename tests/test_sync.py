@@ -10,6 +10,7 @@ from jira_workbench.sync import (
     build_index_jql,
     build_manifest,
     component_slug,
+    find_existing_issue,
     issue_key_sort_key,
     issue_project_key,
     issue_summary,
@@ -146,6 +147,56 @@ def test_issue_key_sort_key_sorts_by_numeric_suffix() -> None:
     keys = ["SAT-100", "SAT-9", "SAT-10", "SAT-2"]
 
     assert sorted(keys, key=issue_key_sort_key) == ["SAT-2", "SAT-9", "SAT-10", "SAT-100"]
+
+
+def test_find_existing_issue_finds_via_glob_without_a_hint(tmp_path: Path) -> None:
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1"})
+
+    path = find_existing_issue(tmp_path / "components", "SAT-1")
+
+    assert path == tmp_path / "components/helm-chart/SAT-1/issue.json"
+
+
+def test_find_existing_issue_uses_the_hint_directly(tmp_path: Path) -> None:
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1"})
+
+    path = find_existing_issue(tmp_path / "components", "SAT-1", component_hint="helm-chart")
+
+    assert path == tmp_path / "components/helm-chart/SAT-1/issue.json"
+
+
+def test_find_existing_issue_falls_back_to_glob_when_hint_is_stale(tmp_path: Path) -> None:
+    # A hint that no longer matches reality (e.g. built from a stale
+    # manifest) must not silently return "not found" -- it should fall back
+    # to the same glob search a missing hint would use.
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1"})
+
+    path = find_existing_issue(tmp_path / "components", "SAT-1", component_hint="terraform")
+
+    assert path == tmp_path / "components/helm-chart/SAT-1/issue.json"
+
+
+def test_find_existing_issue_none_when_missing(tmp_path: Path) -> None:
+    assert find_existing_issue(tmp_path / "components", "SAT-1") is None
+    assert find_existing_issue(tmp_path / "components", "SAT-1", component_hint="helm-chart") is None
+
+
+def test_find_existing_issue_with_a_valid_hint_never_globs(tmp_path: Path, monkeypatch) -> None:
+    # The whole point of component_hint is to skip the `*/{key}/...`
+    # wildcard glob (an O(every component directory) scan) -- a valid hint
+    # must resolve via one direct path check, not fall through to it.
+    from pathlib import Path as PathClass
+
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1"})
+
+    def fail_glob(self, pattern):
+        raise AssertionError(f"glob({pattern!r}) should not have been called with a valid hint")
+
+    monkeypatch.setattr(PathClass, "glob", fail_glob)
+
+    path = find_existing_issue(tmp_path / "components", "SAT-1", component_hint="helm-chart")
+
+    assert path == tmp_path / "components/helm-chart/SAT-1/issue.json"
 
 
 def test_issue_project_key_prefers_synced_fields_project() -> None:

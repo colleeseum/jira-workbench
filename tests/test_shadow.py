@@ -125,6 +125,26 @@ def synced_jira_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_load_shadow_component_hint_is_a_pure_speed_shortcut(tmp_path: Path) -> None:
+    # component_hint must never change the *result* -- only skip the
+    # directory glob to find it. A missing shadow, a real shadow via a
+    # correct hint, and the same shadow found via a stale/wrong hint (falls
+    # back to the glob) must all agree.
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1"})
+
+    assert load_shadow(tmp_path, "SAT-1") is None
+    assert load_shadow(tmp_path, "SAT-1", component_hint="helm-chart") is None
+    assert load_shadow(tmp_path, "SAT-1", component_hint="terraform") is None
+
+    set_field(tmp_path, "SAT-1", "summary", "Updated summary")
+
+    expected = load_shadow(tmp_path, "SAT-1")
+    assert expected is not None
+    assert load_shadow(tmp_path, "SAT-1", component_hint="helm-chart") == expected
+    assert load_shadow(tmp_path, "SAT-1", component_hint="terraform") == expected
+    assert shadow_path(tmp_path, "SAT-1", component_hint="helm-chart") == tmp_path / "components/helm-chart/SAT-1/shadow.json"
+
+
 def test_shadow_set_comment_diff_and_commit(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
 

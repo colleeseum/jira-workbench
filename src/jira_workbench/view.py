@@ -151,15 +151,24 @@ def dev_status_indicator(summary: dict[str, Any] | None) -> tuple[str, str, str]
     return None
 
 
-def resolve_fix_version_names(jira_dir: Path, value: Any) -> list[str]:
+def resolve_fix_version_names(
+    jira_dir: Path, value: Any, *, id_to_name: dict[str, str] | None = None
+) -> list[str]:
     """Fix version display names, resolved by id against the current
     versions cache first. A version can be renamed in Jira after an issue
     was last synced -- Meta's own versions.json is kept current on rename
     (see VersionsScreen.action_rename), but the issue's own locally synced
     fixVersions still has whatever name was embedded back when it was last
     fetched. Falls back to that embedded name only if the id isn't in the
-    cache (e.g. offline, or the versions cache has never been refreshed)."""
-    id_to_name = version_id_to_name_map(jira_dir)
+    cache (e.g. offline, or the versions cache has never been refreshed).
+
+    `id_to_name` lets a caller looping over many issues pass in one
+    precomputed `version_id_to_name_map(jira_dir)` instead of paying for a
+    full versions-cache rebuild (a `load_all_versions` disk scan + sort)
+    on every single call -- rebuilding it here by default keeps this cheap
+    for the common single-item callers (Detail, shadow reports)."""
+    if id_to_name is None:
+        id_to_name = version_id_to_name_map(jira_dir)
     names: list[str] = []
     for entry in as_list(value):
         version_id = entry.get("id") if isinstance(entry, dict) else None
@@ -758,6 +767,7 @@ def load_manifest_items(
         raise ViewError(f"manifest at {manifest_path} does not contain workItems")
     boards = load_cached_boards(jira_dir)
     status_categories = observed_status_category_map(jira_dir)
+    version_names = version_id_to_name_map(jira_dir)
     return sorted(
         (
             with_local_index_fields(
@@ -766,6 +776,7 @@ def load_manifest_items(
                 component_field,
                 boards=boards,
                 status_categories=status_categories,
+                version_names=version_names,
                 dev_status_field=dev_status_field,
             )
             for item in items
@@ -782,25 +793,28 @@ def with_local_index_fields(
     *,
     boards: list[dict[str, Any]] | None = None,
     status_categories: dict[str, str] | None = None,
+    version_names: dict[str, str] | None = None,
     dev_status_field: str | None = None,
 ) -> dict[str, Any]:
     enriched = dict(item)
     key = display_name(item.get("key"))
     if not key:
         return enriched
-    path = find_existing_issue(jira_dir / "components", key)
+    raw_component_hint = item.get("component")
+    component_hint = raw_component_hint if isinstance(raw_component_hint, str) else None
+    path = find_existing_issue(jira_dir / "components", key, component_hint=component_hint)
     if path is None:
         return enriched
     issue = read_json(path)
     if not isinstance(issue, dict):
         return enriched
-    shadow = load_shadow(jira_dir, key)
+    shadow = load_shadow(jira_dir, key, component_hint=component_hint)
     if shadow is not None:
         issue = apply_shadow(issue, shadow)
     fields = as_dict(issue.get("fields"))
     issue_type = fields.get("issuetype")
     status = fields.get("status")
-    fix_version_names = resolve_fix_version_names(jira_dir, fields.get("fixVersions"))
+    fix_version_names = resolve_fix_version_names(jira_dir, fields.get("fixVersions"), id_to_name=version_names)
     parent = as_dict(fields.get("parent"))
     parent_fields = as_dict(parent.get("fields"))
     enriched["summary"] = display_name(fields.get("summary"))
@@ -880,6 +894,7 @@ def refresh_index_item(
     *,
     boards: list[dict[str, Any]] | None = None,
     status_categories: dict[str, str] | None = None,
+    version_names: dict[str, str] | None = None,
     dev_status_field: str | None = None,
 ) -> None:
     for index, item in enumerate(items):
@@ -890,6 +905,7 @@ def refresh_index_item(
                 component_field,
                 boards=boards,
                 status_categories=status_categories,
+                version_names=version_names,
                 dev_status_field=dev_status_field,
             )
             return
@@ -905,6 +921,7 @@ def refresh_stale_index_items(
 ) -> None:
     boards = load_cached_boards(jira_dir)
     status_categories = observed_status_category_map(jira_dir)
+    version_names = version_id_to_name_map(jira_dir)
     for key in sorted(keys, key=issue_key_sort_key):
         refresh_index_item(
             jira_dir,
@@ -913,6 +930,7 @@ def refresh_stale_index_items(
             component_field,
             boards=boards,
             status_categories=status_categories,
+            version_names=version_names,
             dev_status_field=dev_status_field,
         )
     keys.clear()

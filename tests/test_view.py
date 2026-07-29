@@ -782,6 +782,43 @@ def test_load_manifest_items_shows_current_version_name_not_stale_embedded_one(t
     assert items[0]["fixVersion"] == "v1-renamed"
 
 
+def test_load_manifest_items_builds_the_versions_map_once_not_per_item(tmp_path: Path, monkeypatch) -> None:
+    # Regression: with_local_index_fields used to call
+    # resolve_fix_version_names -> version_id_to_name_map -> load_all_versions
+    # once per item, rebuilding (and re-sorting) the whole versions cache
+    # from scratch for every single issue -- the dominant cost of loading a
+    # large manifest. load_manifest_items must precompute this once and
+    # thread it through instead.
+    import jira_workbench.view as view_module
+
+    for key in ("SAT-1", "SAT-2", "SAT-3"):
+        write_json(
+            tmp_path / f"components/_unassigned/{key}/issue.json",
+            {
+                "key": key,
+                "fields": {
+                    "summary": key,
+                    "issuetype": {"name": "Task"},
+                    "status": {"name": "To Do"},
+                    "fixVersions": [{"id": "10000", "name": "v1"}],
+                },
+            },
+        )
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+    build_manifest(tmp_path)
+
+    calls = []
+    real_load_all_versions = view_module.load_all_versions
+    monkeypatch.setattr(
+        view_module, "load_all_versions", lambda *a, **k: calls.append(1) or real_load_all_versions(*a, **k)
+    )
+
+    items = load_manifest_items(tmp_path)
+
+    assert len(calls) == 1
+    assert {item["fixVersion"] for item in items} == {"v1-renamed"}
+
+
 def test_format_issue_shows_current_version_name_not_stale_embedded_one(tmp_path: Path) -> None:
     _write_issue_with_stale_fix_version(tmp_path)
     issue = read_json(tmp_path / "components/_unassigned/SAT-1/issue.json")

@@ -100,8 +100,8 @@ def now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def issue_dir(jira_dir: Path, key: str) -> Path:
-    issue_path = find_existing_issue(jira_dir / "components", key)
+def issue_dir(jira_dir: Path, key: str, *, component_hint: str | None = None) -> Path:
+    issue_path = find_existing_issue(jira_dir / "components", key, component_hint=component_hint)
     if issue_path is None:
         raise ShadowError(f"work item {key} is not synced locally")
     return issue_path.parent
@@ -111,12 +111,16 @@ def issue_path(jira_dir: Path, key: str) -> Path:
     return issue_dir(jira_dir, key) / "issue.json"
 
 
-def shadow_path(jira_dir: Path, key: str) -> Path:
-    return issue_dir(jira_dir, key) / "shadow.json"
+def shadow_path(jira_dir: Path, key: str, *, component_hint: str | None = None) -> Path:
+    return issue_dir(jira_dir, key, component_hint=component_hint) / "shadow.json"
 
 
-def load_shadow(jira_dir: Path, key: str) -> dict[str, Any] | None:
-    path = shadow_path(jira_dir, key)
+def load_shadow(jira_dir: Path, key: str, *, component_hint: str | None = None) -> dict[str, Any] | None:
+    # component_hint (a manifest item's own already-known "component") lets
+    # a caller looping over many items skip find_existing_issue's directory
+    # glob -- see its own docstring. Every enriched item already carries
+    # this, and with_local_index_fields is exactly that hot loop.
+    path = shadow_path(jira_dir, key, component_hint=component_hint)
     if not path.exists():
         return None
     value = read_json(path)
