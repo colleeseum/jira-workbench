@@ -710,11 +710,10 @@ def refresh_boards_api(
                     predicate = scope_predicate_to_project(predicate, project)
 
         backlog_keys: list[str] | None = None
-        if board_type != "scrum":
-            try:
-                backlog_keys = fetch_backlog_keys(client, board_id)
-            except Exception:
-                backlog_keys = None
+        try:
+            backlog_keys = fetch_backlog_keys(client, board_id)
+        except Exception:
+            backlog_keys = None
 
         boards.append(
             {
@@ -1060,7 +1059,15 @@ def format_boards(cache: dict[str, Any]) -> str:
     for board, name in zip(boards, names, strict=True):
         board_type = str(board.get("type") or "")
         reason = board.get("unsupportedReason")
+        jql = board.get("jql")
         membership = f"unsupported: {reason}" if reason else "ok"
+        if jql:
+            # "Supported"/"unsupported" is a jira-wb concept (whether
+            # compile_jql could translate this board's own saved filter
+            # into a local predicate) -- always showing the real JQL next
+            # to it makes that verifiable at a glance, whichever way it
+            # went, rather than trusting the reason text alone.
+            membership += f" (jql: {jql})"
         backlog_keys = board.get("backlogKeys")
         backlog_display = f"{len(backlog_keys)} issues" if isinstance(backlog_keys, list) else "n/a"
         rows.append(f"{name:<{width}}  {board_type:<6}  {membership:<12} {backlog_display}")

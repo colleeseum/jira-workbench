@@ -194,6 +194,8 @@ class ApiClient:
             if start == 0:
                 return {"total": 150, "issues": [{"key": f"SAT-{i}"} for i in range(100)]}
             return {"total": 150, "issues": [{"key": f"SAT-{i}"} for i in range(100, 150)]}
+        if path == "rest/agile/1.0/board/36/backlog":
+            return {"total": 2, "issues": [{"key": "SAT-881"}, {"key": "SAT-882"}]}
         raise AssertionError(f"unexpected get() path in test: {path}")
 
 
@@ -542,8 +544,9 @@ def test_refresh_boards_api_writes_cache_with_compiled_predicates_and_backlog(tm
     assert ps_tools["type"] == "scrum"
     assert ps_tools["unsupportedReason"] is None
     assert ps_tools["predicate"] is not None
-    # scrum boards are out of scope for the active/backlog split
-    assert ps_tools["backlogKeys"] is None
+    # scrum boards have a real backlog too (unassigned-to-sprint issues) --
+    # the Agile backlog endpoint works for them same as any other board type.
+    assert ps_tools["backlogKeys"] == ["SAT-881", "SAT-882"]
 
 
 def test_refresh_boards_api_implicitly_scopes_a_project_less_filter_to_its_own_project(tmp_path: Path) -> None:
@@ -612,6 +615,32 @@ def test_format_boards_reports_membership_and_backlog_counts() -> None:
     assert "1 issues" in output
     assert "n/a" in output
     assert "unsupported: unsupported field: assignee" in output
+
+
+def test_format_boards_includes_jql_alongside_membership() -> None:
+    output = format_boards(
+        {
+            "boards": [
+                {
+                    "name": "SAT board",
+                    "type": "simple",
+                    "unsupportedReason": None,
+                    "backlogKeys": None,
+                    "jql": "project = SAT ORDER BY Rank ASC",
+                },
+                {
+                    "name": "Weird",
+                    "type": "simple",
+                    "unsupportedReason": "unsupported field: assignee",
+                    "backlogKeys": None,
+                    "jql": "assignee = currentUser()",
+                },
+            ]
+        }
+    )
+
+    assert "ok (jql: project = SAT ORDER BY Rank ASC)" in output
+    assert "unsupported: unsupported field: assignee (jql: assignee = currentUser())" in output
 
 
 def test_format_boards_reports_no_boards() -> None:

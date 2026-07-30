@@ -111,6 +111,97 @@ def test_compile_rejects_unsupported_constructs(jql: str) -> None:
     assert reason
 
 
+def test_compile_project_in_single_value() -> None:
+    predicate, reason = compile_jql("project IN (SAT)", component_field_names=[COMPONENT_FIELD_NAME])
+
+    assert reason is None
+    assert predicate == {"op": "eq", "field": "project", "value": "SAT"}
+    assert evaluate_predicate(predicate, component=None, labels=[], project="SAT") is True
+    assert evaluate_predicate(predicate, component=None, labels=[], project="PLAT") is False
+
+
+def test_compile_project_in_multiple_values_desugars_to_or() -> None:
+    # project IN (SAT, PLAT) is equivalent to (project = SAT OR project = PLAT)
+    predicate, reason = compile_jql("project IN (SAT, PLAT)", component_field_names=[COMPONENT_FIELD_NAME])
+
+    assert reason is None
+    assert predicate == {
+        "op": "or",
+        "clauses": [
+            {"op": "eq", "field": "project", "value": "SAT"},
+            {"op": "eq", "field": "project", "value": "PLAT"},
+        ],
+    }
+    assert evaluate_predicate(predicate, component=None, labels=[], project="SAT") is True
+    assert evaluate_predicate(predicate, component=None, labels=[], project="PLAT") is True
+    assert evaluate_predicate(predicate, component=None, labels=[], project="OTHERPROJ") is False
+
+
+def test_compile_project_not_in() -> None:
+    predicate, reason = compile_jql("project NOT IN (SAT, PLAT)", component_field_names=[COMPONENT_FIELD_NAME])
+
+    assert reason is None
+    assert predicate == {
+        "op": "not",
+        "clause": {
+            "op": "or",
+            "clauses": [
+                {"op": "eq", "field": "project", "value": "SAT"},
+                {"op": "eq", "field": "project", "value": "PLAT"},
+            ],
+        },
+    }
+    assert evaluate_predicate(predicate, component=None, labels=[], project="SAT") is False
+    assert evaluate_predicate(predicate, component=None, labels=[], project="OTHERPROJ") is True
+
+
+def test_compile_in_scopes_project_like_a_plain_eq_clause() -> None:
+    # project IN (...) must be recognized by predicate_scopes_project just
+    # like "project = X", so scope_predicate_to_project doesn't redundantly
+    # (and wrongly) AND in another project constraint on top.
+    predicate, reason = compile_jql("project IN (SAT, PLAT)", component_field_names=[COMPONENT_FIELD_NAME])
+    assert reason is None
+    assert predicate_scopes_project(predicate) is True
+    assert scope_predicate_to_project(predicate, "SAT") == predicate
+
+
+def test_compile_real_ps_tools_board_jql_with_project_in() -> None:
+    # The real motivating case: a board filter combining "project IN (SAT)"
+    # with an unrelated OR'd clause -- previously rejected outright because
+    # IN was unsupported at all.
+    jql = (
+        'project IN (SAT) AND (project = SAT AND ( "Components[Dropdown]" = helm-chart '
+        'OR "Components[Dropdown]" = puppy )  OR  labels=k8s_sprints )'
+    )
+
+    predicate, reason = compile_jql(jql, component_field_names=[COMPONENT_FIELD_NAME])
+
+    assert reason is None
+    assert evaluate_predicate(predicate, component="helm-chart", labels=[], project="SAT") is True
+    assert evaluate_predicate(predicate, component="puppy", labels=[], project="SAT") is True
+    assert evaluate_predicate(predicate, component="unrelated", labels=["k8s_sprints"], project="SAT") is True
+    assert evaluate_predicate(predicate, component="unrelated", labels=["other"], project="SAT") is False
+    # the outer "project IN (SAT)" excludes any other project entirely
+    assert evaluate_predicate(predicate, component="helm-chart", labels=[], project="PLAT") is False
+
+
+@pytest.mark.parametrize(
+    "jql",
+    [
+        "project IN SAT",
+        "project IN (",
+        "project IN ()",
+        "project NOT SAT",
+        "project IN (SAT PLAT)",
+    ],
+)
+def test_compile_rejects_malformed_in_expressions(jql: str) -> None:
+    predicate, reason = compile_jql(jql, component_field_names=[COMPONENT_FIELD_NAME])
+
+    assert predicate is None
+    assert reason
+
+
 def test_evaluate_raises_on_malformed_predicate_node() -> None:
     with pytest.raises(ValueError):
         evaluate_predicate({"op": "bogus"}, component=None, labels=[])

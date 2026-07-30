@@ -134,6 +134,60 @@ def test_effective_history_months_none_when_nothing_configured() -> None:
     assert config.effective_history_months("SAT") is None
 
 
+def test_load_config_reads_project_component_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "",
+                "[[projects]]",
+                'key = "PLAT"',
+                "read_only = true",
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.projects == (
+        ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),
+        ProjectSettings(key="PLAT", read_only=True),
+    )
+
+
+def test_load_config_rejects_blank_project_component_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\ncomponent_field = ""\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_effective_component_field_uses_project_override_with_no_cross_project_fallback() -> None:
+    config = WorkbenchConfig(
+        component_field="customfield_10071",
+        projects=(
+            ProjectSettings(key="SAT", component_field="customfield_10071"),
+            ProjectSettings(key="PLAT"),
+        ),
+    )
+
+    assert config.effective_component_field("SAT") == "customfield_10071"
+    assert config.effective_component_field("PLAT") is None
+    assert config.effective_component_field("UNKNOWN") is None
+
+
+def test_effective_component_field_falls_back_to_flat_value_in_legacy_single_project_config() -> None:
+    config = WorkbenchConfig(project="SAT", component_field="customfield_10071")
+
+    assert config.effective_component_field("SAT") == "customfield_10071"
+
+
 def test_resolved_projects_falls_back_to_flat_project_key() -> None:
     config = WorkbenchConfig(project="SAT")
 

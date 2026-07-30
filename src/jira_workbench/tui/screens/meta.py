@@ -11,7 +11,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, ListItem, ListView, Static
 
-from ...cli import (
+from ...service import (
     add_meta_component,
     add_meta_component_field_option,
     add_meta_version,

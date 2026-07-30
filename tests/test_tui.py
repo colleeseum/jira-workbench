@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from textual.widgets import DataTable, Input, SelectionList, Static, TextArea
 
-import jira_workbench.cli
+import jira_workbench.service
 from jira_workbench.config import load_config
 from jira_workbench.metadata import load_versions
 from jira_workbench.shadow import add_comment, load_shadow, set_field
@@ -2185,6 +2185,132 @@ async def test_new_issue_screen_full_flow_creates_and_refreshes_locally(tmp_path
     assert (tmp_path / "components/helm-chart/SAT-900/issue.json").exists()
 
 
+def _write_clone_source_item(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-6/issue.json",
+        {
+            "key": "SAT-6",
+            "fields": {
+                "summary": "Chart values",
+                "description": "Steps to bump chart values",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "priority": {"name": "High"},
+                "components": [{"name": "helm-chart"}],
+                "fixVersions": [{"name": "2026.07"}],
+                "labels": ["k8s"],
+                "assignee": {"displayName": "Alex", "accountId": "acc-1"},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_index_clone_action_prefills_form_and_creates_under_source_project(tmp_path: Path) -> None:
+    from jira_workbench.tui.screens.issue_create import IssueCreateScreen
+    from jira_workbench.tui.widgets.prompts import ConfirmScreen
+
+    _write_clone_source_item(tmp_path)
+    client = FakeCreateIssueClient()
+    app = _issue_create_app(tmp_path, client)
+
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, IndexScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-6"))
+
+        await pilot.press("C")
+        await pilot.pause()
+
+        create_screen = app.screen
+        assert isinstance(create_screen, IssueCreateScreen)
+        assert create_screen.selected_type == "Task"
+        assert create_screen.values["summary"] == "Chart values (clone)"
+        assert create_screen.values["description"] == "Steps to bump chart values"
+        assert create_screen.values["component"] == "helm-chart"
+        assert create_screen.values["version"] == "2026.07"
+        assert create_screen.values["priority"] == "High"
+        assert create_screen.values["labels"] == "k8s"
+        assert create_screen.values["assignee"] == "Alex"
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmScreen)
+        await pilot.press("y")
+        await pilot.pause()
+
+        assert isinstance(app.screen, IndexScreen)
+
+    assert client.create_called is True
+    assert client.created_fields["project"] == {"key": "SAT"}
+    assert client.created_fields["summary"] == "Chart values (clone)"
+    assert client.created_fields["description"] == "Steps to bump chart values"
+    assert (tmp_path / "components/helm-chart/SAT-900/issue.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_index_clone_blocked_for_a_read_only_project(tmp_path: Path) -> None:
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+
+    _write_clone_source_item(tmp_path)
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+    client = FakeCreateIssueClient()
+    app = _issue_create_app(tmp_path, client)
+
+    async with app.run_test() as pilot:
+        table = app.screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-6"))
+
+        await pilot.press("C")
+        await pilot.pause()
+
+        assert isinstance(app.screen, IndexScreen)  # blocked, no create screen opened
+        assert client.createmeta_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_detail_clone_action_opens_prefilled_form_and_new_detail_for_created_key(tmp_path: Path) -> None:
+    from jira_workbench.tui.screens.issue_create import IssueCreateScreen
+    from jira_workbench.tui.widgets.prompts import ConfirmScreen
+
+    _write_clone_source_item(tmp_path)
+    client = FakeCreateIssueClient()
+    app = _issue_create_app(tmp_path, client)
+
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, IndexScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-6"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, DetailScreen)
+
+        await pilot.press("C")
+        await pilot.pause()
+
+        create_screen = app.screen
+        assert isinstance(create_screen, IssueCreateScreen)
+        assert create_screen.values["summary"] == "Chart values (clone)"
+        assert create_screen._context_label == "Clone of SAT-6"
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmScreen)
+        await pilot.press("y")
+        await pilot.pause()
+
+        new_detail = app.screen
+        assert isinstance(new_detail, DetailScreen)
+        assert new_detail.key == "SAT-900"
+
+    assert client.create_called is True
+
+
 async def _pick_option(pilot, needle: str) -> None:
     screen = pilot.app.screen
     input_widget = screen.query_one("#picker-filter", Input)
@@ -2259,6 +2385,89 @@ async def test_new_issue_screen_version_picker_is_scoped_to_project_and_componen
         picker = app.screen
         assert isinstance(picker, OptionPickerScreen)
         assert picker._options == ["(none)", "helm-chart-sa 3.4.0"]
+
+
+@pytest.mark.asyncio
+async def test_new_issue_screen_component_picker_uses_configured_custom_field_not_native(tmp_path: Path) -> None:
+    # Regression test: the Component picker used to call component_options()
+    # unconditionally, which always sources native Jira "components" -- ignoring
+    # component_field entirely. When a custom field is configured (as SAT does),
+    # it must offer the custom field's own observed values instead, and must NOT
+    # offer a value that only exists on the native field (e.g. a component created
+    # there by mistake before the custom field was adopted).
+    from jira_workbench.tui.screens.issue_create import IssueCreateScreen
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "To Do"},
+                "customfield_10071": {"value": "helm-chart"},
+                "components": [{"name": "stray-native-component"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    createmeta = {
+        "projects": [
+            {
+                "key": "SAT",
+                "issuetypes": [
+                    {
+                        "name": "Task",
+                        "fields": {
+                            "summary": {},
+                            "description": {},
+                            "project": {},
+                            "issuetype": {},
+                            "customfield_10071": {},
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    client = FakeCreateIssueClient(createmeta=createmeta)
+    app = JiraWorkbenchApp(
+        tmp_path,
+        component_field="customfield_10071",
+        jira_url="https://example.atlassian.net",
+        jira_email="user@example.com",
+        jira_api_token="token",
+        project="SAT",
+    )
+    app.get_api_client = lambda: client  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, IndexScreen)
+        table = screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("SAT-1"))
+
+        await pilot.press("c")
+        await pilot.pause()
+
+        create_screen = app.screen
+        assert isinstance(create_screen, IssueCreateScreen)
+        create_table = create_screen.query_one(DataTable)
+        create_table.move_cursor(row=create_table.get_row_index("type"))
+        await pilot.press("enter")
+        await pilot.pause()
+        await _pick_option(pilot, "Task")
+
+        create_table.move_cursor(row=create_table.get_row_index("component"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        from jira_workbench.tui.widgets.prompts import OptionPickerScreen
+
+        picker = app.screen
+        assert isinstance(picker, OptionPickerScreen)
+        assert picker._options == ["(none)", "helm-chart"]
+        assert "stray-native-component" not in picker._options
 
 
 @pytest.mark.asyncio
@@ -3737,7 +3946,7 @@ class FakeMetaClient:
 
 
 def meta_app(tmp_path: Path, client: FakeMetaClient, monkeypatch: pytest.MonkeyPatch) -> JiraWorkbenchApp:
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: client)
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: client)
     return JiraWorkbenchApp(
         tmp_path,
         component_field="components",

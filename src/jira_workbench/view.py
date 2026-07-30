@@ -339,6 +339,20 @@ def find_next_item_index(
 def distinct_field_values(
     items: list[dict[str, Any]], field: str, *, empty_bucket: str = VIRTUAL_NONE
 ) -> list[tuple[str, int]]:
+    """Every distinct value for `field` actually observed on `items`, with
+    counts -- what both the TUI's Filters screen and the web GUI's filter
+    chips (assignee, status, ...) offer as options.
+
+    Deliberately local-only: this is whoever/whatever already appears on
+    your synced issues, not a live query against Jira's own APIs (e.g. the
+    project's assignable-users list, which is governed by a separate
+    permission from project access/role membership and is commonly broader
+    -- that's genuine Jira behavior, not something this reflects). Kept
+    this way for simplicity and because it works fully offline; if you want
+    the assignee filter (or any other field here) to instead reflect a live
+    Jira query, that's a deliberate scope decision, not an oversight --
+    PRs welcome.
+    """
     counts: dict[str, int] = {}
     for item in items:
         value = field_value(item, field) or empty_bucket
@@ -1025,6 +1039,32 @@ def _enriched_child_identity(item: dict[str, Any]) -> str:
     if not component:
         return identity
     return f"{key} [{component}] {summary}".rstrip()
+
+
+def clone_prefill(jira_dir: Path, issue: dict[str, Any], component_field: str | None) -> dict[str, str]:
+    """Field values to prefill an issue-create form for cloning `issue` --
+    unlike an epic-context prefill (component/version/priority/labels/
+    assignee/parent only, deliberately blank summary/description so a new
+    sibling/child doesn't accidentally inherit the epic's own text), a
+    clone is a genuine duplicate: summary (with a " (clone)" suffix so it's
+    never confused with the original) and description carry over too, and
+    the source issue's own type seeds the type picker instead of requiring
+    it to be re-picked from scratch."""
+    fields = as_dict(issue.get("fields"))
+    summary = display_name(fields.get("summary")).strip()
+    fix_version_names = resolve_fix_version_names(jira_dir, fields.get("fixVersions"))
+    labels = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
+    return {
+        "type": display_name(fields.get("issuetype")),
+        "summary": f"{summary} (clone)" if summary else "",
+        "description": text_from_adf(fields.get("description")),
+        "component": hierarchy_component(issue, component_field),
+        "version": fix_version_names[0] if fix_version_names else "",
+        "priority": display_name(fields.get("priority")),
+        "labels": ", ".join(labels),
+        "assignee": display_name(fields.get("assignee")),
+        "parent": display_name(as_dict(fields.get("parent")).get("key")),
+    }
 
 
 def hierarchy_section(

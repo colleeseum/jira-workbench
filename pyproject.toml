@@ -23,12 +23,16 @@ classifiers = [
 ]
 dependencies = [
   "atlassian-python-api>=4.0.0",
+  "fastapi>=0.115.0",
+  "python-multipart>=0.0.9",
   "textual>=8.0.0",
   "tomlkit>=0.13",
+  "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
 test = [
+  "httpx2>=2.0.0",
   "pytest-asyncio>=1.0.0",
 ]
 lint = [

@@ -6,12 +6,15 @@ from typing import Any
 _TOKEN_SPEC = [
     ("LPAREN", r"\("),
     ("RPAREN", r"\)"),
+    ("COMMA", r","),
     ("NEQ", r"!="),
     ("EQ", r"="),
     ("QUOTED", r'"[^"]*"'),
     ("AND", r"(?i:AND)\b"),
     ("OR", r"(?i:OR)\b"),
-    ("WORD", r'[^\s()=!"]+'),
+    ("IN", r"(?i:IN)\b"),
+    ("NOT", r"(?i:NOT)\b"),
+    ("WORD", r'[^\s(),=!"]+'),
 ]
 _TOKEN_RE = re.compile("|".join(f"(?P<{name}>{pattern})" for name, pattern in _TOKEN_SPEC))
 _ORDER_BY_RE = re.compile(r"\bORDER\s+BY\b", re.IGNORECASE)
@@ -42,8 +45,11 @@ def _tokenize(expr: str) -> list[tuple[str, str]]:
 class _Parser:
     """Recursive-descent parser for a narrow JQL subset: `field op value`
     clauses combined with AND/OR (AND binds tighter, matching JQL), with
-    optional parentheses. Anything outside this subset raises
-    UnsupportedJqlError rather than being guessed at.
+    optional parentheses. `field IN (a, b, ...)` / `field NOT IN (...)` are
+    supported too, desugared into an OR (or NOT-of-OR) of the same `eq`
+    leaves a chain of `field = a OR field = b OR ...` would produce --
+    evaluate_predicate never needs to know IN existed. Anything outside
+    this subset raises UnsupportedJqlError rather than being guessed at.
     """
 
     def __init__(self, tokens: list[tuple[str, str]], *, component_field_names: list[str]) -> None:
@@ -99,8 +105,28 @@ class _Parser:
         field_token = self._advance()
         if field_token[0] not in _VALUE_TOKENS:
             raise UnsupportedJqlError(f"expected a field name, got {field_token[1]!r}")
+        field_name = field_token[1].strip().lower()
+
         op_token = self._peek()
-        if op_token is None or op_token[0] not in ("EQ", "NEQ"):
+        if op_token is None:
+            raise UnsupportedJqlError(f"unsupported operator after field {field_token[1]!r}")
+
+        negate = False
+        if op_token[0] == "NOT":
+            self._advance()
+            negate = True
+            op_token = self._peek()
+            if op_token is None or op_token[0] != "IN":
+                raise UnsupportedJqlError(f"expected IN after NOT for field {field_token[1]!r}")
+
+        if op_token[0] == "IN":
+            self._advance()
+            values = self._parse_value_list(field_token[1])
+            leaves = [self._make_leaf(field_name, field_token[1], value) for value in values]
+            node = leaves[0] if len(leaves) == 1 else {"op": "or", "clauses": leaves}
+            return {"op": "not", "clause": node} if negate else node
+
+        if op_token[0] not in ("EQ", "NEQ"):
             raise UnsupportedJqlError(f"unsupported operator after field {field_token[1]!r}")
         self._advance()
         value_token = self._peek()
@@ -108,17 +134,40 @@ class _Parser:
             raise UnsupportedJqlError(f"expected a value after {field_token[1]!r} {op_token[1]}")
         self._advance()
 
-        field_name = field_token[1].strip().lower()
-        negate = op_token[0] == "NEQ"
+        leaf = self._make_leaf(field_name, field_token[1], value_token[1])
+        return {"op": "not", "clause": leaf} if op_token[0] == "NEQ" else leaf
+
+    def _parse_value_list(self, field_text: str) -> list[str]:
+        open_paren = self._peek()
+        if open_paren is None or open_paren[0] != "LPAREN":
+            raise UnsupportedJqlError(f"expected '(' after IN for field {field_text!r}")
+        self._advance()
+        values = []
+        while True:
+            value_token = self._peek()
+            if value_token is None or value_token[0] not in _VALUE_TOKENS:
+                raise UnsupportedJqlError(f"expected a value in {field_text!r} IN (...) list")
+            self._advance()
+            values.append(value_token[1])
+            next_token = self._peek()
+            if next_token is not None and next_token[0] == "COMMA":
+                self._advance()
+                continue
+            break
+        closing = self._peek()
+        if closing is None or closing[0] != "RPAREN":
+            raise UnsupportedJqlError(f"unbalanced parentheses in {field_text!r} IN (...) list")
+        self._advance()
+        return values
+
+    def _make_leaf(self, field_name: str, field_text: str, value: str) -> dict[str, Any]:
         if field_name == "project":
-            leaf: dict[str, Any] = {"op": "eq", "field": "project", "value": value_token[1]}
-        elif field_name == "labels":
-            leaf = {"op": "eq", "field": "labels", "value": value_token[1]}
-        elif field_name in self._component_field_names:
-            leaf = {"op": "eq", "field": "component", "value": value_token[1]}
-        else:
-            raise UnsupportedJqlError(f"unsupported field: {field_token[1]}")
-        return {"op": "not", "clause": leaf} if negate else leaf
+            return {"op": "eq", "field": "project", "value": value}
+        if field_name == "labels":
+            return {"op": "eq", "field": "labels", "value": value}
+        if field_name in self._component_field_names:
+            return {"op": "eq", "field": "component", "value": value}
+        raise UnsupportedJqlError(f"unsupported field: {field_text}")
 
 
 def compile_jql(jql: str, *, component_field_names: list[str]) -> tuple[dict[str, Any] | None, str | None]:

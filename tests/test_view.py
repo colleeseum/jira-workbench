@@ -400,6 +400,59 @@ def test_editable_field_choices_replace_native_components_with_override_field() 
     assert ("Parent", "parent") in choices
 
 
+def test_clone_prefill_copies_fields_and_suffixes_summary(tmp_path: Path) -> None:
+    from jira_workbench.view import clone_prefill
+
+    issue = {
+        "key": "SAT-1",
+        "fields": {
+            "summary": "Original title",
+            "description": "Original body",
+            "issuetype": {"name": "Task"},
+            "priority": {"name": "High"},
+            "components": [{"name": "helm-chart"}],
+            "fixVersions": [{"name": "2026.07"}],
+            "labels": ["infra", "helm"],
+            "assignee": {"displayName": "Alex"},
+            "parent": {"key": "SAT-100"},
+        },
+    }
+
+    prefill = clone_prefill(tmp_path, issue, "components")
+
+    assert prefill["type"] == "Task"
+    assert prefill["summary"] == "Original title (clone)"
+    assert prefill["description"] == "Original body"
+    assert prefill["component"] == "helm-chart"
+    assert prefill["version"] == "2026.07"
+    assert prefill["priority"] == "High"
+    assert prefill["labels"] == "infra, helm"
+    assert prefill["assignee"] == "Alex"
+    assert prefill["parent"] == "SAT-100"
+
+
+def test_clone_prefill_uses_custom_component_field_and_handles_blank_summary(tmp_path: Path) -> None:
+    from jira_workbench.view import clone_prefill
+
+    issue = {
+        "key": "SAT-2",
+        "fields": {
+            "summary": "",
+            "issuetype": {"name": "Bug"},
+            "customfield_10071": {"value": "gateway"},
+            "components": [{"name": "stray-native"}],
+        },
+    }
+
+    prefill = clone_prefill(tmp_path, issue, "customfield_10071")
+
+    assert prefill["summary"] == ""  # no source summary -- nothing to suffix
+    assert prefill["component"] == "gateway"
+    assert prefill["description"] == ""
+    assert prefill["version"] == ""
+    assert prefill["labels"] == ""
+
+
 def test_detail_field_rows_include_description_and_global_component_override() -> None:
     issue = {
         "key": "SAT-1",

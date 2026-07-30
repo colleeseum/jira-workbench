@@ -30,6 +30,7 @@ from ...view import (
     DEFAULT_RESOLUTIONS,
     apply_shadow,
     as_dict,
+    clone_prefill,
     comma_parts,
     comments_text,
     detail_field_rows,
@@ -82,6 +83,7 @@ class DetailScreen(Screen[None]):
         Binding("d", "show_diff", "Diff"),
         Binding("x", "view_field", "View full text"),
         Binding("c", "add_comment", "Comment"),
+        Binding("C", "clone_issue", "Clone"),
         Binding("r", "revert", "Revert"),
         Binding("p", "push", "Push"),
         Binding("O", "toggle_other", "Other fields"),
@@ -423,6 +425,40 @@ class DetailScreen(Screen[None]):
             self.notify("no parent on this item")
             return
         self.app.push_screen(DetailScreen(key=parent_key, items=self._items))
+
+    @work
+    async def action_clone_issue(self) -> None:
+        project = issue_project_key(self.effective_issue)
+        if not project:
+            self.notify("cannot clone: no project configured", severity="warning")
+            return
+
+        from .issue_create import IssueCreateScreen, resolve_create_context
+
+        context = await resolve_create_context(self.app, project)
+        if context is None:
+            return
+        client, type_fields, default_reporter, default_reporter_account_id = context
+
+        prefill = clone_prefill(self.app.jira_dir, self.effective_issue, self.app.component_field)
+        new_key = await self.app.push_screen_wait(
+            IssueCreateScreen(
+                jira_dir=self.app.jira_dir,
+                project=str(project),
+                component_field=self.app.component_field or "components",
+                type_fields=type_fields,
+                client=client,
+                epic_item=None,
+                default_reporter=default_reporter,
+                default_reporter_account_id=default_reporter_account_id,
+                context_label=f"Clone of {self.key}",
+                clone_prefill_values=prefill,
+            )
+        )
+        if new_key is None:
+            return
+        self.notify(f"created {new_key}")
+        self.app.push_screen(DetailScreen(key=new_key, items=self._items))
 
     def action_show_help(self) -> None:
         from .help import HelpScreen

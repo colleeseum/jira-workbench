@@ -30,6 +30,7 @@ class ProjectSettings:
     default: bool = False
     read_only: bool = False
     history_months: int | None = None
+    component_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,24 @@ class WorkbenchConfig:
 
     def read_only_project_keys(self) -> frozenset[str]:
         return frozenset(project.key for project in self.resolved_projects() if project.read_only)
+
+    def effective_component_field(self, project_key: str | None) -> str | None:
+        """Which Jira field holds "components" for this project -- a
+        project's own `component_field` wins. Unlike `effective_history_months`,
+        a [[projects]] config does NOT fall back to the top-level
+        `component_field` for a project that doesn't set its own: a wrong
+        custom-field id silently blanks out that project's real component
+        data at sync time (see sync.py's component_slug), so leaking one
+        project's custom field onto another is actively harmful, not just a
+        missing default. The top-level value only still applies to the
+        legacy single-project (`project = "..."`, no [[projects]] array)
+        config, where there's exactly one project anyway."""
+        if self.projects:
+            for project in self.projects:
+                if project.key == project_key:
+                    return project.component_field
+            return None
+        return self.component_field
 
     def effective_history_months(self, project_key: str | None) -> int | None:
         """How many months of statusCategory=Done history to sync for this
@@ -195,8 +214,15 @@ def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
         history_months = entry.get("history_months")
         if history_months is not None and (not isinstance(history_months, int) or history_months <= 0):
             raise ConfigError(f"invalid config file {path}: projects.history_months must be a positive integer")
+        component_field = optional_string(entry, "component_field", path)
         projects.append(
-            ProjectSettings(key=key, default=default, read_only=read_only, history_months=history_months)
+            ProjectSettings(
+                key=key,
+                default=default,
+                read_only=read_only,
+                history_months=history_months,
+                component_field=component_field,
+            )
         )
     if sum(1 for p in projects if p.default) > 1:
         raise ConfigError(f"invalid config file {path}: only one [[projects]] entry may set default = true")

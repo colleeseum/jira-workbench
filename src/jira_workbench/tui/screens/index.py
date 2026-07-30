@@ -14,12 +14,14 @@ from textual.widgets import DataTable, Footer, Header
 from textual.widgets.data_table import RowKey
 
 from ...devstatus import fetch_dev_status
-from ...issue import IssueError, fetch_current_user, fetch_issue_type_fields
 from ...metadata import MetadataError
-from ...sync import issue_key_sort_key
+from ...shadow import load_shadow
+from ...sync import find_existing_issue, issue_key_sort_key, read_json
 from ...view import (
     VIRTUAL_NONE,
+    apply_shadow,
     assignee_first_name_map,
+    clone_prefill,
     cycle_swimlane,
     dev_status_indicator,
     display_component,
@@ -78,6 +80,7 @@ class IndexScreen(Screen[None]):
         Binding("m", "toggle_modified", "Modified"),
         Binding("f", "filters", "Filters"),
         Binding("c", "new_issue", "New issue"),
+        Binding("C", "clone_issue", "Clone"),
         Binding("S", "cycle_swimlane", "Swimlane"),
         Binding("z", "toggle_lane", "Collapse lane"),
         Binding("Z", "toggle_all_lanes", "Collapse/expand all"),
@@ -617,51 +620,17 @@ class IndexScreen(Screen[None]):
 
     @work
     async def action_new_issue(self) -> None:
-        if not self.app.can_push():
-            self.notify("cannot create: missing Jira API configuration", severity="warning")
-            return
         project = self.app.project
         if not project:
             self.notify("cannot create: no project configured", severity="warning")
             return
-        if self.app.is_project_read_only(project):
-            self.notify(f"cannot create: project {project} is read-only", severity="warning")
-            return
-        try:
-            client = self.app.get_api_client()
-            # Cached per project for the rest of the session, and offloaded
-            # to a thread -- issue_createmeta is a synchronous (blocking)
-            # HTTP call, so running it inline here would freeze the whole UI
-            # for the round trip on every single "new issue" press, not just
-            # delay this one screen.
-            type_fields = self.app.issue_type_fields_cache.get(project)
-            if type_fields is None:
-                type_fields = await asyncio.to_thread(fetch_issue_type_fields, client, str(project))
-                self.app.issue_type_fields_cache[project] = type_fields
-        except (MetadataError, IssueError) as exc:
-            self.notify(f"cannot create: {exc}", severity="error")
-            return
-        if not type_fields:
-            self.notify(f"no creatable issue types found for project {project}", severity="warning")
-            return
 
-        default_reporter = ""
-        default_reporter_account_id: str | None = None
-        if any("reporter" in fields for fields in type_fields.values()):
-            current_user = self.app.current_user
-            if current_user is None:
-                try:
-                    current_user = await asyncio.to_thread(fetch_current_user, client)
-                    self.app.current_user = current_user
-                except IssueError:
-                    current_user = None
-            if current_user is not None:
-                default_reporter_account_id = str(current_user.get("accountId") or "") or None
-                default_reporter = str(
-                    current_user.get("displayName") or current_user.get("emailAddress") or default_reporter_account_id or ""
-                )
+        from .issue_create import IssueCreateScreen, resolve_create_context
 
-        from .issue_create import IssueCreateScreen
+        context = await resolve_create_context(self.app, project)
+        if context is None:
+            return
+        client, type_fields, default_reporter, default_reporter_account_id = context
 
         epic_item = self._epic_context()
         context_label = f"New issue under {display_name(epic_item.get('key'))}" if epic_item else ""
@@ -687,6 +656,64 @@ class IndexScreen(Screen[None]):
         self._rebuild_table()
         self._select_key(key)
         self.notify(f"created {key}")
+
+    @work
+    async def action_clone_issue(self) -> None:
+        key = self._current_key()
+        if key is None:
+            self.notify("select an item to clone", severity="warning")
+            return
+        item = next((candidate for candidate in self.items if display_name(candidate.get("key")) == key), None)
+        if item is None:
+            self.notify("select an item to clone", severity="warning")
+            return
+        project = item.get("project") or self.app.project
+        if not project:
+            self.notify("cannot clone: no project configured", severity="warning")
+            return
+        component_hint = item.get("component") if isinstance(item.get("component"), str) else None
+        path = find_existing_issue(self.app.jira_dir / "components", key, component_hint=component_hint)
+        if path is None:
+            self.notify(f"cannot clone: {key} is not synced locally", severity="error")
+            return
+        issue = read_json(path)
+        if not isinstance(issue, dict):
+            self.notify(f"cannot clone: local issue file for {key} is invalid", severity="error")
+            return
+        shadow = load_shadow(self.app.jira_dir, key, component_hint=component_hint)
+        effective = apply_shadow(issue, shadow) if shadow is not None else issue
+
+        from .issue_create import IssueCreateScreen, resolve_create_context
+
+        context = await resolve_create_context(self.app, str(project))
+        if context is None:
+            return
+        client, type_fields, default_reporter, default_reporter_account_id = context
+
+        prefill = clone_prefill(self.app.jira_dir, effective, self.app.component_field)
+        new_key = await self.app.push_screen_wait(
+            IssueCreateScreen(
+                jira_dir=self.app.jira_dir,
+                project=str(project),
+                component_field=self.app.component_field or "components",
+                type_fields=type_fields,
+                client=client,
+                epic_item=None,
+                default_reporter=default_reporter,
+                default_reporter_account_id=default_reporter_account_id,
+                context_label=f"Clone of {key}",
+                clone_prefill_values=prefill,
+            )
+        )
+        if new_key is None:
+            return
+
+        self.items = load_manifest_items(
+            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+        )
+        self._rebuild_table()
+        self._select_key(new_key)
+        self.notify(f"created {new_key}")
 
     async def _open_dev_status_link(self, row_key: RowKey) -> None:
         # The Dev column's cached indicator (from the already-synced

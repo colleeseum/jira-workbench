@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from textual import work
@@ -8,7 +9,8 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
-from ...issue import IssueError, build_create_fields, create_issue
+from ...issue import IssueError, build_create_fields, create_issue, fetch_current_user, fetch_issue_type_fields
+from ...metadata import MetadataError
 from ...shadow import ShadowError, refresh_local_issue_after_push, user_payload
 from ...view import (
     comma_parts,
@@ -30,6 +32,57 @@ from ..widgets.prompts import (
 from ..widgets.tables import ClickableRowDataTable
 
 HARD_CODED_STATUS = "To Do"
+
+
+async def resolve_create_context(
+    app: Any, project: str
+) -> tuple[Any, dict[str, dict[str, object]], str, str | None] | None:
+    """Resolve (client, type_fields, default_reporter,
+    default_reporter_account_id) for creating an issue under `project` --
+    shared by Index's "new issue"/"clone" and Detail's "clone", which differ
+    only in which project they target and how the form's values get
+    prefilled. Notifies and returns None on any failure, so callers can
+    just `return` on a None result."""
+    if not app.can_push():
+        app.notify("cannot create: missing Jira API configuration", severity="warning")
+        return None
+    if app.is_project_read_only(project):
+        app.notify(f"cannot create: project {project} is read-only", severity="warning")
+        return None
+    try:
+        client = app.get_api_client()
+        # Cached per project for the rest of the session, and offloaded to a
+        # thread -- issue_createmeta is a synchronous (blocking) HTTP call,
+        # so running it inline here would freeze the whole UI for the round
+        # trip on every single "new issue"/"clone" press, not just delay
+        # this one screen.
+        type_fields = app.issue_type_fields_cache.get(project)
+        if type_fields is None:
+            type_fields = await asyncio.to_thread(fetch_issue_type_fields, client, str(project))
+            app.issue_type_fields_cache[project] = type_fields
+    except (MetadataError, IssueError) as exc:
+        app.notify(f"cannot create: {exc}", severity="error")
+        return None
+    if not type_fields:
+        app.notify(f"no creatable issue types found for project {project}", severity="warning")
+        return None
+
+    default_reporter = ""
+    default_reporter_account_id: str | None = None
+    if any("reporter" in fields for fields in type_fields.values()):
+        current_user = app.current_user
+        if current_user is None:
+            try:
+                current_user = await asyncio.to_thread(fetch_current_user, client)
+                app.current_user = current_user
+            except IssueError:
+                current_user = None
+        if current_user is not None:
+            default_reporter_account_id = str(current_user.get("accountId") or "") or None
+            default_reporter = str(
+                current_user.get("displayName") or current_user.get("emailAddress") or default_reporter_account_id or ""
+            )
+    return client, type_fields, default_reporter, default_reporter_account_id
 
 # Ordered to match DetailScreen's normal (non-Other, non-Comments) field
 # layout: Summary, Description, Type, Status, Priority, Version, Assignee,
@@ -107,6 +160,7 @@ class IssueCreateScreen(Screen[str | None]):
         default_reporter: str,
         default_reporter_account_id: str | None,
         context_label: str,
+        clone_prefill_values: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
         self._jira_dir = jira_dir
@@ -117,6 +171,21 @@ class IssueCreateScreen(Screen[str | None]):
         self._default_reporter = default_reporter
         self._default_reporter_account_id = default_reporter_account_id
         self._context_label = context_label
+
+        if clone_prefill_values is not None:
+            self.selected_type = clone_prefill_values.get("type", "")
+            self.values: dict[str, str] = {
+                "summary": clone_prefill_values.get("summary", ""),
+                "description": clone_prefill_values.get("description", ""),
+                "component": clone_prefill_values.get("component", ""),
+                "version": clone_prefill_values.get("version", ""),
+                "priority": clone_prefill_values.get("priority", ""),
+                "labels": clone_prefill_values.get("labels", ""),
+                "assignee": clone_prefill_values.get("assignee", ""),
+                "reporter": default_reporter,
+                "parent": clone_prefill_values.get("parent", ""),
+            }
+            return
 
         self.selected_type = ""
 
@@ -241,7 +310,10 @@ class IssueCreateScreen(Screen[str | None]):
             return
 
         if key == "component":
-            options = component_options(self._jira_dir)
+            if self._component_field and self._component_field != "components":
+                options = observed_field_options(self._jira_dir, self._component_field)
+            else:
+                options = component_options(self._jira_dir)
             choice = await self.app.push_screen_wait(
                 OptionPickerScreen("Component:", ["(none)", *options], current=self.values["component"] or None)
             )
