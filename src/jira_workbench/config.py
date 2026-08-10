@@ -31,6 +31,7 @@ class ProjectSettings:
     read_only: bool = False
     history_months: int | None = None
     component_field: str | None = None
+    exclude_assignees: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,19 @@ class WorkbenchConfig:
 
     def read_only_project_keys(self) -> frozenset[str]:
         return frozenset(project.key for project in self.resolved_projects() if project.read_only)
+
+    def excluded_assignees(self, project_key: str | None) -> frozenset[str]:
+        """Names to hide from the ASSIGN dropdown regardless of what Jira's
+        own APIs say -- a manual, user-maintained escape hatch for people
+        who've stopped actually working on a project but still hold a
+        project role Jira never got cleaned up (confirmed in practice:
+        neither the "assignable users" search nor Administrator/Member
+        project-role membership reliably reflects this, since both depend
+        on someone remembering to update Jira's own access settings)."""
+        for project in self.resolved_projects():
+            if project.key == project_key:
+                return frozenset(name.strip().lower() for name in project.exclude_assignees)
+        return frozenset()
 
     def effective_component_field(self, project_key: str | None) -> str | None:
         """Which Jira field holds "components" for this project -- a
@@ -215,6 +229,9 @@ def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
         if history_months is not None and (not isinstance(history_months, int) or history_months <= 0):
             raise ConfigError(f"invalid config file {path}: projects.history_months must be a positive integer")
         component_field = optional_string(entry, "component_field", path)
+        exclude_assignees_raw = entry.get("exclude_assignees", [])
+        if not isinstance(exclude_assignees_raw, list) or not all(isinstance(item, str) for item in exclude_assignees_raw):
+            raise ConfigError(f"invalid config file {path}: projects.exclude_assignees must be an array of strings")
         projects.append(
             ProjectSettings(
                 key=key,
@@ -222,6 +239,7 @@ def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
                 read_only=read_only,
                 history_months=history_months,
                 component_field=component_field,
+                exclude_assignees=tuple(exclude_assignees_raw),
             )
         )
     if sum(1 for p in projects if p.default) > 1:

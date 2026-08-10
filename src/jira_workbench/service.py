@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from .shadow import PushResult, push_shadows, set_field
+from .sync import issue_key_sort_key
+from .view import display_name, load_manifest_items
 from .metadata import (
     JiraApiConfig,
     MetadataError,
@@ -15,6 +20,7 @@ from .metadata import (
     format_components as format_meta_components,
     format_component_cache,
     format_versions,
+    is_project_read_only,
     jira_api_client,
     load_all_components,
     load_all_versions,
@@ -101,7 +107,7 @@ def meta_components_output(
             jira_email,
             jira_api_token,
         )
-    summary = load_component_summary(jira_dir)
+    summary = load_component_summary(jira_dir, str(project) if project is not None else None)
     if summary:
         return format_meta_components(summary)
     if project is None:
@@ -139,7 +145,7 @@ def meta_component_field_options_output(
         cache = refresh_component_field_options_api(jira_dir, api_project, field_id, client)
     if cache is None:
         raise MetadataError(f"no cached options found for {field_id}")
-    summary = load_component_summary(jira_dir)
+    summary = load_component_summary(jira_dir, str(project))
     if summary:
         return format_meta_components(merge_components(normalize_components(cache.get("options")), summary))
     return format_component_field_option_cache(cache)
@@ -301,10 +307,10 @@ def load_meta_components(
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_component_field_options_api(jira_dir, api_project, field_id, client)
         options = normalize_components(cache.get("options"))
-        summary = load_component_summary(jira_dir)
+        summary = load_component_summary(jira_dir, str(project))
         return merge_components(options, summary) if summary else options
 
-    summary = load_component_summary(jira_dir)
+    summary = load_component_summary(jira_dir, str(project) if project is not None else None)
     if summary:
         return summary
     if project is None:
@@ -369,3 +375,63 @@ def filter_versions(
     except re.error as exc:
         return versions, f"invalid regex: {exc}"
     return [version for version in versions if regex.search(version_filter_text(version))], None
+
+
+@dataclass(frozen=True)
+class LabelBulkEditResult:
+    affected_keys: tuple[str, ...]
+    skipped_read_only_keys: tuple[str, ...]
+    push_result: PushResult | None
+    push_error: str | None = None
+
+
+def bulk_edit_label(
+    jira_dir: Path,
+    label: str,
+    new_name: str | None,
+    project: object | None,
+    jira_url: object | None,
+    jira_email: object | None,
+    jira_api_token: object | None,
+    component_field: object | None,
+) -> LabelBulkEditResult:
+    """Jira has no API for labels as an independent entity -- a label is
+    just free text on each issue's `labels` field, so renaming/deleting one
+    means finding every locally synced issue that has it, editing each
+    one's shadow, and pushing them all -- the same thing this app's TUI
+    LabelsScreen already does (moved here, rather than duplicated, so the
+    web GUI can drive the identical bulk-edit flow).
+
+    `new_name=None` deletes the label from every affected issue instead of
+    renaming it. Issues in a read-only project are skipped entirely (never
+    edited), same as the TUI's own policy -- their keys are reported
+    separately so a caller can tell the user what was left untouched.
+    """
+    items: list[dict[str, Any]] = load_manifest_items(jira_dir, str(component_field) if component_field else None)
+    affected = [item for item in items if label in (item.get("labels") or [])]
+    skipped = [item for item in affected if is_project_read_only(jira_dir, item.get("project"))]
+    affected = [item for item in affected if item not in skipped]
+    skipped_keys = tuple(sorted((display_name(item.get("key")) for item in skipped), key=issue_key_sort_key))
+
+    if not affected:
+        return LabelBulkEditResult(affected_keys=(), skipped_read_only_keys=skipped_keys, push_result=None)
+
+    keys = sorted((display_name(item.get("key")) for item in affected), key=issue_key_sort_key)
+    for item in affected:
+        key = display_name(item.get("key"))
+        current_labels = item.get("labels") or []
+        updated = (
+            [new_name if existing == label else existing for existing in current_labels]
+            if new_name
+            else [existing for existing in current_labels if existing != label]
+        )
+        set_field(jira_dir, key, "labels", updated)
+
+    try:
+        _, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+    except MetadataError as exc:
+        return LabelBulkEditResult(
+            affected_keys=tuple(keys), skipped_read_only_keys=skipped_keys, push_result=None, push_error=str(exc)
+        )
+    result = push_shadows(jira_dir, keys, client, component_field=str(component_field or "components"))
+    return LabelBulkEditResult(affected_keys=tuple(keys), skipped_read_only_keys=skipped_keys, push_result=result)

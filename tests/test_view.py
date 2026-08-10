@@ -13,6 +13,7 @@ from jira_workbench.view import (
     PRIORITY_ICONS,
     TYPE_ICONS,
     assignee_first_name_map,
+    avatar_url,
     comment_body_text,
     comments_text,
     component_counts,
@@ -2289,6 +2290,49 @@ def test_with_local_index_fields_resolves_shadow_changed_status_category(tmp_pat
 
     assert enriched["status"] == "Solved"
     assert enriched["statusCategory"] == "done"
+
+
+def test_with_local_index_fields_extracts_the_assignees_avatar_url(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "assignee": {
+                    "displayName": "Serge Colle",
+                    "avatarUrls": {"48x48": "https://example.com/48.png", "32x32": "https://example.com/32.png"},
+                },
+            },
+        },
+    )
+
+    enriched = with_local_index_fields(tmp_path, {"key": "SAT-1"}, "components")
+
+    assert enriched["assigneeAvatarUrl"] == "https://example.com/32.png"
+
+
+def test_with_local_index_fields_assignee_avatar_url_blank_when_unassigned(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "One"}},
+    )
+
+    enriched = with_local_index_fields(tmp_path, {"key": "SAT-1"}, "components")
+
+    assert enriched["assigneeAvatarUrl"] == ""
+
+
+def test_avatar_url_prefers_32x32_then_falls_back_by_size() -> None:
+    assert avatar_url({"avatarUrls": {"48x48": "big", "32x32": "mid"}}) == "mid"
+    assert avatar_url({"avatarUrls": {"48x48": "big"}}) == "big"
+    assert avatar_url({"avatarUrls": {"16x16": "small"}}) == "small"
+
+
+def test_avatar_url_blank_for_non_dict_or_missing_avatar_urls() -> None:
+    assert avatar_url(None) == ""
+    assert avatar_url("Serge Colle") == ""
+    assert avatar_url({"displayName": "Serge Colle"}) == ""
 
 
 def test_filter_items_max_done_age_days() -> None:

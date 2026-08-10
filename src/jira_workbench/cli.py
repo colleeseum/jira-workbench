@@ -31,10 +31,12 @@ from .metadata import (
     load_component_summary,
     load_components,
     load_versions,
+    refresh_assignees_api,
     refresh_boards_api,
     refresh_component_field_options_api,
     refresh_components_api,
     refresh_versions_api,
+    seed_project_registry,
     write_project_registry,
 )
 from .issue import IssueError, build_create_fields, create_issue, fetch_issue_type_fields, resolve_reporter
@@ -263,6 +265,9 @@ def build_parser() -> argparse.ArgumentParser:
     meta_refresh.add_argument("--versions", action="store_true", help="Refresh project fix versions")
     meta_refresh.add_argument("--components", action="store_true", help="Refresh project components")
     meta_refresh.add_argument("--boards", action="store_true", help="Refresh Jira Kanban boards and membership")
+    meta_refresh.add_argument(
+        "--assignees", action="store_true", help="Refresh the project's currently assignable (active) users"
+    )
 
     meta_versions = meta_subparsers.add_parser("versions", help="List cached Jira project fix versions")
     meta_versions.add_argument(
@@ -421,6 +426,15 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    # Seed the on-disk read-only/default registry for any project config.toml
+    # declares that the registry has never recorded at all -- otherwise
+    # is_project_read_only() defaults such a project to "fully permissive"
+    # until a full `sync` happens to run for it first. This only fills in
+    # missing keys; it never touches an entry the registry already has
+    # (that stays authoritative, and only `sync`'s full write_project_registry
+    # call is allowed to change it -- see is_project_read_only/shadow.py).
+    seed_project_registry(resolve_jira_dir(getattr(args, "jira_dir", None), config.jira_dir), config.resolved_projects())
 
     if args.command == "sync":
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
@@ -817,12 +831,16 @@ def run_meta(
         return 2
 
     if args.meta_command == "refresh":
-        refresh_versions_requested = args.versions or not (args.components or args.boards)
-        if refresh_versions_requested:
+        # No flags at all means "refresh everything" -- naming one or more
+        # flags switches to refreshing only those, same as before. Without
+        # this, a bare `meta refresh` silently refreshed versions only,
+        # which reads as "did nothing" for components/boards/assignees.
+        no_flags_given = not (args.versions or args.components or args.boards or args.assignees)
+        if args.versions or no_flags_given:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_versions_api(jira_dir, api_project, client)
             print(f"refreshed {len(cache.get('versions', []))} versions")
-        if args.components:
+        if args.components or no_flags_given:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             if component_field and str(component_field) != "components":
                 cache = refresh_component_field_options_api(jira_dir, api_project, str(component_field), client)
@@ -830,10 +848,21 @@ def run_meta(
             else:
                 cache = refresh_components_api(jira_dir, api_project, client)
                 print(f"refreshed {len(cache.get('components', []))} native components")
-        if args.boards:
+        if args.boards or no_flags_given:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))
             print(f"refreshed {len(cache.get('boards', []))} boards")
+        if args.assignees or no_flags_given:
+            api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+            cache = refresh_assignees_api(jira_dir, api_project, client)
+            print(f"refreshed {len(cache.get('assignees', []))} assignable users")
+            if cache.get("source") == "role-api-fallback":
+                print(
+                    "warning: Jira's internal Access-page API was unavailable -- fell back to the "
+                    "classic role-based API, which can still include people who no longer actually "
+                    "have project access (see config.toml's exclude_assignees for a manual override)",
+                    file=sys.stderr,
+                )
         return 0
 
     if args.meta_command == "versions":
@@ -871,7 +900,7 @@ def run_meta(
                 end="",
             )
             return 0
-        components = load_component_summary(jira_dir)
+        components = load_component_summary(jira_dir, str(project) if project is not None else None)
         if components:
             print(format_meta_components(components), end="")
             return 0

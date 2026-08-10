@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from .config import ProjectSettings
 from .jql import compile_jql, scope_predicate_to_project
-from .sync import FALLBACK_DONE_STATUS_NAMES, read_json, utc_now, write_json
+from .sync import FALLBACK_DONE_STATUS_NAMES, bump_manifest_generation, read_json, utc_now, write_json
 
 
 DEFAULT_METADATA_TTL_SECONDS = 3600
@@ -183,6 +183,10 @@ def boards_path(jira_dir: Path, project: str) -> Path:
     return jira_dir / "meta" / project / "boards.json"
 
 
+def assignees_path(jira_dir: Path, project: str) -> Path:
+    return jira_dir / "meta" / project / "assignees.json"
+
+
 def component_field_options_path(jira_dir: Path, project: str, field_id: str) -> Path:
     return jira_dir / "meta" / project / f"{field_id}-options.json"
 
@@ -260,6 +264,10 @@ def sort_components(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(components, key=lambda component: component_name(component).lower())
 
 
+def sort_assignees(users: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(users, key=lambda user: str(user.get("displayName") or "").lower())
+
+
 def load_versions(jira_dir: Path, project: str) -> dict[str, Any] | None:
     path = versions_path(jira_dir, project)
     if not path.exists():
@@ -278,6 +286,14 @@ def load_components(jira_dir: Path, project: str) -> dict[str, Any] | None:
 
 def load_boards(jira_dir: Path, project: str) -> dict[str, Any] | None:
     path = boards_path(jira_dir, project)
+    if not path.exists():
+        return None
+    value = read_json(path)
+    return value if isinstance(value, dict) else None
+
+
+def load_assignees(jira_dir: Path, project: str) -> dict[str, Any] | None:
+    path = assignees_path(jira_dir, project)
     if not path.exists():
         return None
     value = read_json(path)
@@ -401,6 +417,25 @@ def write_project_registry(jira_dir: Path, projects: tuple[ProjectSettings, ...]
         project_registry_path(jira_dir),
         {"projects": {p.key: {"readOnly": p.read_only, "default": p.default} for p in projects}},
     )
+
+
+def seed_project_registry(jira_dir: Path, projects: tuple[ProjectSettings, ...]) -> None:
+    """Fill in a registry entry for any project config.toml declares that the
+    registry has never recorded at all, so a freshly added `read_only = true`
+    takes effect on the very next command instead of staying "fully permissive"
+    (see load_project_registry) until someone happens to run a full `sync`.
+
+    Deliberately additive-only: a project already present in the registry --
+    however it got there -- is left untouched, even if this config disagrees
+    (e.g. a `--config` pointed at a file without read_only info). Only
+    write_project_registry's full overwrite, from `sync`, may change or
+    remove an existing entry; this only ever adds ones that were missing."""
+    existing = load_project_registry(jira_dir)
+    missing = {p.key: p for p in projects if p.key not in existing}
+    if not missing:
+        return
+    merged = {**existing, **{key: {"readOnly": p.read_only, "default": p.default} for key, p in missing.items()}}
+    write_json(project_registry_path(jira_dir), {"projects": merged})
 
 
 def load_project_registry(jira_dir: Path) -> dict[str, dict[str, bool]]:
@@ -616,6 +651,158 @@ def refresh_components_api(
     return cache
 
 
+_PROJECT_ACCESS_ROLE_NAMES = {"administrator", "member"}
+
+
+def fetch_project_access_members(client: Any, project_key: str) -> list[dict[str, Any]]:
+    """Everyone with real, current access to this project -- the union of
+    its Administrator and Member roles, the same roster Jira's own Project
+    Settings > Access page shows (.../jira/software/projects/{key}/settings
+    /access). Deliberately NOT Jira's generic "assignable users" search
+    (rest/api/2/user/assignable/search): confirmed live against a real
+    instance that it still returns someone who's been removed from the
+    project's own Access list, as long as they retain assign permission
+    through some other, broader grant -- Access-role membership is what
+    actually tracks "is this still someone I work with on this project"
+    day to day. The Viewer role (can't be assigned issues) and the
+    addon/service system roles (atlassian-addons-project-access,
+    jira-guest-member) are excluded on purpose."""
+    try:
+        roles = client.get_project_roles(project_key)
+    except Exception as exc:
+        raise MetadataError(f"could not list project roles for {project_key}: {exc}") from exc
+    if not isinstance(roles, dict):
+        return []
+    users_by_id: dict[str, dict[str, Any]] = {}
+    for role_name, role_url in roles.items():
+        if str(role_name).strip().lower() not in _PROJECT_ACCESS_ROLE_NAMES:
+            continue
+        role_id = str(role_url).rstrip("/").rsplit("/", 1)[-1]
+        try:
+            role_detail = client.get_project_actors_for_role_project(project_key, role_id)
+        except Exception as exc:
+            raise MetadataError(f"could not list actors for role {role_name} on {project_key}: {exc}") from exc
+        actors = role_detail.get("actors") if isinstance(role_detail, dict) else role_detail
+        if not isinstance(actors, list):
+            continue
+        for actor in actors:
+            if not isinstance(actor, dict) or actor.get("type") != "atlassian-user-role-actor":
+                continue
+            display_name = actor.get("displayName")
+            if not isinstance(display_name, str) or not display_name:
+                continue
+            actor_user = actor.get("actorUser")
+            account_id = actor_user.get("accountId") if isinstance(actor_user, dict) else None
+            users_by_id[str(account_id or display_name)] = {"accountId": account_id, "displayName": display_name}
+    return list(users_by_id.values())
+
+
+_PROJECT_ACTORS_QUERY = """query ProjectActorsQuery($filter: ProjectActorInputs, $projectId: Long!) {
+  projectActors(filter: $filter, projectId: $projectId) {
+    actors {
+      email
+      avatarUrl
+      active
+      accountId
+      roleTypeId
+      type
+      displayName
+      roles
+      isGuest
+      __typename
+    }
+    isLastBatch
+    __typename
+  }
+  projectActorsLimits(projectId: $projectId) {
+    limit
+    totalCount
+    __typename
+  }
+}"""
+
+
+def fetch_project_actors_internal(client: Any, project_id: object) -> list[dict[str, Any]]:
+    """The exact internal GraphQL query Jira's own web UI issues for a
+    team-managed project's Settings > Access page (POST rest/gira/1/
+    ?operation=ProjectActorsQuery) -- reverse-engineered from that page's
+    own network traffic. Confirmed against a real instance to be the only
+    source whose "active" flag actually tracks current Access-page
+    membership: both the classic project-role actors API
+    (fetch_project_access_members) and Jira's public "assignable users"
+    search kept including people well after they'd been removed from the
+    project, apparently because neither correctly reflects a site-
+    deactivated account the way this internal query does.
+
+    UNDOCUMENTED and unsupported -- not part of the Jira REST v3 contract,
+    so Atlassian can change or remove it without notice. Callers should
+    treat any failure here as expected and fall back to the public,
+    supported role-based API (see refresh_assignees_api)."""
+    actors: list[dict[str, Any]] = []
+    page_number = 1
+    while True:
+        body = {
+            "operationName": "ProjectActorsQuery",
+            "variables": {
+                "projectId": project_id,
+                "filter": {
+                    "page": {"number": page_number, "size": 100},
+                    "orderBy": {"field": "NAME", "direction": "ASC"},
+                    "roles": {"ids": [], "actorTypes": []},
+                },
+            },
+            "query": _PROJECT_ACTORS_QUERY,
+        }
+        payload = client.post("rest/gira/1/", json=body, params={"operation": "ProjectActorsQuery"})
+        data = payload.get("data") if isinstance(payload, dict) else None
+        project_actors = data.get("projectActors") if isinstance(data, dict) else None
+        page_actors = project_actors.get("actors") if isinstance(project_actors, dict) else None
+        if not isinstance(page_actors, list) or not page_actors:
+            break
+        actors.extend(actor for actor in page_actors if isinstance(actor, dict))
+        if project_actors.get("isLastBatch"):
+            break
+        page_number += 1
+    return actors
+
+
+def refresh_assignees_api(
+    jira_dir: Path,
+    project: str,
+    client: Any,
+) -> dict[str, Any]:
+    try:
+        project_id = client.project(project).get("id")
+        actors = fetch_project_actors_internal(client, project_id)
+        users = [
+            {"accountId": actor.get("accountId"), "displayName": actor.get("displayName")}
+            for actor in actors
+            if actor.get("active") is True and isinstance(actor.get("displayName"), str) and actor.get("displayName")
+        ]
+        source = "internal-access-api"
+    except Exception:
+        # The internal query is undocumented -- Atlassian can change or
+        # remove it without notice. Degrading to the classic, public
+        # role-based API keeps the refresh functional rather than failing
+        # outright, but that source is known to be less accurate (see
+        # fetch_project_access_members's own docstring: it can still
+        # include someone who's actually stopped working on the project).
+        # "source" is recorded in the cache itself, not just logged at
+        # refresh time, so a stale degraded cache stays visible to anyone
+        # inspecting it later, not only to whoever happened to be watching
+        # the terminal when the refresh ran.
+        users = fetch_project_access_members(client, project)
+        source = "role-api-fallback"
+    cache = {
+        "project": project,
+        "fetchedAt": utc_now(),
+        "assignees": sort_assignees(users),
+        "source": source,
+    }
+    write_json(assignees_path(jira_dir, project), cache)
+    return cache
+
+
 def field_clause_names(client: ProjectMetadataClient, field_id: str) -> list[str]:
     """Every name usable in a JQL clause for this field.
 
@@ -664,6 +851,73 @@ def fetch_backlog_keys(client: ProjectMetadataClient, board_id: object) -> list[
             break
         start += 100
     return keys
+
+
+def fetch_board_keys(client: Any, board_id: object) -> list[str]:
+    """Same shape as fetch_backlog_keys, but against the board's own issue
+    list (GET board/{id}/issue) rather than its backlog -- Jira returns both
+    already ordered by rank, so this doubles as the "active" section's
+    display order the same way fetch_backlog_keys's return value already is
+    for "backlog" (see with_local_index_fields, view.py), even though
+    nothing used that ordering property until now."""
+    keys: list[str] = []
+    start = 0
+    while True:
+        page = client.get(
+            f"rest/agile/1.0/board/{board_id}/issue",
+            params={"startAt": start, "maxResults": 100, "fields": "key"},
+        )
+        if not isinstance(page, dict):
+            break
+        issues = page.get("issues")
+        if not isinstance(issues, list):
+            break
+        keys.extend(issue["key"] for issue in issues if isinstance(issue, dict) and isinstance(issue.get("key"), str))
+        total = page.get("total")
+        if not isinstance(total, int) or start + 100 >= total:
+            break
+        start += 100
+    return keys
+
+
+def move_issue_to_backlog(client: Any, key: str) -> None:
+    """POST rest/agile/1.0/backlog/issue -- removes `key` from whatever
+    sprint/board placement it has, same as dragging a card down into Jira's
+    own Backlog section."""
+    client.move_issues_to_backlog([key])
+
+
+def move_issue_to_board(client: Any, board_id: object, key: str) -> None:
+    """POST rest/agile/1.0/board/{boardId}/issue -- the "move onto the
+    board" counterpart to move_issue_to_backlog. Not wrapped by the
+    atlassian-python-api library (it only has the GET side, get_issues_for_
+    board), so this goes through the client's own generic post() directly,
+    the same way fetch_backlog_keys/fetch_board_keys go through its generic
+    get()."""
+    client.post(client.get_agile_resource_url(f"board/{board_id}/issue"), json={"issues": [key]})
+
+
+def fetch_rank_field_id(client: Any) -> str | None:
+    """Jira's Agile "Rank" field is a custom field whose id varies per
+    instance -- discovered here by display name rather than assumed, using
+    the same instance-wide field listing the New Issue page's create-meta
+    lookup already relies on (fetch_all_field_names, issue.py). Returns
+    None (not an exception) when no field is named "Rank" -- callers must
+    treat that as "ranking unavailable here", not a hard failure, since some
+    instances hide or rename it."""
+    from .issue import fetch_all_field_names
+
+    for field_id, name in fetch_all_field_names(client).items():
+        if name.strip().lower() == "rank":
+            return field_id
+    return None
+
+
+def rank_issue_before(client: Any, key: str, before_key: str, rank_field_id: str) -> None:
+    """PUT rest/agile/1.0/issue/rank -- places `key` immediately before
+    `before_key` in Jira's own rank order, the same operation dragging a
+    card to a new position in Jira's backlog view performs."""
+    client.update_rank([key], before_key, rank_field_id)
 
 
 def refresh_boards_api(
@@ -715,6 +969,12 @@ def refresh_boards_api(
         except Exception:
             backlog_keys = None
 
+        board_keys: list[str] | None = None
+        try:
+            board_keys = fetch_board_keys(client, board_id)
+        except Exception:
+            board_keys = None
+
         boards.append(
             {
                 "id": board_id,
@@ -724,11 +984,19 @@ def refresh_boards_api(
                 "predicate": predicate,
                 "unsupportedReason": reason,
                 "backlogKeys": backlog_keys,
+                "boardKeys": board_keys,
             }
         )
 
     cache = {"project": project, "fetchedAt": utc_now(), "boards": boards}
     write_json(boards_path(jira_dir, project), cache)
+    # Board membership/active-vs-backlog classification is computed fresh
+    # from this exact file on every load_manifest_items() call (see
+    # with_local_index_fields, view.py), not baked into manifest.json at
+    # sync time -- so a cached all_items() result (server.py) needs to
+    # know this changed too, the same way a shadow write or a full sync
+    # already bumps this counter.
+    bump_manifest_generation(jira_dir)
     return cache
 
 
@@ -1095,29 +1363,38 @@ def merge_components(*sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sort_components(list(merged.values()))
 
 
-def load_component_summary(jira_dir: Path) -> list[dict[str, Any]]:
+def load_component_summary(jira_dir: Path, project: str | None = None) -> list[dict[str, Any]]:
+    """Component usage across locally synced issues, with active/total
+    counts -- scoped to `project` when given. Derived directly from the
+    manifest's own workItems (each of which already knows its own project),
+    not from the manifest's separate top-level "components" list: that list
+    is built from the on-disk components/<slug>/<KEY>/ directory structure,
+    which is shared across every synced project regardless of which
+    project's custom component field a given slug actually belongs to --
+    using it unscoped mixed every other project's component values (and
+    their _unassigned bucket's project-wide counts) into what should have
+    been one project's own short list."""
     path = manifest_path(jira_dir)
     if not path.exists():
         return []
     value = read_json(path)
     if not isinstance(value, dict):
         return []
-    components = value.get("components")
-    if not isinstance(components, list):
-        return []
-    summaries = [component for component in components if isinstance(component, dict)]
     work_items = value.get("workItems")
     if not isinstance(work_items, list):
-        return summaries
-    by_component: dict[str, dict[str, int]] = {}
+        components = value.get("components")
+        return [component for component in components if isinstance(component, dict)] if isinstance(components, list) else []
+    by_component: dict[str, dict[str, Any]] = {}
     for item in work_items:
         if not isinstance(item, dict):
+            continue
+        if project is not None and item.get("project") != project:
             continue
         component = str(item.get("component") or "").strip()
         if not component:
             continue
-        counts = by_component.setdefault(component.lower(), {"active": 0, "total": 0})
-        counts["total"] += 1
+        entry = by_component.setdefault(component.lower(), {"component": component, "active": 0, "total": 0})
+        entry["total"] += 1
         category = item.get("statusCategory")
         is_done = (
             category == "done"
@@ -1125,16 +1402,8 @@ def load_component_summary(jira_dir: Path) -> list[dict[str, Any]]:
             else str(item.get("status") or "").strip().lower() in FALLBACK_DONE_STATUS_NAMES
         )
         if not is_done:
-            counts["active"] += 1
-    enriched = []
-    for component in summaries:
-        name = component_name(component).strip()
-        counts = by_component.get(name.lower())
-        if counts is None:
-            enriched.append(component)
-            continue
-        enriched.append({**component, "active": counts["active"], "total": counts["total"]})
-    return enriched
+            entry["active"] += 1
+    return sort_components(list(by_component.values()))
 
 
 def format_components(components: list[dict[str, Any]]) -> str:

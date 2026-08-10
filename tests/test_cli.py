@@ -1407,6 +1407,207 @@ def test_meta_refresh_with_only_boards_flag_does_not_also_refresh_versions(tmp_p
     assert version_calls == []
 
 
+def test_meta_refresh_with_no_flags_refreshes_everything(tmp_path: Path, capsys, monkeypatch) -> None:
+    # Regression: a bare `meta refresh` used to silently refresh versions
+    # only -- components/boards/assignees looked untouched with no
+    # indication anything had been skipped. No flags now means "refresh
+    # everything"; naming specific flags still means "only those" (see the
+    # "only X flag" tests below/above).
+    jira_dir = tmp_path / "jira"
+    calls = []
+
+    monkeypatch.setattr(jira_workbench.cli, "refresh_versions_api", lambda *a, **k: calls.append("versions") or {"versions": []})
+    monkeypatch.setattr(jira_workbench.cli, "refresh_components_api", lambda *a, **k: calls.append("components") or {"components": []})
+    monkeypatch.setattr(jira_workbench.cli, "refresh_boards_api", lambda *a, **k: calls.append("boards") or {"boards": []})
+    monkeypatch.setattr(jira_workbench.cli, "refresh_assignees_api", lambda *a, **k: calls.append("assignees") or {"assignees": []})
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+        ]
+    )
+
+    assert code == 0
+    assert set(calls) == {"versions", "components", "boards", "assignees"}
+
+
+def test_meta_refresh_assignees_calls_refresh_assignees_api(tmp_path: Path, capsys, monkeypatch) -> None:
+    jira_dir = tmp_path / "jira"
+    calls = []
+
+    def fake_refresh_assignees_api(jira_dir_arg, project, client):
+        calls.append(project)
+        return {"assignees": [{"displayName": "Serge Colle"}]}
+
+    monkeypatch.setattr(jira_workbench.cli, "refresh_assignees_api", fake_refresh_assignees_api)
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert calls == ["SAT"]
+    assert "refreshed 1 assignable users" in captured.out
+
+
+def test_meta_refresh_assignees_warns_on_stderr_when_degraded_to_the_fallback_api(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    jira_dir = tmp_path / "jira"
+
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "refresh_assignees_api",
+        lambda *a, **k: {"assignees": [{"displayName": "Serge Colle"}], "source": "role-api-fallback"},
+    )
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "refreshed 1 assignable users" in captured.out
+    assert "warning" in captured.err.lower()
+    assert "fell back" in captured.err.lower()
+
+
+def test_meta_refresh_assignees_no_warning_when_the_internal_api_succeeds(tmp_path: Path, capsys, monkeypatch) -> None:
+    jira_dir = tmp_path / "jira"
+
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "refresh_assignees_api",
+        lambda *a, **k: {"assignees": [{"displayName": "Serge Colle"}], "source": "internal-access-api"},
+    )
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err == ""
+
+
+def test_meta_refresh_with_only_assignees_flag_does_not_also_refresh_versions(tmp_path: Path, monkeypatch) -> None:
+    jira_dir = tmp_path / "jira"
+    version_calls = []
+
+    monkeypatch.setattr(jira_workbench.cli, "refresh_versions_api", lambda *a, **k: version_calls.append(1))
+    monkeypatch.setattr(jira_workbench.cli, "refresh_assignees_api", lambda *a, **k: {"assignees": []})
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    assert code == 0
+    assert version_calls == []
+
+
 def test_meta_components_lists_cached_manifest_components(tmp_path: Path, capsys) -> None:
     jira_dir = tmp_path / "jira"
     write_json(

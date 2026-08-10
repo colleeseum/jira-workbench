@@ -745,6 +745,19 @@ def display_name(value: Any) -> str:
     return str(value)
 
 
+def avatar_url(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    avatar_urls = value.get("avatarUrls")
+    if not isinstance(avatar_urls, dict):
+        return ""
+    for size in ("32x32", "24x24", "48x48", "16x16"):
+        url = avatar_urls.get(size)
+        if isinstance(url, str) and url:
+            return url
+    return ""
+
+
 def display_component(value: Any) -> str:
     # "_unassigned" is the real on-disk sync sentinel for "no component"
     # (see sync.py's component_slug) -- meaningful for filtering, but not a
@@ -849,8 +862,15 @@ def with_local_index_fields(
     enriched["type"] = display_name(issue_type)
     enriched["component"] = hierarchy_component(issue, component_field) or display_name(item.get("component"))
     enriched["fixVersion"] = fix_version_names[0] if fix_version_names else ""
+    # Full multi-value list, alongside the display-only singular
+    # "fixVersion" above (kept as-is -- other callers already depend on
+    # its exact single-name shape) -- needed by anything that edits fix
+    # versions from an already-enriched item without truncating an
+    # issue that genuinely has more than one.
+    enriched["fixVersions"] = fix_version_names
     enriched["priority"] = display_name(fields.get("priority"))
     enriched["assignee"] = display_name(fields.get("assignee"))
+    enriched["assigneeAvatarUrl"] = avatar_url(fields.get("assignee"))
     enriched["epic"] = display_name(parent.get("key"))
     enriched["epicSummary"] = display_name(parent_fields.get("summary"))
     enriched["statusCategoryChangeDate"] = display_name(fields.get("statuscategorychangedate"))

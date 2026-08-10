@@ -134,6 +134,44 @@ def test_effective_history_months_none_when_nothing_configured() -> None:
     assert config.effective_history_months("SAT") is None
 
 
+def test_load_config_reads_project_exclude_assignees(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[projects]]",
+                'key = "SAT"',
+                'exclude_assignees = ["Matt Petrillo", "Rafael Campo"]',
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.projects == (ProjectSettings(key="SAT", exclude_assignees=("Matt Petrillo", "Rafael Campo")),)
+
+
+def test_load_config_rejects_non_string_exclude_assignees(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\nexclude_assignees = [1, 2]\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_excluded_assignees_is_case_insensitive() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT", exclude_assignees=("Matt Petrillo",)),))
+
+    assert config.excluded_assignees("SAT") == {"matt petrillo"}
+
+
+def test_excluded_assignees_empty_for_unknown_project_or_unconfigured() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
+
+    assert config.excluded_assignees("SAT") == frozenset()
+    assert config.excluded_assignees("SOMETHING") == frozenset()
+
+
 def test_load_config_reads_project_component_field(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(

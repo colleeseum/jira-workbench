@@ -124,8 +124,8 @@ def test_meta_component_field_options_output_uses_cached_options(tmp_path: Path)
         {
             "components": [{"component": "helm-chart", "count": 2}],
             "workItems": [
-                {"key": "SAT-1", "component": "helm-chart", "status": "To Do"},
-                {"key": "SAT-2", "component": "helm-chart", "status": "Closed"},
+                {"key": "SAT-1", "project": "SAT", "component": "helm-chart", "status": "To Do"},
+                {"key": "SAT-2", "project": "SAT", "component": "helm-chart", "status": "Closed"},
             ],
         },
     )
@@ -170,8 +170,8 @@ def test_meta_components_output_uses_component_field_options_when_configured(tmp
         {
             "components": [{"component": "helm-chart", "count": 2}],
             "workItems": [
-                {"key": "SAT-1", "component": "helm-chart", "status": "To Do"},
-                {"key": "SAT-2", "component": "helm-chart", "status": "Done"},
+                {"key": "SAT-1", "project": "SAT", "component": "helm-chart", "status": "To Do"},
+                {"key": "SAT-2", "project": "SAT", "component": "helm-chart", "status": "Done"},
             ],
         },
     )
