@@ -350,6 +350,26 @@ def test_add_local_board_then_load_all_boards_with_settings_tags_it_local(tmp_pa
     ]
 
 
+def test_add_local_board_updates_stored_board_membership_without_a_reindex(tmp_path: Path) -> None:
+    # write_board_settings is the sole choke point for every local-board
+    # mutation -- board membership is stored per item (db.items.boards),
+    # so this needs to recompute it the same way a Jira boards refresh or
+    # a full reindex already does.
+    from jira_workbench.db import list_items, reindex_items
+    from jira_workbench.sync import write_json
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"customfield_10071": {"value": "helm-chart"}}},
+    )
+    reindex_items(tmp_path, "customfield_10071")
+    assert {item["key"]: item for item in list_items(tmp_path)}["SAT-1"]["boards"] == []
+
+    add_local_board(tmp_path, "Helm Filter", {"component": ["helm-chart"]}, None)
+
+    assert {item["key"]: item for item in list_items(tmp_path)}["SAT-1"]["boards"] == ["Helm Filter"]
+
+
 def test_add_local_board_rejects_empty_name(tmp_path: Path) -> None:
     try:
         add_local_board(tmp_path, "   ", {}, None)
@@ -499,6 +519,55 @@ def test_refresh_versions_api_writes_cache(tmp_path: Path) -> None:
     assert cache["versions"][0]["name"] == "helm-chart-sa 3.4.0"
     assert load_versions(tmp_path, "SAT") == cache
     assert ("get_project_versions", "SAT") in client.calls
+
+
+def test_refresh_versions_api_also_populates_the_sql_index(tmp_path: Path) -> None:
+    from jira_workbench import db
+
+    client = ApiClient()
+
+    refresh_versions_api(tmp_path, "SAT", client)
+
+    indexed = db.project_versions(tmp_path, "SAT")
+    assert indexed is not None
+    versions, _fetched_at = indexed
+    assert versions == [{"id": "10000", "name": "helm-chart-sa 3.4.0", "released": False, "archived": False}]
+
+
+def test_load_versions_prefers_the_sql_index_over_a_stale_file(tmp_path: Path) -> None:
+    # A version renamed after the index was populated must show the new
+    # name -- the SQL index, not whatever meta/<PROJECT>/versions.json
+    # happened to say (a caller updating one without the other would be a
+    # bug, but load_versions should still favor the fresher of the two).
+    refresh_versions_api(tmp_path, "SAT", ApiClient())
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "stale-name"}]})
+
+    cache = load_versions(tmp_path, "SAT")
+
+    assert cache is not None
+    assert cache["versions"][0]["name"] == "helm-chart-sa 3.4.0"
+
+
+def test_load_versions_falls_back_to_the_file_when_not_yet_in_the_sql_index(tmp_path: Path) -> None:
+    write_json(tmp_path / "meta/SAT/versions.json", {"project": "SAT", "versions": [{"id": "1", "name": "v1"}]})
+
+    cache = load_versions(tmp_path, "SAT")
+
+    assert cache is not None
+    assert cache["versions"] == [{"id": "1", "name": "v1"}]
+
+
+def test_refresh_versions_api_removes_stale_rows_no_longer_returned_by_jira(tmp_path: Path) -> None:
+    from jira_workbench import db
+
+    client = ApiClient()
+    refresh_versions_api(tmp_path, "SAT", client)
+    client.versions = [{"id": "10001", "name": "helm-chart-sa 3.5.0"}]
+
+    refresh_versions_api(tmp_path, "SAT", client)
+
+    versions, _fetched_at = db.project_versions(tmp_path, "SAT")
+    assert [version["id"] for version in versions] == ["10001"]
 
 
 def test_refresh_versions_api_wraps_client_errors(tmp_path: Path) -> None:

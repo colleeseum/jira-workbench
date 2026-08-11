@@ -32,6 +32,7 @@ class ProjectSettings:
     history_months: int | None = None
     component_field: str | None = None
     exclude_assignees: tuple[str, ...] = ()
+    fix_version_single_select: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,17 @@ class WorkbenchConfig:
             if project.key == project_key:
                 return frozenset(name.strip().lower() for name in project.exclude_assignees)
         return frozenset()
+
+    def fix_version_single_select_project(self, project_key: str | None) -> bool:
+        """Whether this project's Fix Version field should only ever allow
+        one selection at a time -- a workbench-local preference (not read
+        from Jira's own field configuration, which would need an extra,
+        admin-gated API call), off by default (Jira issues can genuinely
+        have more than one fix version, and most projects use that)."""
+        for project in self.resolved_projects():
+            if project.key == project_key:
+                return project.fix_version_single_select
+        return False
 
     def effective_component_field(self, project_key: str | None) -> str | None:
         """Which Jira field holds "components" for this project -- a
@@ -232,6 +244,9 @@ def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
         exclude_assignees_raw = entry.get("exclude_assignees", [])
         if not isinstance(exclude_assignees_raw, list) or not all(isinstance(item, str) for item in exclude_assignees_raw):
             raise ConfigError(f"invalid config file {path}: projects.exclude_assignees must be an array of strings")
+        fix_version_single_select = entry.get("fix_version_single_select", False)
+        if not isinstance(fix_version_single_select, bool):
+            raise ConfigError(f"invalid config file {path}: projects.fix_version_single_select must be a boolean")
         projects.append(
             ProjectSettings(
                 key=key,
@@ -240,6 +255,7 @@ def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
                 history_months=history_months,
                 component_field=component_field,
                 exclude_assignees=tuple(exclude_assignees_raw),
+                fix_version_single_select=fix_version_single_select,
             )
         )
     if sum(1 for p in projects if p.default) > 1:

@@ -362,6 +362,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     meta_subparsers.add_parser("doctor", help="Test Jira Workbench metadata configuration")
 
+    db_parser = subparsers.add_parser("db", help="Manage the local SQLite index (index.db)")
+    db_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
+    db_parser.add_argument("--component-field", default=os.environ.get("JIRA_COMPONENT_FIELD"))
+    db_subparsers = db_parser.add_subparsers(dest="db_command")
+
+    db_subparsers.add_parser(
+        "reindex", help="Rebuild index.db's items table from the locally synced issue.json files"
+    )
+
+    db_backup = db_subparsers.add_parser("backup", help="Back up index.db via SQLite's online backup API")
+    db_backup.add_argument("dest", help="Destination path for the backup copy")
+
     shadow_parser = subparsers.add_parser(
         "shadow",
         help="Manage local-only Jira changes",
@@ -706,6 +718,12 @@ def main(argv: list[str] | None = None) -> int:
         except MetadataError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+
+    if args.command == "db":
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
+        project = config.default_project_key()
+        component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
+        return run_db(args, jira_dir, component_field)
 
     parser.print_help()
     return 0
@@ -1055,6 +1073,24 @@ def run_meta(
         return 0 if all(check.ok for check in checks) else 1
 
     print("error: missing meta command", file=sys.stderr)
+    return 2
+
+
+def run_db(args: argparse.Namespace, jira_dir: Path, component_field: str) -> int:
+    from . import db
+
+    if args.db_command == "reindex":
+        count = db.reindex_items(jira_dir, component_field)
+        print(f"reindexed {count} items into {db.db_path(jira_dir)}")
+        return 0
+
+    if args.db_command == "backup":
+        dest = Path(str(args.dest))
+        db.backup(jira_dir, dest)
+        print(f"backed up index.db to {dest}")
+        return 0
+
+    print("error: missing db command", file=sys.stderr)
     return 2
 
 

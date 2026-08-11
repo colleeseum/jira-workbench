@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from .config import ProjectSettings
 from .jql import compile_jql, scope_predicate_to_project
-from .sync import FALLBACK_DONE_STATUS_NAMES, bump_manifest_generation, read_json, utc_now, write_json
+from .sync import FALLBACK_DONE_STATUS_NAMES, read_json, utc_now, write_json
 
 
 DEFAULT_METADATA_TTL_SECONDS = 3600
@@ -269,6 +269,16 @@ def sort_assignees(users: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def load_versions(jira_dir: Path, project: str) -> dict[str, Any] | None:
+    from . import db as _db
+
+    indexed = _db.project_versions(jira_dir, project)
+    if indexed is not None:
+        versions, fetched_at = indexed
+        return {"project": project, "fetchedAt": fetched_at, "versions": sort_versions(versions)}
+    # Not (yet) in the SQL index -- meta/<PROJECT>/versions.json predates
+    # this table (an upgrade before the next refresh, or a test/manual
+    # write) -- fall back to the file, exactly as before this table
+    # existed.
     path = versions_path(jira_dir, project)
     if not path.exists():
         return None
@@ -317,15 +327,18 @@ def load_all_versions(jira_dir: Path) -> list[dict[str, Any]]:
     version picker) stay project-agnostic even though the caches themselves
     are now namespaced per project.
     """
+    from . import db as _db
+
     meta_dir = jira_dir / "meta"
-    if not meta_dir.is_dir():
+    project_names = _db.project_names_with_versions(jira_dir)
+    if meta_dir.is_dir():
+        project_names |= {entry.name for entry in meta_dir.iterdir() if entry.is_dir()}
+    if not project_names:
         return []
     merged: dict[str, dict[str, Any]] = {}
     unidentified: list[dict[str, Any]] = []
-    for project_dir in sorted(meta_dir.iterdir()):
-        if not project_dir.is_dir():
-            continue
-        cache = load_versions(jira_dir, project_dir.name)
+    for project_name in sorted(project_names):
+        cache = load_versions(jira_dir, project_name)
         if cache is None:
             continue
         for version in normalize_versions(cache.get("versions")):
@@ -492,6 +505,13 @@ def load_board_settings(jira_dir: Path) -> dict[str, Any]:
 
 def write_board_settings(jira_dir: Path, settings: dict[str, Any]) -> None:
     write_json(board_settings_path(jira_dir), settings)
+    from . import db as _db
+
+    # The sole choke point for every local-board mutation (add/rename/
+    # set-filters/delete/toggle-active) -- board membership is stored per
+    # item (see db.recompute_board_membership), so any of those needs the
+    # same recompute a Jira boards refresh or a full reindex already gets.
+    _db.recompute_board_membership(jira_dir)
 
 
 def _all_board_names(jira_dir: Path, settings: dict[str, Any]) -> set[str]:
@@ -614,22 +634,21 @@ def refresh_versions_api(
         versions = client.get_project_versions(project)
     except Exception as exc:
         raise MetadataError(f"could not refresh Jira versions for {project}: {exc}") from exc
-    cache = {
-        "project": project,
-        "fetchedAt": utc_now(),
-        "versions": sort_versions(normalize_versions(versions)),
-    }
-    write_json(versions_path(jira_dir, project), cache)
-    return cache
+    return cache_versions(jira_dir, project, normalize_versions(versions))
 
 
 def cache_versions(jira_dir: Path, project: str, versions: list[dict[str, Any]]) -> dict[str, Any]:
+    fetched_at = utc_now()
+    sorted_versions = sort_versions(versions)
     cache = {
         "project": project,
-        "fetchedAt": utc_now(),
-        "versions": sort_versions(versions),
+        "fetchedAt": fetched_at,
+        "versions": sorted_versions,
     }
     write_json(versions_path(jira_dir, project), cache)
+    from . import db as _db
+
+    _db.save_versions(jira_dir, project, sorted_versions, fetched_at)
     return cache
 
 
@@ -990,13 +1009,15 @@ def refresh_boards_api(
 
     cache = {"project": project, "fetchedAt": utc_now(), "boards": boards}
     write_json(boards_path(jira_dir, project), cache)
-    # Board membership/active-vs-backlog classification is computed fresh
-    # from this exact file on every load_manifest_items() call (see
-    # with_local_index_fields, view.py), not baked into manifest.json at
-    # sync time -- so a cached all_items() result (server.py) needs to
-    # know this changed too, the same way a shadow write or a full sync
-    # already bumps this counter.
-    bump_manifest_generation(jira_dir)
+    from . import db as _db
+
+    # Board membership/active-vs-backlog classification is stored on each
+    # item in db.items (see db.recompute_board_membership) rather than
+    # computed at read time -- a boards refresh changes the predicates/
+    # backlog data every item was matched against, so it has to be
+    # recomputed here, the same as after a full reindex or any local
+    # board CRUD (see write_board_settings).
+    _db.recompute_board_membership(jira_dir)
     return cache
 
 

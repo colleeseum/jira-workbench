@@ -169,6 +169,39 @@ def test_excluded_assignees_empty_for_unknown_project_or_unconfigured() -> None:
     config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
 
     assert config.excluded_assignees("SAT") == frozenset()
+
+
+def test_load_config_reads_project_fix_version_single_select(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\nfix_version_single_select = true\n')
+
+    config = load_config(path)
+
+    assert config.projects == (ProjectSettings(key="SAT", fix_version_single_select=True),)
+
+
+def test_load_config_rejects_non_bool_fix_version_single_select(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\nfix_version_single_select = "yes"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_fix_version_single_select_project_defaults_to_false() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
+
+    assert config.fix_version_single_select_project("SAT") is False
+    assert config.fix_version_single_select_project("UNKNOWN") is False
+
+
+def test_fix_version_single_select_project_reads_the_matching_project() -> None:
+    config = WorkbenchConfig(
+        projects=(ProjectSettings(key="SAT", fix_version_single_select=True), ProjectSettings(key="PLAT"))
+    )
+
+    assert config.fix_version_single_select_project("SAT") is True
+    assert config.fix_version_single_select_project("PLAT") is False
     assert config.excluded_assignees("SOMETHING") == frozenset()
 
 

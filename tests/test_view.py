@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from jira_workbench.cli import main
 from jira_workbench.metadata import remember_field_names
 from jira_workbench.shadow import add_comment, delete_comment, edit_comment, load_shadow, set_field
@@ -20,6 +22,7 @@ from jira_workbench.view import (
     cycle_component,
     cycle_fix_version,
     cycle_swimlane,
+    _directory_component_hint,
     detailed_shadow_report_lines,
     detail_field_rows,
     dev_status_indicator,
@@ -46,9 +49,11 @@ from jira_workbench.view import (
     label_counts,
     label_options,
     label_type_fields,
+    filtered_manifest_items,
     load_manifest_items,
     issue_parent_key,
     modified_issue_keys,
+    observed_field_options,
     observed_status_category_map,
     parent_options,
     parse_dev_status_summary,
@@ -1017,6 +1022,43 @@ def test_selectable_field_options_use_local_issue_values(tmp_path: Path) -> None
     assert selectable_field_options(jira_dir, "customfield_10071", "customfield_10071") == ["API Team"]
 
 
+def test_observed_field_options_uses_the_sql_index_for_mapped_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # status/assignee/priority/type/resolution are all promoted db.items
+    # columns -- observed_field_options must answer from a single SQL
+    # query for these, not its own full issue.json rescan (the dominant
+    # cost of a real Items-list page load before this).
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"status": {"name": "Open"}, "resolution": {"name": "Fixed"}}},
+    )
+    reindex_items(tmp_path)
+
+    def fail_local_issues(jira_dir):
+        raise AssertionError("observed_field_options should not fall back to a full file scan")
+
+    monkeypatch.setattr(view_module, "local_issues", fail_local_issues)
+
+    assert observed_field_options(tmp_path, "status") == ["Open"]
+    assert observed_field_options(tmp_path, "resolution") == ["Fixed"]
+
+
+def test_observed_field_options_falls_back_to_a_file_scan_for_an_unmapped_field(tmp_path: Path) -> None:
+    # "reporter" (and anything else that isn't one of the fixed columns
+    # DISTINCT_VALUE_COLUMNS promotes) has no dedicated column -- must
+    # still work correctly, just via the slower path.
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"reporter": {"displayName": "Serge Colle"}}},
+    )
+
+    assert observed_field_options(tmp_path, "reporter") == ["Serge Colle"]
+
+
 def test_observed_field_options_orders_priority_by_severity(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)  # SAT-1 is "Medium"
     for index, name in enumerate(("Highest", "High", "Low", "Lowest")):
@@ -1024,6 +1066,7 @@ def test_observed_field_options_orders_priority_by_severity(tmp_path: Path) -> N
             jira_dir / f"components/_unassigned/EXTRA-{index}/issue.json",
             {"key": f"EXTRA-{index}", "fields": {"priority": {"name": name}}},
         )
+    build_manifest(jira_dir)
 
     assert selectable_field_options(jira_dir, "priority") == ["Highest", "High", "Medium", "Low", "Lowest"]
 
@@ -1872,6 +1915,198 @@ def test_load_manifest_items_enriches_missing_fix_version_from_issue_json(tmp_pa
     assert load_manifest_items(tmp_path)[0]["fixVersion"] == "helm-chart-sa 3.4.4"
 
 
+def test_load_manifest_items_reflects_a_fix_version_rename_without_a_reindex(tmp_path: Path) -> None:
+    # Regression: db.reindex_items used to bake the *resolved* fix version
+    # name into the SQL index at reindex time. Renaming a version updates
+    # meta/<PROJECT>/versions.json immediately (see VersionsScreen's
+    # rename action) but doesn't touch the issue itself, so a name baked
+    # in at the last reindex went stale until the next full reindex --
+    # this must instead re-resolve against the current versions cache on
+    # every read, same as resolve_fix_version_names always promised.
+    from jira_workbench.db import reindex_items
+
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1"}]})
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"fixVersions": [{"id": "10000", "name": "v1"}]}},
+    )
+    write_json(tmp_path / "manifest.json", {"workItems": [{"key": "SAT-1"}]})
+    reindex_items(tmp_path, "customfield_10071")
+
+    assert load_manifest_items(tmp_path, component_field="customfield_10071")[0]["fixVersion"] == "v1"
+
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+
+    assert load_manifest_items(tmp_path, component_field="customfield_10071")[0]["fixVersion"] == "v1-renamed"
+
+
+def test_directory_component_hint_parses_the_stored_local_path() -> None:
+    assert _directory_component_hint("components/api-team/SAT-1") == "api-team"
+    assert _directory_component_hint("components/_unassigned/SAT-1") == "_unassigned"
+    assert _directory_component_hint(None) is None
+    assert _directory_component_hint("") is None
+
+
+def test_load_manifest_items_uses_the_directory_path_as_the_shadow_hint_not_the_enriched_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: db.items.component is hierarchy_component's *display*
+    # value ("API Team"), which commonly differs from the actual on-disk
+    # directory an issue synced into ("api-team") -- component_slug and
+    # hierarchy_component don't apply the same casing/hyphenation. Passing
+    # the display value as load_shadow's component_hint made every such
+    # item (the majority of a real dataset) miss the hint and fall back to
+    # a full directory glob per item, on every single load_manifest_items
+    # call -- silently as slow as the pre-SQL-index code it was meant to
+    # replace, just relocated. The hint must come from the item's own
+    # stored path instead.
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+    from jira_workbench.shadow import save_shadow
+
+    write_json(
+        tmp_path / "components/api-team/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "s", "customfield_10071": {"value": "API Team"}}},
+    )
+    write_json(tmp_path / "manifest.json", {"workItems": [{"key": "SAT-1"}]})
+    reindex_items(tmp_path, "customfield_10071")
+    indexed_component = load_manifest_items(tmp_path, component_field="customfield_10071")[0]["component"]
+    assert indexed_component == "API Team"  # confirms the mismatch the bug relied on actually exists
+
+    # A shadow is what actually triggers a load_shadow call with a
+    # component_hint in load_manifest_items now (has_shadow=false items
+    # skip the file check entirely) -- so this needs one to exercise the
+    # hint-selection logic at all.
+    save_shadow(tmp_path, "SAT-1", {"key": "SAT-1", "fields": {"summary": "shadow summary"}})
+
+    seen_hints = []
+    real_load_shadow = view_module.load_shadow
+
+    def spying_load_shadow(jira_dir, key, *, component_hint=None):
+        seen_hints.append(component_hint)
+        return real_load_shadow(jira_dir, key, component_hint=component_hint)
+
+    monkeypatch.setattr(view_module, "load_shadow", spying_load_shadow)
+
+    load_manifest_items(tmp_path, component_field="customfield_10071")
+
+    assert seen_hints == ["api-team"]
+
+
+def test_load_manifest_items_never_calls_load_shadow_for_an_item_without_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole point of items.has_shadow: a plain column read replaces a
+    # filesystem check for every item that doesn't have a shadow (the vast
+    # majority on a real dataset) -- load_shadow (a real path.exists()
+    # call) should only ever run for the few that do.
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1", "fields": {"summary": "s"}})
+    write_json(tmp_path / "components/helm-chart/SAT-2/issue.json", {"key": "SAT-2", "fields": {"summary": "s"}})
+    write_json(tmp_path / "manifest.json", {"workItems": [{"key": "SAT-1"}, {"key": "SAT-2"}]})
+    reindex_items(tmp_path)
+
+    def fail_load_shadow(jira_dir, key, *, component_hint=None):
+        raise AssertionError(f"load_shadow should not be called for {key} -- it has no shadow")
+
+    monkeypatch.setattr(view_module, "load_shadow", fail_load_shadow)
+
+    load_manifest_items(tmp_path)
+
+
+def test_filtered_manifest_items_matches_load_manifest_items_filtered_in_python(tmp_path: Path) -> None:
+    # filtered_manifest_items pushes field_filters/board into SQL as a
+    # narrowing optimization only -- for any given filter, its result must
+    # be identical to running the exact same filter_items call against
+    # load_manifest_items' full, unfiltered output.
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "one",
+                "status": {"name": "Open"},
+                "assignee": {"displayName": "Serge Colle"},
+                "customfield_10071": {"value": "helm-chart"},
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/other/SAT-2/issue.json",
+        {
+            "key": "SAT-2",
+            "fields": {"summary": "two", "status": {"name": "Done"}, "customfield_10071": {"value": "other"}},
+        },
+    )
+    write_json(
+        tmp_path / "components/other/PLAT-1/issue.json",
+        {"key": "PLAT-1", "fields": {"summary": "three", "status": {"name": "Open"}}},
+    )
+    build_manifest(tmp_path, "customfield_10071")
+
+    for field_filters in (
+        {},
+        {"project": ["SAT"]},
+        {"status": ["Open"]},
+        {"assignee": ["(none)"]},
+        {"component": ["helm-chart"]},
+        {"project": ["SAT"], "status": ["Done"]},
+    ):
+        expected = filter_items(load_manifest_items(tmp_path, "customfield_10071"), field_filters=field_filters, active=False)
+        actual = filter_items(
+            filtered_manifest_items(tmp_path, "customfield_10071", field_filters=field_filters),
+            field_filters=field_filters,
+            active=False,
+        )
+        assert sorted(item["key"] for item in actual) == sorted(item["key"] for item in expected), field_filters
+
+
+def test_filtered_manifest_items_board_matches_load_manifest_items_filtered_in_python(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "one", "customfield_10071": {"value": "helm-chart"}}},
+    )
+    write_json(
+        tmp_path / "components/other/SAT-2/issue.json",
+        {"key": "SAT-2", "fields": {"summary": "two", "customfield_10071": {"value": "other"}}},
+    )
+    write_json(
+        tmp_path / "meta/SAT/boards.json",
+        {
+            "project": "SAT",
+            "boards": [{"id": 1, "name": "Helm board", "predicate": {"op": "eq", "field": "component", "value": "helm-chart"}}],
+        },
+    )
+    build_manifest(tmp_path, "customfield_10071")
+
+    expected = filter_items(load_manifest_items(tmp_path, "customfield_10071"), board="Helm board", active=False)
+    actual = filter_items(
+        filtered_manifest_items(tmp_path, "customfield_10071", board="Helm board"), board="Helm board", active=False
+    )
+    assert sorted(item["key"] for item in actual) == sorted(item["key"] for item in expected) == ["SAT-1"]
+
+
+def test_filtered_manifest_items_still_reflects_a_shadow_edit(tmp_path: Path) -> None:
+    # A shadow item must never be silently dropped by the SQL narrowing
+    # even when its *stored* column doesn't match the filter.
+    from jira_workbench.db import reindex_items
+    from jira_workbench.shadow import set_field
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "one", "assignee": {"displayName": "Serge Colle"}}},
+    )
+    reindex_items(tmp_path)
+    set_field(tmp_path, "SAT-1", "assignee", {"displayName": "Craig Oberg"})
+
+    items = filtered_manifest_items(tmp_path, field_filters={"assignee": ["Craig Oberg"]})
+    filtered = filter_items(items, field_filters={"assignee": ["Craig Oberg"]}, active=False)
+
+    assert [item["key"] for item in filtered] == ["SAT-1"]
+
+
 def test_refresh_index_item_applies_shadow_fix_version(tmp_path: Path) -> None:
     write_json(
         tmp_path / "manifest.json",
@@ -2266,6 +2501,29 @@ def test_observed_status_category_map_scans_local_issues(tmp_path: Path) -> None
     )
 
     assert observed_status_category_map(tmp_path) == {"Solved": "done", "In Review": "indeterminate"}
+
+
+def test_observed_status_category_map_uses_the_sql_index_when_populated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: this used to unconditionally re-scan every issue.json on
+    # every call regardless of the SQL index existing -- on a large synced
+    # dataset that single call dominated load_manifest_items' total time
+    # even after items itself moved to SQL, since this ran once per
+    # load_manifest_items call independent of item count optimizations.
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"status": {"name": "Solved", "statusCategory": {"key": "done"}}}},
+    )
+    reindex_items(tmp_path)
+
+    def fail_local_issues(jira_dir):
+        raise AssertionError("observed_status_category_map should not fall back to a full file scan")
+
+    monkeypatch.setattr(view_module, "local_issues", fail_local_issues)
+
+    assert observed_status_category_map(tmp_path) == {"Solved": "done"}
 
 
 def test_with_local_index_fields_resolves_shadow_changed_status_category(tmp_path: Path) -> None:

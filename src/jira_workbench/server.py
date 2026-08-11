@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import json
 import re
-import time
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -34,12 +33,15 @@ from .metadata import (
     load_component_field_options,
     load_components,
     load_field_names,
-    normalize_components,
+    load_versions,
     move_issue_to_backlog,
     move_issue_to_board,
+    normalize_components,
+    normalize_versions,
     rank_issue_before,
     refresh_boards_api,
     set_board_active,
+    version_name,
 )
 from .service import (
     LabelBulkEditResult,
@@ -77,10 +79,8 @@ from .shadow import (
     user_payload,
 )
 from .sync import (
-    bump_manifest_generation,
     find_existing_issue,
     issue_project_key,
-    manifest_generation,
     read_json,
     write_json,
 )
@@ -99,7 +99,9 @@ from .view import (
     editable_field_value,
     encode_edit_value,
     filter_items,
+    filtered_manifest_items,
     hierarchy_component,
+    is_archived_version,
     issue_key_from_text,
     label_counts,
     list_comments,
@@ -133,30 +135,16 @@ ISSUE_KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 # layer behind every interface" principle).
 
 
-# load_manifest_items doesn't just read one manifest.json -- it re-reads
-# and re-enriches every individual issue.json (plus a shadow.json exists()
-# check per issue) from scratch on every call, which is the dominant cost
-# of any page that calls all_items() (every GUI page does, at least once).
-# On a few thousand synced issues that's multiple real seconds -- fine
-# once, brutal when Items list -> Detail -> back to Items list each pay it
-# again in a row. Cached here for _MANIFEST_CACHE_TTL_SECONDS, invalidated
-# immediately by manifest_generation() (sync.py's build_manifest and
-# shadow.py's save_shadow/delete_shadow all bump it, so this process' own
-# writes -- via the web routes, or the TUI/CLI sharing this same process
-# in tests -- are never served stale). The TTL alone is what catches a
-# write from a genuinely separate process (e.g. `jira-wb sync` running in
-# another terminal while the server is up), which this in-memory counter
-# can't see. 30s (not something short like 2s) is deliberate: each page
-# load this is meant to speed up already takes multiple real seconds on
-# its own (this cache removes the *redundant* re-reads, not that base
-# cost), so a too-short TTL would already have expired by the time you
-# click to the next page, providing no benefit at all in practice. A
-# separate-process write going unnoticed for up to 30s is the trade-off
-# for ordinary List <-> Detail browsing actually feeling fast.
-_MANIFEST_CACHE_TTL_SECONDS = 30.0
-_manifest_cache: dict[tuple[Path, str | None], tuple[float, int, list[dict[str, Any]]]] = {}
-
-
+# load_manifest_items used to re-read and re-enrich every individual
+# issue.json from scratch on every call -- multiple real seconds on a few
+# thousand synced issues, which is why this used to be wrapped in a
+# generation-counter + TTL cache. It's now backed by index.db (see db.py)
+# and reads in well under a second even on a large real dataset, so the
+# cache was removed rather than kept as a safety margin -- it was also a
+# repeat source of real staleness bugs (any metadata mutation that forgot
+# to bump manifest_generation, e.g. a fix-version rename, silently served
+# stale data for up to its TTL). Revisit only if a future profile shows
+# this call actually dominating a page's render time again.
 def all_items(jira_dir: Path, config: WorkbenchConfig) -> list[dict[str, Any]]:
     """Every synced item, unfiltered -- raises ViewError if no manifest.
     Shared by items_data (further filters this) and the GUI's filter panel
@@ -164,21 +152,7 @@ def all_items(jira_dir: Path, config: WorkbenchConfig) -> list[dict[str, Any]]:
     independent of whatever's currently selected)."""
     default_project = config.default_project_key()
     component_field = config.effective_component_field(default_project)
-    # component_field is part of the cache key, not just jira_dir -- it
-    # changes which raw Jira field gets denormalized into each item's own
-    # "component" key, so two configs with different component_field
-    # settings over the same jira_dir must never share a cached result.
-    cache_key = (jira_dir, component_field)
-    now = time.monotonic()
-    current_generation = manifest_generation(jira_dir)
-    cached = _manifest_cache.get(cache_key)
-    if cached is not None:
-        loaded_at, generation_at_load, items = cached
-        if generation_at_load == current_generation and now - loaded_at < _MANIFEST_CACHE_TTL_SECONDS:
-            return items
-    items = load_manifest_items(jira_dir, component_field)
-    _manifest_cache[cache_key] = (now, current_generation, items)
-    return items
+    return load_manifest_items(jira_dir, component_field)
 
 
 def items_data(
@@ -490,16 +464,17 @@ def page(
     Summary (the only <col> left with no explicit width) absorbs
     whatever's left over. */
     .items-table {{ table-layout: fixed; }}
-    /* :not(.icon-select-cell) -- Type/Priority/Assignee's own open dropdown
+    /* :not(.pill-select-cell) -- every editable field's own open dropdown
     (an absolutely-positioned div, not a native <select>) is a child of its
     td and escapes the td's box on purpose; clipping every td's overflow
     indiscriminately clipped that open menu right along with any long text,
     making it look like the dropdown vanished behind the next row.
-    :has(.icon-select-menu) -- Fix Versions' own checkbox dropdown lives in
-    a .row-field-cell, not .icon-select-cell (it needs the wider, roomier
-    trigger those get, not the compact icon-only one) -- same clipped-menu
-    bug as above would otherwise recur there specifically. */
-    .items-table td:not(.icon-select-cell):not(:has(.icon-select-menu)) {{ overflow: hidden; }}
+    :has(.pill-select-menu) -- Status/Component/Fix Versions' own dropdowns
+    live in a .pill-select-row-cell, not .pill-select-cell (they need the
+    wider, roomier trigger those get, not the compact icon-only one) --
+    same clipped-menu bug as above would otherwise recur there
+    specifically. */
+    .items-table td:not(.pill-select-cell):not(:has(.pill-select-menu)) {{ overflow: hidden; }}
     pre {{ overflow: auto; padding: 12px; background: #8882; white-space: pre-wrap; }}
     a {{ color: LinkText; }}
     .filters {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }}
@@ -664,6 +639,76 @@ def page(
     }}
     .row-field-cell select:focus, .row-field-cell input[type="text"]:focus {{ border-color: #8885; background: Field; }}
     .resolution-picker {{ display: block; margin-top: 4px; }}
+    /* The Items list's one unified dropdown (Type/Priority/Status/
+    Component/Assignee/Fix Version all use this, single- or multi-select
+    -- see _pill_select_row_trigger_html/PILL_SELECT_SCRIPT), replacing
+    what used to be four different widget implementations. Deliberately
+    a <div role="button">, not a real <button>, for the trigger -- a
+    multi-select's own pills each carry a real removable "x", and a
+    <button> can never legally contain another <button>/interactive
+    control (see jiraWbPillRemove's own docstring). */
+    .pill-select {{ position: relative; }}
+    .pill-select-trigger {{
+      display: flex; align-items: center; gap: 4px; flex-wrap: wrap; width: 100%; box-sizing: border-box;
+      min-height: 1.6em; padding: 4px 8px; border: 1px solid #8885; border-radius: 4px;
+      background: Field; color: FieldText; cursor: pointer;
+    }}
+    .pill-select-trigger::after {{ content: "\\25be"; margin-left: auto; opacity: 0.6; flex-shrink: 0; }}
+    /* The Items list's row triggers (both compact icon-only cells and the
+    wider Status/Component/Fix Version ones) drop the dropdown-chevron
+    affordance entirely -- no visible "combo box" cue at all, just the
+    pill(s); clicking anywhere on them opens the selection menu directly. */
+    .pill-select-cell .pill-select-trigger::after, .pill-select-row-cell .pill-select-trigger::after {{ display: none; }}
+    .pill-select-pills {{ display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; }}
+    .pill-select-pills .pill {{ display: inline-flex; align-items: center; gap: 4px; margin-right: 0; }}
+    .pill-select-empty {{ opacity: 0.5; }}
+    .pill-remove {{
+      display: inline-flex; align-items: center; justify-content: center; width: 1.1em; height: 1.1em;
+      margin-left: 2px; border-radius: 50%; cursor: pointer; opacity: 0.6; line-height: 1;
+    }}
+    .pill-remove:hover {{ opacity: 1; background: #8884; }}
+    .pill-select-menu {{
+      display: none; position: absolute; top: 100%; left: 0; z-index: 20; margin-top: 2px;
+      background: Canvas; border: 1px solid #8885; border-radius: 6px; box-shadow: 0 4px 12px #0004;
+      min-width: 220px; max-width: 340px;
+    }}
+    .pill-select-menu.open {{ display: block; }}
+    .pill-select-filter {{
+      display: block; width: 100%; box-sizing: border-box; padding: 6px 8px; border: none;
+      border-bottom: 1px solid #8885; background: Canvas; color: FieldText;
+    }}
+    .pill-select-options {{ max-height: 240px; overflow-y: auto; }}
+    .pill-select-option {{
+      display: flex; align-items: center; gap: 6px; padding: 6px 10px; cursor: pointer; white-space: nowrap;
+      border-left: 3px solid transparent;
+    }}
+    .pill-select-option:hover {{ background: #8882; }}
+    /* No checkbox (see _pill_select_options_template_html) -- selection is
+    an accent-colored left bar plus a matching checkmark at the row's own
+    trailing edge instead, so it reads at a glance rather than needing the
+    bold weight alone to be noticed. border-left is reserved (transparent)
+    on every row, selected or not, so gaining the color never shifts the
+    row's own content sideways. */
+    .pill-select-option.selected {{ font-weight: 600; border-left-color: #2563eb; }}
+    .pill-select-option.selected::after {{ content: "\\2713"; margin-left: auto; padding-left: 12px; color: #2563eb; }}
+    /* Fix Version's Released/Unreleased section headers (see
+    fix_version_groups_for) -- matching Jira's own grouped Fix Version
+    dropdown look. */
+    .pill-select-group-header {{
+      padding: 6px 10px 2px; font-size: 0.75em; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.03em; opacity: 0.6;
+    }}
+    .pill-select-group-header:not(:first-child) {{ margin-top: 4px; padding-top: 8px; border-top: 1px solid #8883; }}
+    /* Compact variant for the Items list table -- same reasoning as
+    .icon-select-cell/.row-field-cell above. */
+    .pill-select-cell form, .pill-select-row-cell form {{ margin: 0; }}
+    .pill-select-cell .pill-select-trigger {{
+      width: auto; max-width: 100%; padding: 2px 4px; border: none; background: transparent; min-height: 0;
+    }}
+    .pill-select-row-cell .pill-select-trigger {{ padding: 2px 4px; border-color: transparent; background: transparent; }}
+    .pill-select-cell .pill-select-trigger:hover, .pill-select-row-cell .pill-select-trigger:hover {{
+      background: #8882; border-radius: 4px;
+    }}
     .swimlane-header td {{ background: #8882; font-weight: 700; padding: 6px 8px; cursor: pointer; user-select: none; }}
     .swimlane-header td::before {{ content: "\\25be  "; }}
     .swimlane-header.collapsed td::before {{ content: "\\25b8  "; }}
@@ -984,7 +1029,9 @@ def _patch_board_order(
         board["backlogKeys"] = backlog_keys
         board["boardKeys"] = board_keys
         write_json(boards_path(jira_dir, project), cache)
-        bump_manifest_generation(jira_dir)
+        from . import db as _db
+
+        _db.recompute_board_membership(jira_dir)
         return
 
 
@@ -995,16 +1042,22 @@ def _clear_all_url(query: dict[str, Any]) -> str:
     return f"/?{urlencode(params, doseq=True)}"
 
 
-def _filter_form(query: dict[str, Any], base_items: list[dict[str, Any]], allowed_version_names: set[str]) -> str:
-    project_field = _checkbox_field(
-        "Project", "project", distinct_field_values(base_items, "project"), query["project"], query
-    )
+def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any], allowed_version_names: set[str]) -> str:
+    from .db import distinct_projects_for_board, field_counts
+
+    # Straight SQL GROUP BY counts instead of materializing/JSON-decoding
+    # every indexed item to count them in Python -- project/status/
+    # component/assignee are all plain promoted columns with no per-request
+    # re-resolution concern (unlike fixVersion, see below).
+    project_counts = field_counts(jira_dir, "project")
+    project_field = _checkbox_field("Project", "project", project_counts, query["project"], query)
+
     # Status/Component/Fix version/Assignee are all scoped to whichever
     # project(s) are currently selected -- no point offering a status,
     # component, version, or assignee that doesn't occur anywhere in the
     # selected project(s); it can't match anything. Unscoped (shows every
     # value across every synced project) when no project filter is set yet.
-    selected_projects = {value.strip().lower() for value in query["project"]}
+    selected_projects_lower = {value.strip().lower() for value in query["project"]}
     # A selected board narrows this the same way an explicit Project
     # checkbox would, even when no checkbox is actually ticked -- picking
     # "SAT board" (which only ever matches SAT issues) used to still show
@@ -1016,21 +1069,34 @@ def _filter_form(query: dict[str, Any], base_items: list[dict[str, Any]], allowe
     # that same board too, once the empty selection gets remembered in the
     # per-board cookie.
     board = str(query.get("board") or "")
-    if not selected_projects and board:
-        selected_projects = {
-            str(item.get("project") or "").strip().lower() for item in base_items if board in as_list(item.get("boards"))
-        }
-        selected_projects.discard("")
-    project_scoped_items = (
-        [item for item in base_items if str(item.get("project") or "").strip().lower() in selected_projects]
-        if selected_projects
-        else base_items
-    )
+    if selected_projects_lower:
+        scoped_projects = [name for name, _count in project_counts if name.strip().lower() in selected_projects_lower]
+    elif board:
+        scoped_projects = sorted(distinct_projects_for_board(jira_dir, board))
+    else:
+        scoped_projects = None
+    project_scope = {"projects": scoped_projects} if scoped_projects else {}
     status_field = _checkbox_field(
-        "Status", "status", distinct_field_values(project_scoped_items, "status"), query["status"], query
+        "Status", "status", field_counts(jira_dir, "status", **project_scope), query["status"], query
     )
     component_field = _checkbox_field(
-        "Component", "component", component_counts(project_scoped_items), query["component"], query
+        "Component",
+        "component",
+        field_counts(jira_dir, "component", empty_bucket="_unassigned", **project_scope),
+        query["component"],
+        query,
+    )
+    # fixVersion can't be a raw GROUP BY on the stored column the way the
+    # fields above are: it must stay re-resolved against the *current*
+    # versions cache (a version can be renamed after this item's last
+    # reindex without the issue itself changing -- see
+    # resolve_fix_version_names), so a stale stored name is never trusted
+    # for counting. Fetches the (project-scoped, so still small) enriched
+    # item list instead and counts off that, same computation as before
+    # this function moved everything else to SQL.
+    fix_version_component_field = config.effective_component_field(config.default_project_key())
+    fix_version_items = filtered_manifest_items(
+        jira_dir, fix_version_component_field, field_filters={"project": scoped_projects} if scoped_projects else None
     )
     # Same policy as the TUI's version picker: archived versions never
     # show, released ones are hidden unless the "show released" toggle is
@@ -1044,7 +1110,7 @@ def _filter_form(query: dict[str, Any], base_items: list[dict[str, Any]], allowe
     selected_versions_lower = {value.strip().lower() for value in query["fixVersion"]}
     fix_version_options = [
         (name, count)
-        for name, count in distinct_field_values(project_scoped_items, "fixVersion")
+        for name, count in distinct_field_values(fix_version_items, "fixVersion")
         if name.strip().lower() in allowed_version_names or name.strip().lower() in selected_versions_lower
     ]
     show_released_checked = "checked" if query.get("show_released") == "1" else ""
@@ -1063,7 +1129,7 @@ def _filter_form(query: dict[str, Any], base_items: list[dict[str, Any]], allowe
         force_open=query.get("show_released") == "1",
     )
     assignee_field = _checkbox_field(
-        "Assignee", "assignee", distinct_field_values(project_scoped_items, "assignee"), query["assignee"], query
+        "Assignee", "assignee", field_counts(jira_dir, "assignee", **project_scope), query["assignee"], query
     )
     pattern = html.escape(query.get("pattern") or "")
     active_checked = "checked" if query.get("active", "1") == "1" else ""
@@ -1130,7 +1196,6 @@ def render_items_page(
     items: list[dict[str, Any]],
     total: int,
     query: dict[str, Any],
-    base_items: list[dict[str, Any]],
     boards: list[str],
     allowed_version_names: set[str],
     jira_dir: Path,
@@ -1158,16 +1223,10 @@ def render_items_page(
     items = sort_items_for_swimlane(items, swimlane_mode, sort_field=sort_field, reverse=query.get("dir") != "asc")
 
     # Every per-field option list (and read-only status, and status'
-    # done-category classification) is per-project, not per-row --
-    # computed once per distinct project seen, from the full unfiltered
-    # base_items (so a filtered-down view still offers every option that
-    # project's synced issues actually have), rather than rescanning the
-    # whole item set once per visible row.
-    items_by_project: dict[str, list[dict[str, Any]]] = {}
-    for base_item in base_items:
-        project = base_item.get("project")
-        if project:
-            items_by_project.setdefault(str(project), []).append(base_item)
+    # done-category classification) is per-project, not per-row -- fetched
+    # once per distinct project actually *rendered* (not the full
+    # unfiltered dataset -- see project_scoped_items_for below), and cached
+    # for any repeat project across the visible rows.
     status_categories = observed_status_category_map(jira_dir)
     # Resolution names aren't project-scoped (Jira's Resolution field is
     # instance-wide, not per-project workflow config, unlike status/
@@ -1175,33 +1234,94 @@ def render_items_page(
     # _project_scoped_options relies on -- computed once here (not once per
     # row) straight from the observed_field_options local-scan the same
     # way status_categories above already is.
-    resolution_options = observed_field_options(jira_dir, "resolution")
+    # A leading "" entry (rendered as "(none)" by _pill_select_options_template_html's
+    # own empty-label fallback) lets a status transition to Done submit with
+    # no resolution, or clear one already set -- matching the old native
+    # <select>'s explicit `<option value="">(none)</option>` (still present
+    # for the Detail page's own _status_select_widget_html).
+    resolution_options = ["", *observed_field_options(jira_dir, "resolution")]
     options_cache: dict[tuple[str, str], list[str]] = {}
+    version_groups_cache: dict[str, list[tuple[str, list[str]]]] = {}
     done_statuses_cache: dict[str, list[str]] = {}
     read_only_cache: dict[str, bool] = {}
     component_field_cache: dict[str, str | None] = {}
+    project_items_cache: dict[str, list[dict[str, Any]]] = {}
 
     def component_field_for(project: str) -> str | None:
         if project not in component_field_cache:
             component_field_cache[project] = config.effective_component_field(project)
         return component_field_cache[project]
 
+    # Every pill-select's option list (Type/Priority/Status/Component/
+    # Assignee/Fix Version -- all six editable fields now share this one
+    # widget, see _pill_select_row_trigger_html) is identical for every row
+    # sharing the same field+project -- registered into a shared <template>
+    # (see _pill_select_options_template_html) the first time a given key
+    # is needed, emitted once at the bottom of the page, and cloned into
+    # each row's own menu lazily on first open (jiraWbPillPopulate) instead
+    # of every row shipping its own full copy regardless of whether it's
+    # ever opened. This is the fix for the Items list's actual page-weight
+    # problem: on a real dataset these fields' repeated option markup was
+    # measured at the large majority of each row's own HTML.
+    pill_templates_by_key: dict[str, str] = {}
+    pill_templates_html: list[str] = []
+
+    def ensure_pill_template(
+        key: str,
+        options: list[str],
+        icon_map: dict[str, tuple[str, str]] | None = None,
+        default_icon: tuple[str, str] | None = None,
+        *,
+        empty_icon_html: str | None = None,
+        icon_renderer: Callable[[str], str] | None = None,
+        single: bool = True,
+        groups: list[tuple[str, list[str]]] | None = None,
+    ) -> str:
+        if key not in pill_templates_by_key:
+            template_id = f"t{len(pill_templates_by_key)}"
+            pill_templates_by_key[key] = template_id
+            pill_templates_html.append(
+                _pill_select_options_template_html(
+                    template_id,
+                    options,
+                    icon_map=icon_map,
+                    default_icon=default_icon,
+                    empty_icon_html=empty_icon_html,
+                    icon_renderer=icon_renderer,
+                    single=single,
+                    groups=groups,
+                )
+            )
+        return pill_templates_by_key[key]
+
+    def project_scoped_items_for(project: str) -> list[dict[str, Any]]:
+        # A project-scoped SQL fetch (see filtered_manifest_items) instead
+        # of grouping the full unfiltered dataset in Python -- offers every
+        # option that project's synced issues actually have (same
+        # guarantee the old base_items grouping gave), just without ever
+        # materializing the other projects' items to get there.
+        if project not in project_items_cache:
+            project_items_cache[project] = filtered_manifest_items(
+                jira_dir, component_field_for(project), field_filters={"project": [project]}
+            )
+        return project_items_cache[project]
+
     def type_options_for(project: str) -> list[str]:
         key = ("type", project)
         if key not in options_cache:
-            options_cache[key] = _project_scoped_options(items_by_project.get(project, []), "type")
+            options_cache[key] = _project_scoped_options(project_scoped_items_for(project), "type")
         return options_cache[key]
 
     def priority_options_for(project: str) -> list[str]:
         key = ("priority", project)
         if key not in options_cache:
-            options_cache[key] = _project_scoped_priority_options(items_by_project.get(project, []))
+            options_cache[key] = _project_scoped_priority_options(project_scoped_items_for(project))
         return options_cache[key]
 
     def status_options_for(project: str) -> list[str]:
         key = ("status", project)
         if key not in options_cache:
-            options_cache[key] = _project_scoped_options(items_by_project.get(project, []), "status")
+            options_cache[key] = _project_scoped_options(project_scoped_items_for(project), "status")
         return options_cache[key]
 
     def done_statuses_for(project: str) -> list[str]:
@@ -1216,7 +1336,7 @@ def render_items_page(
         if key not in options_cache:
             options_cache[key] = [
                 "(unassigned)",
-                *_active_assignee_options(jira_dir, config, project, items_by_project.get(project, [])),
+                *_active_assignee_options(jira_dir, config, project, project_scoped_items_for(project)),
             ]
         return options_cache[key]
 
@@ -1224,16 +1344,102 @@ def render_items_page(
         key = ("component", project)
         if key not in options_cache:
             options_cache[key] = _active_component_options(
-                jira_dir, project, component_field_for(project), items_by_project.get(project, [])
+                jira_dir, project, component_field_for(project), project_scoped_items_for(project)
             )
         return options_cache[key]
 
-    def fix_version_options_for(project: str) -> list[str]:
-        key = ("fixVersion", project)
+    def _extended_with_observed(official: list[str], observed: set[str]) -> list[str]:
+        # assignee/fixVersion's "official" option source (an explicitly
+        # curated roster / the active-unreleased versions list) can miss a
+        # specific item's own actual current value -- someone no longer on
+        # the active roster, or a version that's since been released --
+        # _icon_select_editor_html/_multi_select_editor_html used to patch
+        # this in per-row ("if current not in options, prepend it"); the
+        # shared template can't do that per-row, so it's done once here
+        # instead, unioned across every item in the project (a strict
+        # superset of anything any one row could have needed to show).
+        known_lower = {value.strip().lower() for value in official}
+        extra = sorted(value for value in observed if value.strip().lower() not in known_lower)
+        return [*official, *extra]
+
+    def assignee_template_options_for(project: str) -> list[str]:
+        key = ("assigneeTemplate", project)
         if key not in options_cache:
-            options_cache[key] = version_options(
-                jira_dir, project=project, version_filters_by_component=config.version_filters_by_component
+            observed = {
+                str(scoped_item.get("assignee") or "") or "(unassigned)"
+                for scoped_item in project_scoped_items_for(project)
+            }
+            options_cache[key] = _extended_with_observed(assignee_options_for(project), observed)
+        return options_cache[key]
+
+    def fix_version_groups_for(project: str) -> list[tuple[str, list[str]]]:
+        # Grouped into "Released"/"Unreleased" sections with headers,
+        # matching Jira's own Fix Version dropdown look -- unlike
+        # fix_version_options_for (the New Issue/Detail pages' flat list,
+        # which hides released versions by default -- assigning new work to
+        # an already-shipped version is unusual enough to want a deliberate
+        # toggle there), this widget shows both groups straight away since
+        # Jira's own picker does too. Archived versions are still always
+        # excluded -- archiving is what actually removes a version from
+        # Jira's picker for good.
+        if project not in version_groups_cache:
+            all_versions = [
+                version for version in normalize_versions(load_versions(jira_dir, project)) if isinstance(version, dict)
+            ]
+            versions = [version for version in all_versions if not is_archived_version(version)]
+            released_names = sorted({version_name(version).strip() for version in versions if version.get("released")} - {""})
+            unreleased_names = sorted(
+                {version_name(version).strip() for version in versions if not version.get("released")} - {""}
             )
+            # A version this project's own issues actually carry but that's
+            # missing from the refreshed versions cache entirely (deleted in
+            # Jira after being assigned, or the cache is simply stale) --
+            # same "extend with observed" safety net every other field's
+            # template already uses, bucketed into Unreleased since there's
+            # no released/archived signal available for it here. Excludes
+            # anything that's actually a known ARCHIVED version, though --
+            # regression: an issue can still carry an archived version as
+            # its own current fixVersions value, and this fallback used to
+            # reinstate it into the Unreleased group just because it wasn't
+            # in the (already archived-filtered) known set, defeating the
+            # "archived versions are always excluded" rule above for the
+            # one case that rule exists to cover.
+            archived_lower = {
+                version_name(version).strip().lower() for version in all_versions if is_archived_version(version)
+            }
+            observed = {
+                version
+                for scoped_item in project_scoped_items_for(project)
+                for version in (scoped_item.get("fixVersions") or [])
+            }
+            known_lower = {name.strip().lower() for name in (*released_names, *unreleased_names)}
+            extra = sorted(
+                value
+                for value in observed
+                if value.strip().lower() not in known_lower and value.strip().lower() not in archived_lower
+            )
+            groups: list[tuple[str, list[str]]] = []
+            if released_names:
+                groups.append(("Released", released_names))
+            if unreleased_names or extra:
+                groups.append(("Unreleased", [*unreleased_names, *extra]))
+            version_groups_cache[project] = groups
+        return version_groups_cache[project]
+
+    def component_template_options_for(project: str) -> list[str]:
+        key = ("componentTemplate", project)
+        if key not in options_cache:
+            # A project with no dedicated component_field uses Jira's native
+            # (genuinely multi-valued) "components" field, comma-joined into
+            # one display string per item (e.g. "Cloud, Spark") -- splitting
+            # is required here so each individual component ends up as its
+            # own observed option, not one unmatchable combined string that
+            # would never equal any single template option's value.
+            observed: set[str] = set()
+            for scoped_item in project_scoped_items_for(project):
+                observed.update(comma_parts(str(scoped_item.get("component") or "")))
+            observed.discard("_unassigned")
+            options_cache[key] = _extended_with_observed(component_options_for(project), observed)
         return options_cache[key]
 
     def project_is_read_only(project: str) -> bool:
@@ -1342,32 +1548,38 @@ def render_items_page(
         if project and not project_is_read_only(project):
             any_editable = True
             action = f"/items/{key}/fields"
-            type_cell = _icon_select_editor_html(
+            type_cell = _pill_select_row_trigger_html(
                 action,
                 "type",
-                type_options_for(project),
-                item_type,
-                TYPE_ICONS_SVG,
-                DEFAULT_TYPE_ICON_SVG,
+                [item_type],
+                ensure_pill_template(f"type::{project}", type_options_for(project), TYPE_ICONS_SVG, DEFAULT_TYPE_ICON_SVG),
+                single=True,
+                pill_icon_html=lambda v: _icon_span(v, TYPE_ICONS_SVG, DEFAULT_TYPE_ICON_SVG),
                 extra_hidden=extra_hidden,
+                compact=True,
             )
-            priority_cell = _icon_select_editor_html(
+            priority_cell = _pill_select_row_trigger_html(
                 action,
                 "priority",
-                priority_options_for(project),
-                item_priority,
-                PRIORITY_ICONS_SVG,
-                DEFAULT_TYPE_ICON_SVG,
-                empty_icon_html=NO_PRIORITY_ICON_HTML,
-                show_trigger_label=False,
+                [item_priority],
+                ensure_pill_template(
+                    f"priority::{project}",
+                    priority_options_for(project),
+                    PRIORITY_ICONS_SVG,
+                    DEFAULT_TYPE_ICON_SVG,
+                    empty_icon_html=NO_PRIORITY_ICON_HTML,
+                ),
+                single=True,
+                pill_icon_html=lambda v: _icon_span(v, PRIORITY_ICONS_SVG, DEFAULT_TYPE_ICON_SVG),
                 extra_hidden=extra_hidden,
+                compact=True,
             )
-            status_cell = _status_select_widget_html(
+            status_cell = _status_pill_widget_html(
                 f"/items/{key}/status",
-                status_options_for(project),
+                ensure_pill_template(f"status::{project}", status_options_for(project)),
                 str(item.get("status") or ""),
                 done_statuses_for(project),
-                resolution_options,
+                ensure_pill_template("resolution", resolution_options),
                 extra_hidden=extra_hidden,
             )
             # "_unassigned" is sync.py's real on-disk sentinel for "no
@@ -1378,33 +1590,54 @@ def render_items_page(
             raw_component = str(item.get("component") or "")
             current_component = "" if raw_component == "_unassigned" else raw_component
             component_field = component_field_for(project)
-            if component_field:
-                component_cell = _select_editor_html(
-                    action, component_field, component_options_for(project), current_component, extra_hidden=extra_hidden
-                )
-            else:
-                component_cell = _tag_input_editor_html(
-                    action,
-                    "components",
-                    component_options_for(project),
-                    comma_parts(current_component),
-                    extra_hidden=extra_hidden,
-                )
-            assignee_name = str(item.get("assignee") or "") or "(unassigned)"
-            assignee_cell = _icon_select_editor_html(
+            component_single = bool(component_field)
+            component_current = [current_component] if component_single else comma_parts(current_component)
+            component_cell = _pill_select_row_trigger_html(
                 action,
-                "assignee",
-                assignee_options_for(project),
-                assignee_name,
-                icon_renderer=_assignee_icon_renderer(assignee_name, str(item.get("assigneeAvatarUrl") or "")),
-                show_trigger_label=False,
+                component_field or "components",
+                component_current,
+                ensure_pill_template(
+                    f"component::{project}", component_template_options_for(project), single=component_single
+                ),
+                single=component_single,
                 extra_hidden=extra_hidden,
             )
-            fix_version_cell = _multi_select_editor_html(
+            assignee_name = str(item.get("assignee") or "") or "(unassigned)"
+            assignee_cell = _pill_select_row_trigger_html(
+                action,
+                "assignee",
+                [assignee_name],
+                # The shared template can't show *this* row's real avatar
+                # photo for every other row's own current assignee too --
+                # it always renders initials-only (_avatar_span with no
+                # photo_url); the pill below (per-row, always rendered)
+                # still shows the real photo for the actual current one.
+                ensure_pill_template(
+                    f"assignee::{project}",
+                    assignee_template_options_for(project),
+                    icon_renderer=lambda value: _avatar_span(value, ""),
+                ),
+                single=True,
+                pill_icon_html=lambda v: _avatar_span(v, str(item.get("assigneeAvatarUrl") or "")),
+                extra_hidden=extra_hidden,
+                compact=True,
+            )
+            fix_version_single = config.fix_version_single_select_project(project)
+            fix_version_current = list(item.get("fixVersions") or [])
+            if fix_version_single:
+                fix_version_current = fix_version_current[:1]
+            fix_version_groups = fix_version_groups_for(project)
+            fix_version_cell = _pill_select_row_trigger_html(
                 action,
                 "fixVersions",
-                fix_version_options_for(project),
-                list(item.get("fixVersions") or []),
+                fix_version_current,
+                ensure_pill_template(
+                    f"fixVersion::{project}",
+                    [name for _, names in fix_version_groups for name in names],
+                    single=fix_version_single,
+                    groups=fix_version_groups,
+                ),
+                single=fix_version_single,
                 extra_hidden=extra_hidden,
             )
             summary_cell = _text_editor_html(action, "summary", str(item.get("summary") or ""), extra_hidden=extra_hidden)
@@ -1431,14 +1664,14 @@ def render_items_page(
         )
         rows.append(
             f"<tr{row_drag_attrs}>"
-            f'<td class="icon-select-cell">{type_cell}</td>'
+            f'<td class="pill-select-cell">{type_cell}</td>'
             f'<td><a href="/items/{key}">{key}</a>{modified_badge_html}</td>'
-            f'<td class="row-field-cell">{status_cell}</td>'
-            f'<td class="row-field-cell">{component_cell}</td>'
+            f'<td class="pill-select-row-cell">{status_cell}</td>'
+            f'<td class="pill-select-row-cell">{component_cell}</td>'
             f'<td class="row-field-cell">{summary_cell}</td>'
-            f'<td class="icon-select-cell">{priority_cell}</td>'
-            f'<td class="icon-select-cell">{assignee_cell}</td>'
-            f'<td class="row-field-cell">{fix_version_cell}</td>'
+            f'<td class="pill-select-cell">{priority_cell}</td>'
+            f'<td class="pill-select-cell">{assignee_cell}</td>'
+            f'<td class="pill-select-row-cell">{fix_version_cell}</td>'
             "</tr>"
         )
     headers = "".join(
@@ -1457,7 +1690,7 @@ def render_items_page(
     if not sections_mode:
         new_issue_href = f"/items/new?{urlencode(new_issue_base_params)}"
         bottom_fab_html = f'<p><a href="{new_issue_href}" class="new-issue-fab" title="Create a new Jira issue">+</a></p>'
-    icon_select_script = ICON_SELECT_SCRIPT if any_editable else ""
+    pill_select_script = PILL_SELECT_SCRIPT + STATUS_PILL_SCRIPT if any_editable else ""
     swimlane_script = SWIMLANE_TOGGLE_SCRIPT if swimlane_mode != "none" else ""
     board_sections_script = BOARD_SECTIONS_SCRIPT if sections_mode else ""
     flash_banner = ""
@@ -1488,7 +1721,7 @@ def render_items_page(
           <p>{len(items)} of {total} synced items match the current filter.</p>
           {push_all_button_html}
           {flash_banner}
-          {_filter_form(query, base_items, allowed_version_names)}
+          {_filter_form(jira_dir, config, query, allowed_version_names)}
         </header>
         <table class="items-table">
           <colgroup>
@@ -1505,7 +1738,8 @@ def render_items_page(
           <tbody>{"".join(rows)}</tbody>
         </table>
         {bottom_fab_html}
-        {icon_select_script}
+        {"".join(pill_templates_html)}
+        {pill_select_script}
         {swimlane_script}
         {board_sections_script}
     """
@@ -1796,7 +2030,8 @@ def _assignee_icon_renderer(current_name: str, current_photo_url: str) -> Callab
 
 
 # Shared by every page that renders at least one _icon_select_editor_html
-# widget (Detail page, Items list) -- kept as one constant rather than
+# widget (Detail page, New Issue page -- the Items list moved to the
+# unified PILL_SELECT_SCRIPT instead) -- kept as one constant rather than
 # duplicated inline per page, and only actually emitted (see each page's
 # own gating) when a widget that needs it is actually on screen.
 ICON_SELECT_SCRIPT = """
@@ -1836,6 +2071,175 @@ document.addEventListener('click', function (e) {
     document.querySelectorAll('.icon-select-menu.open').forEach(function (m) { m.classList.remove('open'); });
   }
 });
+</script>
+"""
+
+# The Items list's one unified dropdown -- Type/Priority/Status/Component/
+# Assignee/Fix Version all render through _pill_select_row_trigger_html now
+# instead of four separate widget implementations (a native <select>, a
+# custom icon-select listbox, a checkbox-list variant of that, and a text+
+# datalist input). Every interactive change still auto-submits and reloads
+# the whole page, exactly like every other widget in this app (see
+# _text_editor_html's own docstring for why that's the deliberate baseline
+# here) -- there's no client-side optimistic pill update to keep in sync,
+# which is what keeps this script small despite covering both single- and
+# multi-select in one set of functions.
+PILL_SELECT_SCRIPT = """
+<script>
+function jiraWbPillCurrent(container) {
+  try { return JSON.parse(container.getAttribute('data-current') || '[]'); } catch (e) { return []; }
+}
+function jiraWbPillPopulate(container) {
+  // Lazily clones the shared <template> (see ensure_icon_template/
+  // _pill_select_options_template_html) into this row's own menu, once --
+  // this is the actual fix for the Items list's page-weight problem: the
+  // option list (icons, avatars, every fix version) is never repeated per
+  // row in the HTML the server sends, only cloned into the rows a user
+  // actually opens.
+  var menu = container.querySelector('.pill-select-menu');
+  if (menu.dataset.populated) return menu;
+  var key = container.dataset.optionsKey;
+  var tpl = key && document.getElementById('tpl-' + key);
+  var target = menu.querySelector('.pill-select-options');
+  if (tpl) target.appendChild(tpl.content.cloneNode(true));
+  menu.dataset.populated = '1';
+  // Marks every currently-selected option -- one, for single-select, any
+  // number for multi -- with .selected (a checkmark, see CSS) instead of a
+  // native checkbox's checked state.
+  var current = {};
+  jiraWbPillCurrent(container).forEach(function (v) { current[v] = true; });
+  target.querySelectorAll('.pill-select-option').forEach(function (el) {
+    el.classList.toggle('selected', !!current[el.getAttribute('data-value')]);
+  });
+  return menu;
+}
+function jiraWbPillToggle(trigger) {
+  var container = trigger.closest('.pill-select');
+  var menu = jiraWbPillPopulate(container);
+  var wasOpen = menu.classList.contains('open');
+  document.querySelectorAll('.pill-select-menu.open').forEach(function (m) {
+    if (m !== menu) m.classList.remove('open');
+  });
+  menu.classList.toggle('open', !wasOpen);
+  if (!wasOpen) {
+    var filterInput = menu.querySelector('.pill-select-filter');
+    if (filterInput) {
+      filterInput.value = '';
+      jiraWbPillApplyFilter(menu, '');
+      filterInput.focus();
+    }
+  }
+}
+function jiraWbPillFilter(input) {
+  jiraWbPillApplyFilter(input.closest('.pill-select-menu'), input.value.trim().toLowerCase());
+}
+function jiraWbPillApplyFilter(menu, needle) {
+  menu.querySelectorAll('.pill-select-option').forEach(function (opt) {
+    var label = opt.getAttribute('data-label') || '';
+    opt.style.display = (!needle || label.indexOf(needle) !== -1) ? '' : 'none';
+  });
+  // Fix Version's Released/Unreleased group headers (see
+  // fix_version_groups_for) hide too once every option under them is
+  // filtered out, so a search doesn't leave an empty-looking header behind.
+  menu.querySelectorAll('.pill-select-group-header').forEach(function (header) {
+    var sibling = header.nextElementSibling;
+    var anyVisible = false;
+    while (sibling && !sibling.classList.contains('pill-select-group-header')) {
+      if (sibling.style.display !== 'none') { anyVisible = true; break; }
+      sibling = sibling.nextElementSibling;
+    }
+    header.style.display = anyVisible ? '' : 'none';
+  });
+}
+function jiraWbPillOptionClick(optionEl) {
+  // Single-select: sets the one value and submits immediately.
+  var container = optionEl.closest('.pill-select');
+  var value = optionEl.getAttribute('data-value');
+  var hiddenInput = container.closest('form').querySelector('input[name="' + container.dataset.valueField + '"]');
+  if (hiddenInput) hiddenInput.value = value;
+  container.setAttribute('data-current', JSON.stringify(value ? [value] : []));
+  container.querySelector('.pill-select-menu').classList.remove('open');
+  var hook = container.dataset.onSelect;
+  if (hook && window[hook]) {
+    window[hook](container, value);
+  } else {
+    container.closest('form').submit();
+  }
+}
+function jiraWbPillSetMultiValues(container, values) {
+  // Multi-select has no persistent native inputs for its current values
+  // (no checkboxes anymore, see _pill_select_options_template_html) --
+  // every change rebuilds one hidden input per value straight from the
+  // tracked data-current list, right before submitting.
+  var form = container.closest('form');
+  form.querySelectorAll('input[data-pill-value="1"]').forEach(function (input) { input.remove(); });
+  values.forEach(function (value) {
+    var input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = container.dataset.valueField;
+    input.value = value;
+    input.setAttribute('data-pill-value', '1');
+    form.appendChild(input);
+  });
+  container.setAttribute('data-current', JSON.stringify(values));
+}
+function jiraWbPillMultiToggle(optionEl) {
+  var container = optionEl.closest('.pill-select');
+  var value = optionEl.getAttribute('data-value');
+  var current = jiraWbPillCurrent(container);
+  var idx = current.indexOf(value);
+  var next = idx === -1 ? current.concat([value]) : current.slice(0, idx).concat(current.slice(idx + 1));
+  jiraWbPillSetMultiValues(container, next);
+  container.closest('form').submit();
+}
+function jiraWbPillRemove(removeBtn, value) {
+  // A multi-select pill's own "x" -- removeBtn is a <span>, not a real
+  // nested <button> (a <button> can never legally contain another one,
+  // which every row's own pills otherwise would).
+  var container = removeBtn.closest('.pill-select');
+  var next = jiraWbPillCurrent(container).filter(function (v) { return v !== value; });
+  jiraWbPillSetMultiValues(container, next);
+  container.closest('form').submit();
+}
+document.addEventListener('click', function (e) {
+  if (!e.target.closest('.pill-select')) {
+    document.querySelectorAll('.pill-select-menu.open').forEach(function (m) { m.classList.remove('open'); });
+  }
+});
+</script>
+"""
+
+# The Items list's status pill-select is the one field that needs a real
+# on-select hook instead of PILL_SELECT_SCRIPT's default "just submit" --
+# a transition into a Done-category status also needs a resolution, so
+# rather than always showing a resolution picker nobody needs most of the
+# time, this reveals one right at the moment of transition (mirroring
+# Jira's own workflow transition screen), matching the previous native-
+# <select>-based widget's own behavior exactly, just wired through
+# data-on-select instead of an inline onchange.
+STATUS_PILL_SCRIPT = """
+<script>
+function jiraWbStatusSelected(container, value) {
+  var form = container.closest('form');
+  var done = JSON.parse(container.dataset.done || '[]');
+  var picker = form.querySelector('.resolution-picker');
+  if (done.indexOf(value) !== -1) {
+    picker.style.display = '';
+    var resolutionTrigger = picker.querySelector('.pill-select-trigger');
+    if (resolutionTrigger) resolutionTrigger.focus();
+  } else {
+    picker.style.display = 'none';
+    var resolutionContainer = picker.querySelector('.pill-select');
+    if (resolutionContainer) {
+      resolutionContainer.setAttribute('data-current', '[]');
+      var resolutionHidden = form.querySelector('input[name="resolution"]');
+      if (resolutionHidden) resolutionHidden.value = '';
+      var pills = resolutionContainer.querySelector('.pill-select-pills');
+      if (pills) pills.innerHTML = '<span class="pill-select-empty">(none)</span>';
+    }
+    form.submit();
+  }
+}
 </script>
 """
 
@@ -2034,6 +2438,197 @@ def _icon_select_editor_html(
         </button>
         <div class="icon-select-menu" role="listbox">{options_html}</div>
       </div>
+    </form>
+    """
+
+
+def _pill_html(value: str, icon_html: str = "", *, removable: bool = False, compact: bool = False) -> str:
+    """compact=True renders the icon/avatar with no visible text label at
+    all -- just a native `title` tooltip carrying it -- for the handful of
+    row-trigger fields (Type, Priority, Assignee) narrow enough that a
+    label would either get clipped or spill into the next column; every
+    other pill (including these same fields' own dropdown *options*, via
+    _pill_select_options_template_html, which never goes compact) still
+    shows its label normally."""
+    escaped = html.escape(value) or "(none)"
+    remove_html = ""
+    if removable:
+        value_json = html.escape(json.dumps(value), quote=True)
+        remove_html = (
+            f'<span class="pill-remove" role="button" tabindex="0" '
+            f'onclick="event.stopPropagation(); jiraWbPillRemove(this, {value_json})">&times;</span>'
+        )
+    if compact:
+        return f'<span class="pill" title="{escaped}">{icon_html}{remove_html}</span>'
+    return f'<span class="pill">{icon_html}<span>{escaped}</span>{remove_html}</span>'
+
+
+def _pill_select_options_template_html(
+    template_id: str,
+    options: list[str],
+    *,
+    icon_map: dict[str, tuple[str, str]] | None = None,
+    default_icon: tuple[str, str] | None = None,
+    empty_icon_html: str | None = None,
+    icon_renderer: Callable[[str], str] | None = None,
+    single: bool,
+    groups: list[tuple[str, list[str]]] | None = None,
+) -> str:
+    """The Items list's one shared dropdown option list -- rendered once
+    per distinct (field, project) pair into an inert <template> (see
+    ensure_icon_template), cloned into a row's own menu lazily on first
+    open (jiraWbPillPopulate, PILL_SELECT_SCRIPT). Never bakes in a
+    selected/checked state -- the same template is cloned into many rows
+    with different current values, so that's applied per-row at open time
+    instead, from that row's own data-current attribute.
+
+    groups (Fix Version only, see fix_version_groups_for) renders section
+    headers -- "Released"/"Unreleased" -- ahead of their own options,
+    matching Jira's own Fix Version dropdown look, instead of one flat
+    list; `options` is ignored when `groups` is given (still computed by
+    the caller as the flattened equivalent, harmlessly unused here)."""
+
+    def icon_for(value: str) -> str:
+        if icon_renderer is not None:
+            return icon_renderer(value)
+        if not value and empty_icon_html is not None:
+            return empty_icon_html
+        if icon_map is None and default_icon is None:
+            return ""
+        return _icon_span(value, icon_map or {}, default_icon or ("", "currentColor"))
+
+    def option_row(option: str) -> str:
+        label = html.escape(option) or "(none)"
+        escaped = html.escape(option)
+        label_attr = html.escape(option.strip().lower())
+        # No checkbox, either mode -- a checkbox suggested you had to hit
+        # that exact target, when the whole row has always been the click
+        # target; a plain row (hover highlight + a checkmark once selected,
+        # see .pill-select-option.selected) reads as one clickable option
+        # instead of a form control. Single-select sets the value
+        # (jiraWbPillOptionClick); multi-select toggles membership
+        # (jiraWbPillMultiToggle) -- both submit immediately, same
+        # auto-submit-on-change convention the checkbox's own onchange used.
+        handler = "jiraWbPillOptionClick" if single else "jiraWbPillMultiToggle"
+        return (
+            f'<div class="pill-select-option" role="option" data-value="{escaped}" data-label="{label_attr}" '
+            f'onclick="{handler}(this)">{icon_for(option)}<span>{label}</span></div>'
+        )
+
+    if groups is not None:
+        options_html = "".join(
+            f'<div class="pill-select-group-header">{html.escape(label)}</div>'
+            + "".join(option_row(option) for option in group_options)
+            for label, group_options in groups
+            if group_options
+        )
+    else:
+        options_html = "".join(option_row(option) for option in options)
+    return f'<template id="tpl-{html.escape(template_id)}">{options_html}</template>'
+
+
+def _pill_select_div_html(
+    current: list[str],
+    template_id: str,
+    *,
+    single: bool,
+    pill_icon_html: Callable[[str], str] | None = None,
+    value_field_name: str = "value",
+    on_select: str | None = None,
+    placeholder: str = "(none)",
+    container_attrs: str = "",
+    compact: bool = False,
+) -> str:
+    """The actual `.pill-select` markup, with no enclosing <form> of its
+    own -- see _pill_select_row_trigger_html for the normal case (one
+    field, one form), and _status_pill_widget_html for the one case that
+    needs two of these (status + a conditionally-revealed resolution)
+    sharing a single <form> instead of two independent ones."""
+    pills_html = (
+        "".join(
+            _pill_html(value, pill_icon_html(value) if pill_icon_html else "", removable=not single, compact=compact)
+            for value in current
+            if value
+        )
+        if any(current)
+        else f'<span class="pill-select-empty">{html.escape(placeholder)}</span>'
+    )
+    hidden_value_input = (
+        f'<input type="hidden" name="{html.escape(value_field_name)}" value="{html.escape(current[0] if current else "")}">'
+        if single
+        else ""
+    )
+    current_json = html.escape(json.dumps([value for value in current if value]), quote=True)
+    on_select_attr = f' data-on-select="{html.escape(on_select)}"' if on_select else ""
+    return f"""
+      {hidden_value_input}
+      <div class="pill-select" data-options-key="{html.escape(template_id)}" data-current="{current_json}"
+           data-mode="{"single" if single else "multi"}" data-value-field="{html.escape(value_field_name)}"{on_select_attr}{container_attrs}>
+        <div class="pill-select-trigger" role="button" tabindex="0" onclick="jiraWbPillToggle(this)">
+          <span class="pill-select-pills">{pills_html}</span>
+        </div>
+        <div class="pill-select-menu" role="listbox">
+          <input type="text" class="pill-select-filter" placeholder="Filter…" oninput="jiraWbPillFilter(this)"
+                 onclick="event.stopPropagation()">
+          <div class="pill-select-options"></div>
+        </div>
+      </div>
+    """
+
+
+def _pill_select_row_trigger_html(
+    action: str,
+    field: str | None,
+    current: list[str],
+    template_id: str,
+    *,
+    single: bool,
+    pill_icon_html: Callable[[str], str] | None = None,
+    value_field_name: str = "value",
+    on_select: str | None = None,
+    placeholder: str = "(none)",
+    extra_hidden: str = "",
+    compact: bool = False,
+) -> str:
+    """The per-row half of the Items list's unified dropdown, once its
+    option list has moved into a shared _pill_select_options_template_html
+    template -- current value(s) shown as pills (rendered here, using each
+    value's own icon -- cheap, bounded by how many values THIS row
+    actually has, not the full option list), a form posting the real
+    value(s), and an empty menu populated lazily on first open (see
+    PILL_SELECT_SCRIPT).
+
+    single=False renders plain clickable option rows in the shared template
+    (jiraWbPillMultiToggle rebuilds the posted "value" inputs from scratch
+    on every toggle -- see jiraWbPillSetMultiValues, no native checkboxes)
+    and each pill gets a removable "x". single=True renders one hidden
+    input named value_field_name (not
+    always literally "value" -- the status widget reuses this same
+    component with name="status"/"resolution" for its own route/on_select
+    hook) that a click updates before submitting. field=None skips the
+    generic hidden "field" input entirely -- the status/resolution route,
+    unlike /items/{key}/fields, has no use for a field/value pair at all.
+    compact=True (Type/Priority/Assignee) drops the trigger's own visible
+    text label in favor of a title tooltip -- see _pill_html -- these
+    columns are narrow enough that a label either clips or spills into the
+    next column.
+    """
+    field_hidden = f'<input type="hidden" name="field" value="{html.escape(field)}">' if field is not None else ""
+    div_html = _pill_select_div_html(
+        current,
+        template_id,
+        single=single,
+        pill_icon_html=pill_icon_html,
+        value_field_name=value_field_name,
+        on_select=on_select,
+        placeholder=placeholder,
+        compact=compact,
+    )
+    return f"""
+    <form method="post" action="{action}">
+      {field_hidden}
+      {extra_hidden}
+      {div_html}
     </form>
     """
 
@@ -2274,6 +2869,49 @@ def _status_select_widget_html(
           <option value="">(none)</option>
           {resolution_options_html}
         </select>
+      </span>
+    </form>
+    """
+
+
+def _status_pill_widget_html(
+    action: str,
+    status_template_id: str,
+    current_status: str,
+    done_statuses: list[str],
+    resolution_template_id: str,
+    *,
+    extra_hidden: str = "",
+) -> str:
+    """The Items list's unified-pill-select version of
+    _status_select_widget_html (still used by the Detail page, untouched)
+    -- same behavior, auto-submits on a plain status change but reveals a
+    resolution picker first for a transition into a Done-category status
+    (see STATUS_PILL_SCRIPT's jiraWbStatusSelected) -- composed from two
+    _pill_select_div_html instances sharing one <form> instead of two
+    native <select>s, since status and resolution submit together."""
+    done_json = html.escape(json.dumps(done_statuses), quote=True)
+    status_div = _pill_select_div_html(
+        [current_status] if current_status else [],
+        status_template_id,
+        single=True,
+        value_field_name="status",
+        on_select="jiraWbStatusSelected",
+        container_attrs=f' data-done="{done_json}"',
+    )
+    resolution_div = _pill_select_div_html(
+        [],
+        resolution_template_id,
+        single=True,
+        value_field_name="resolution",
+        placeholder="Resolution…",
+    )
+    return f"""
+    <form method="post" action="{action}">
+      {extra_hidden}
+      {status_div}
+      <span class="resolution-picker" style="display: none;">
+        {resolution_div}
       </span>
     </form>
     """
@@ -3592,16 +4230,42 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             if values
         }
         active_only = active == "1"
-        try:
-            base = all_items(jira_dir, config)
-        except ViewError:
+        if not (jira_dir / "manifest.json").exists():
             return page("<h1>Jira Workbench</h1><p>No manifest found. Run <code>jira-wb sync</code>.</p>")
+        component_field = config.effective_component_field(config.default_project_key())
+        from .db import count_items, reindex_items
+
+        if count_items(jira_dir) == 0:
+            # index.db exists (bootstrapped) but has never actually been
+            # reindexed -- e.g. a fresh index.db created by opening it
+            # once, with no `jira-wb sync`/`db reindex` run since. Every
+            # SQL-only helper below (filtered_manifest_items, field_counts,
+            # count_items itself) trusts the index completely with no
+            # per-item file fallback (unlike load_manifest_items), so left
+            # unchecked this would silently render "0 of 0" instead of the
+            # real, already-synced data manifest.json says exists.
+            # Self-heals here instead: one slow request rebuilds it, every
+            # request after this one hits the normal fast path.
+            reindex_items(jira_dir, component_field)
+        # filtered_manifest_items pushes the SQL-native fields (not
+        # fixVersion -- see its own docstring) plus board membership down
+        # into a WHERE clause as a safe-superset narrowing (db.list_items);
+        # filter_items below still runs the exact same, unchanged filtering
+        # it always has, just over a much smaller candidate set instead of
+        # every synced item.
+        sql_field_filters = {
+            field: values
+            for field, values in field_filters.items()
+            if field in {"project", "status", "component", "assignee"}
+        }
         if board == MODIFIED_BOARD_NAME:
             # Not a real board -- bypasses matches_board entirely in favor
             # of filter_items' own modified_only/modified_keys, which
-            # nothing in this app's web GUI used until now.
+            # nothing in this app's web GUI used until now -- and isn't a
+            # board list_items' json_each check could match against either.
+            narrowed = filtered_manifest_items(jira_dir, component_field, field_filters=sql_field_filters)
             filtered = filter_items(
-                base,
+                narrowed,
                 field_filters=field_filters,
                 pattern=pattern,
                 active=active_only,
@@ -3609,8 +4273,11 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 modified_keys=modified_issue_keys(jira_dir),
             )
         else:
+            narrowed = filtered_manifest_items(
+                jira_dir, component_field, field_filters=sql_field_filters, board=board or None
+            )
             filtered = filter_items(
-                base,
+                narrowed,
                 field_filters=field_filters,
                 pattern=pattern,
                 active=active_only,
@@ -3663,9 +4330,8 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         allowed_version_names = {name.strip().lower() for name in allowed_version_names}
         return render_items_page(
             filtered,
-            len(base),
+            count_items(jira_dir),
             query,
-            base,
             boards,
             allowed_version_names,
             jira_dir,

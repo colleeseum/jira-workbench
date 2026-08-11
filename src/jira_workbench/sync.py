@@ -330,32 +330,9 @@ def issue_summary(component: str, key: str, issue_path: Path, base_dir: Path) ->
     }
 
 
-# A process-lifetime "has anything actually changed" signal for a given
-# jira_dir -- bumped here and by shadow.py's save_shadow/delete_shadow (the
-# choke point for every field edit/comment/status change/revert, whoever
-# calls it: a web route, the TUI, the CLI, or a test calling shadow.py
-# directly). Lets a caller that re-reads/re-enriches the full manifest on
-# every call (expensive for a few thousand issues -- see
-# view.py's load_manifest_items) cache that work across calls within this
-# same process and still invalidate immediately on its own writes, without
-# needing a hook at every single write call site. Deliberately NOT a
-# substitute for checking the manifest file itself -- a write from a
-# different process (e.g. `jira-wb sync` running in another terminal
-# while the web server is up) never touches this in-memory counter, which
-# is why callers pair it with a short wall-clock TTL rather than trusting
-# it alone.
-_manifest_generation: dict[Path, int] = {}
-
-
-def bump_manifest_generation(jira_dir: Path) -> None:
-    _manifest_generation[jira_dir] = _manifest_generation.get(jira_dir, 0) + 1
-
-
-def manifest_generation(jira_dir: Path) -> int:
-    return _manifest_generation.get(jira_dir, 0)
-
-
-def build_manifest(jira_dir: Path) -> dict[str, Any]:
+def build_manifest(
+    jira_dir: Path, component_field: str | None = None, *, dev_status_field: str | None = None
+) -> dict[str, Any]:
     components_dir = jira_dir / "components"
     items: list[dict[str, Any]] = []
     if components_dir.exists():
@@ -380,7 +357,9 @@ def build_manifest(jira_dir: Path) -> dict[str, Any]:
         "workItems": items,
     }
     write_json(jira_dir / "manifest.json", manifest)
-    bump_manifest_generation(jira_dir)
+    from . import db as _db
+
+    _db.reindex_items(jira_dir, component_field, dev_status_field=dev_status_field)
     return manifest
 
 
@@ -564,7 +543,7 @@ def sync_project(
 
     if progress:
         progress("[5/6] Building manifest...")
-    build_manifest(jira_dir)
+    build_manifest(jira_dir, config.component_field)
     if progress:
         progress("[6/6] Done.")
     return SyncResult(

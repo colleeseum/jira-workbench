@@ -10,13 +10,42 @@ from fastapi.testclient import TestClient
 import jira_workbench.service
 from jira_workbench.config import ProjectSettings, WorkbenchConfig
 from jira_workbench.metadata import write_project_registry
-import jira_workbench.server
 from jira_workbench.server import ISSUE_KEY_PATTERN, ITEMS_FILTER_FORM_ID, _diff_display_value, all_items, create_app
 from jira_workbench.shadow import add_comment, load_shadow, set_field, set_status_change
 from jira_workbench.sync import SyncConfig, build_manifest, read_json, sync_project, write_json
 from test_metadata import ApiClient
 from test_shadow import PushJiraClient
 from test_sync import FakeJiraClient
+
+
+def _icon_select_template_content(response_text: str, widget_html: str) -> str:
+    """The Items list's icon-select widgets (type/priority/assignee/
+    fixVersions) no longer carry their own option list inline -- it's
+    deduped into a shared <template> (see ensure_icon_template/
+    _icon_select_options_template_html in server.py) referenced by the
+    widget's own data-options-key. This resolves that reference so a test
+    can still assert on what the dropdown's options actually contain."""
+    match = re.search(r'data-options-key="([^"]*)"', widget_html)
+    assert match, f"widget has no data-options-key: {widget_html!r}"
+    key = html.unescape(match.group(1))
+    template_start = response_text.index(f'<template id="tpl-{key}"')
+    content_start = response_text.index(">", template_start) + 1
+    content_end = response_text.index("</template>", content_start)
+    return response_text[content_start:content_end]
+
+
+def _icon_select_current_values(widget_html: str) -> list[str]:
+    """The current value(s) an Items-list icon-select trigger carries, from
+    its own data-current attribute (a JSON array either way, single- or
+    multi-select) -- the shared template itself never bakes in a selected/
+    checked state (see jiraWbPopulateMenu's own docstring), so a test
+    checking "is this row's value marked as selected" has to read it from
+    here instead of a "selected"/"checked" attribute in the HTML."""
+    import json as _json
+
+    match = re.search(r'data-current="([^"]*)"', widget_html)
+    assert match, f"widget has no data-current: {widget_html!r}"
+    return _json.loads(html.unescape(match.group(1)))
 
 
 def _synced_client(tmp_path: Path, config: WorkbenchConfig | None = None) -> TestClient:
@@ -31,36 +60,10 @@ def _synced_client(tmp_path: Path, config: WorkbenchConfig | None = None) -> Tes
     return TestClient(create_app(tmp_path, config or default_config))
 
 
-def test_all_items_caches_the_manifest_within_the_ttl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # load_manifest_items re-reads and re-enriches every individual
-    # issue.json from scratch -- expensive on a few thousand issues -- so
-    # a second all_items() call right after the first must not hit it
-    # again as long as nothing has actually changed.
-    sync_project(
-        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
-        FakeJiraClient(),
-        progress=None,
-    )
-    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),))
-    calls = []
-    real_load = jira_workbench.server.load_manifest_items
-
-    def counting_load(*args, **kwargs):
-        calls.append(1)
-        return real_load(*args, **kwargs)
-
-    monkeypatch.setattr(jira_workbench.server, "load_manifest_items", counting_load)
-
-    all_items(tmp_path, config)
-    all_items(tmp_path, config)
-
-    assert len(calls) == 1
-
-
-def test_all_items_cache_invalidated_by_a_shadow_write(tmp_path: Path) -> None:
-    # A field edit (set_field -> shadow.py's save_shadow) must be visible
-    # on the very next all_items() call, not held back by the cache's TTL
-    # -- save_shadow bumps sync.py's manifest_generation for exactly this.
+def test_all_items_reflects_a_shadow_write_on_the_very_next_call(tmp_path: Path) -> None:
+    # all_items() reads straight through to load_manifest_items on every
+    # call (no cache to go stale) -- a field edit must be visible
+    # immediately.
     sync_project(
         SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
         FakeJiraClient(),
@@ -77,10 +80,10 @@ def test_all_items_cache_invalidated_by_a_shadow_write(tmp_path: Path) -> None:
     assert next(item for item in items_after if item["key"] == "SAT-1")["priority"] == "High"
 
 
-def test_all_items_cache_invalidated_by_a_resync(tmp_path: Path) -> None:
+def test_all_items_reflects_a_resync_on_the_very_next_call(tmp_path: Path) -> None:
     # build_manifest (a full jira-wb sync, or the post-push refresh) must
-    # also bust the cache -- a newly synced issue should show up on the
-    # very next all_items() call.
+    # be visible immediately too -- a newly synced issue should show up on
+    # the very next all_items() call.
     sync_project(
         SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
         FakeJiraClient(),
@@ -97,6 +100,31 @@ def test_all_items_cache_invalidated_by_a_resync(tmp_path: Path) -> None:
 
     items_after = all_items(tmp_path, config)
     assert any(item["key"] == "SAT-3" for item in items_after)
+
+
+def test_all_items_reflects_a_fix_version_rename_on_the_very_next_call(tmp_path: Path) -> None:
+    from jira_workbench.metadata import cache_versions
+
+    sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+        FakeJiraClient(),
+        progress=None,
+    )
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),))
+    cache_versions(tmp_path, "SAT", [{"id": "10000", "name": "v1"}])
+    (issue_path,) = tmp_path.glob("components/*/SAT-1/issue.json")
+    issue = read_json(issue_path)
+    issue["fields"]["fixVersions"] = [{"id": "10000", "name": "v1"}]
+    write_json(issue_path, issue)
+    build_manifest(tmp_path, "customfield_10071")
+
+    items = all_items(tmp_path, config)
+    assert next(item for item in items if item["key"] == "SAT-1")["fixVersion"] == "v1"
+
+    cache_versions(tmp_path, "SAT", [{"id": "10000", "name": "v1-renamed"}])
+
+    items_after = all_items(tmp_path, config)
+    assert next(item for item in items_after if item["key"] == "SAT-1")["fixVersion"] == "v1-renamed"
 
 
 def test_list_items_returns_every_synced_item(tmp_path: Path) -> None:
@@ -306,6 +334,44 @@ def test_items_page_missing_manifest_shows_friendly_message_not_an_error(tmp_pat
     assert "jira-wb sync" in response.text
 
 
+def test_items_page_self_heals_a_bootstrapped_but_never_reindexed_index(tmp_path: Path) -> None:
+    # Regression: index.db can exist (bootstrapped -- sources/users rows
+    # created just by opening a connection) without ever having been
+    # populated by an actual reindex, e.g. a jira_dir where the server was
+    # started but `jira-wb sync`/`db reindex` was never run since. The
+    # SQL-only fast path (filtered_manifest_items/field_counts/count_items)
+    # has no per-item file fallback the way load_manifest_items does, so
+    # left unchecked this rendered "0 of 0 synced items match" instead of
+    # the real, already-synced data manifest.json says exists.
+    from jira_workbench import db
+
+    sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+        FakeJiraClient(),
+        progress=None,
+    )
+    # Simulate "index.db was bootstrapped but never reindexed" by clearing
+    # the items table a real sync just populated, without touching
+    # manifest.json or the synced issue.json files themselves.
+    conn = db.connect(tmp_path)
+    try:
+        conn.execute("DELETE FROM items")
+        conn.commit()
+    finally:
+        conn.close()
+    assert db.count_items(tmp_path) == 0
+
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),))
+    client = TestClient(create_app(tmp_path, config))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "SAT-1" in response.text
+    assert "of 0 synced items" not in response.text
+    assert db.count_items(tmp_path) > 0  # self-healed for the next request too
+
+
 def test_item_detail_page_renders_fields_and_comments(tmp_path: Path) -> None:
     client = _synced_client(tmp_path)
 
@@ -416,8 +482,8 @@ def test_items_page_read_only_project_rows_keep_the_plain_icon_not_a_widget(tmp_
     response = client.get("/")
 
     assert 'action="/items/SAT-1/fields"' not in response.text
-    assert 'class="icon-select-cell"' in response.text  # cells still there, just not editable
-    assert 'class="icon-select"' not in response.text
+    assert 'class="pill-select-cell"' in response.text  # cells still there, just not editable
+    assert 'class="pill-select"' not in response.text
 
 
 def test_items_page_options_are_scoped_per_row_project(tmp_path: Path) -> None:
@@ -473,8 +539,9 @@ def test_items_page_status_widget_reveals_a_resolution_dropdown_on_done_transiti
     response = client.get("/")
 
     status_start = response.text.index('action="/items/SAT-1/status"')
-    status_widget = response.text[status_start : status_start + 1000]
-    assert "<select" in status_widget
+    status_widget = response.text[status_start : status_start + 1800]
+    assert 'class="pill-select"' in status_widget
+    assert 'name="status"' in status_widget
     assert 'class="resolution-picker"' in status_widget
     assert 'name="resolution"' in status_widget
     assert "prompt(" not in status_widget
@@ -503,9 +570,11 @@ def test_items_page_resolution_dropdown_lists_observed_resolutions(tmp_path: Pat
     response = client.get("/")
 
     status_start = response.text.index('action="/items/SAT-1/status"')
-    status_widget = response.text[status_start : status_start + 1000]
-    assert "value=\"Won&#x27;t Do\"" in status_widget
-    assert 'value="">(none)</option>' in status_widget
+    status_widget = response.text[status_start : status_start + 1800]
+    resolution_widget = status_widget[status_widget.index('class="resolution-picker"') :]
+    options_html = _icon_select_template_content(response.text, resolution_widget)
+    assert 'data-value="Won&#x27;t Do"' in options_html
+    assert '<div class="pill-select-option" role="option" data-value=""' in options_html  # explicit "clear" option
 
 
 def test_items_page_editing_a_row_field_persists(tmp_path: Path) -> None:
@@ -2803,9 +2872,9 @@ def test_items_page_shows_type_and_priority_as_icons_not_text(tmp_path: Path) ->
     response = client.get("/")
 
     # SAT-1/SAT-2 are both type "Task" and priority "Medium", in a writable
-    # project -- shown as icon-select widgets (real SVG icon + visible
+    # project -- shown as pill-select widgets (real SVG icon + visible
     # text on the trigger), not as plain table text.
-    assert 'class="icon-select-cell"' in response.text
+    assert 'class="pill-select-cell"' in response.text
     assert "<svg" in response.text
     assert "Task" in response.text
     assert "Medium" in response.text
@@ -2813,35 +2882,43 @@ def test_items_page_shows_type_and_priority_as_icons_not_text(tmp_path: Path) ->
     assert response.text.count("<td>Medium</td>") == 0
 
 
-def test_items_page_priority_trigger_is_icon_only_but_options_keep_labels(tmp_path: Path) -> None:
+def test_items_page_priority_trigger_is_icon_only_with_a_text_tooltip(tmp_path: Path) -> None:
+    # Priority's row trigger is icon-only -- no visible "Medium" label,
+    # which would either clip in this narrow column or spill into the
+    # next one -- but the value is still discoverable on hover via a
+    # native title tooltip (see _pill_html's compact=True) rather than
+    # being lost entirely.
     client = _synced_client(tmp_path)
 
     response = client.get("/")
 
     priority_start = response.text.index('name="field" value="priority"')
     priority_widget = response.text[priority_start : priority_start + 1200]
-    trigger_start = priority_widget.index('class="icon-select-trigger"')
-    trigger_end = priority_widget.index("</button>", trigger_start)
+    trigger_start = priority_widget.index('class="pill-select-trigger"')
+    trigger_end = priority_widget.index("</div>", trigger_start)
     trigger_html = priority_widget[trigger_start:trigger_end]
-    # The closed trigger shows only the icon -- no "Medium" text label --
-    # but the option rows underneath (shown once the dropdown is open)
-    # still carry their own text, so picking a value from the list is
-    # never ambiguous.
-    assert "Medium" not in trigger_html
-    assert "Medium" in priority_widget[trigger_end:]
+    assert "<svg" in trigger_html
+    assert 'title="Medium"' in trigger_html
+    assert "<span>Medium</span>" not in trigger_html
+    options_html = _icon_select_template_content(response.text, priority_widget[: trigger_end + len("</div>")])
+    assert "Medium" in options_html
 
 
-def test_items_page_type_trigger_still_shows_its_label(tmp_path: Path) -> None:
-    # Only Priority dropped its trigger label -- Type is unaffected.
+def test_items_page_type_trigger_is_icon_only_with_a_tooltip(tmp_path: Path) -> None:
+    # Type's row trigger is icon-only too, same as Priority -- no visible
+    # "Task" label, discoverable via a title tooltip instead.
     client = _synced_client(tmp_path)
 
     response = client.get("/")
 
     type_start = response.text.index('name="field" value="type"')
-    type_widget = response.text[type_start : type_start + 800]
-    trigger_start = type_widget.index('class="icon-select-trigger"')
-    trigger_end = type_widget.index("</button>", trigger_start)
-    assert "Task" in type_widget[trigger_start:trigger_end]
+    type_widget = response.text[type_start : type_start + 1200]
+    trigger_start = type_widget.index('class="pill-select-trigger"')
+    trigger_end = type_widget.index("</div>", trigger_start)
+    trigger_html = type_widget[trigger_start:trigger_end]
+    assert "<svg" in trigger_html
+    assert 'title="Task"' in trigger_html
+    assert "<span>Task</span>" not in trigger_html
 
 
 def test_items_page_columns_have_explicit_widths_so_summary_gets_the_rest(tmp_path: Path) -> None:
@@ -2864,7 +2941,7 @@ def test_items_page_assignee_column_is_narrow_like_priority_not_a_dropdown_width
 
     assignee_start = response.text.index('name="field" value="assignee"')
     assignee_td_start = response.text.rindex("<td", 0, assignee_start)
-    assert 'class="icon-select-cell"' in response.text[assignee_td_start : assignee_td_start + 40]
+    assert 'class="pill-select-cell"' in response.text[assignee_td_start : assignee_td_start + 40]
 
 
 def test_items_page_open_dropdown_is_not_clipped_by_the_row(tmp_path: Path) -> None:
@@ -2878,7 +2955,7 @@ def test_items_page_open_dropdown_is_not_clipped_by_the_row(tmp_path: Path) -> N
 
     response = client.get("/")
 
-    assert "items-table td:not(.icon-select-cell):not(:has(.icon-select-menu)) { overflow: hidden; }" in response.text
+    assert "items-table td:not(.pill-select-cell):not(:has(.pill-select-menu)) { overflow: hidden; }" in response.text
 
 
 def test_items_page_type_trigger_does_not_spill_into_the_key_column(tmp_path: Path) -> None:
@@ -2954,18 +3031,21 @@ def test_items_page_assignee_shows_an_avatar_circle(tmp_path: Path) -> None:
 
     assignee_start = response.text.index('name="field" value="assignee"')
     assignee_widget = response.text[assignee_start : assignee_start + 1200]
-    assert 'class="icon-select"' in assignee_widget
+    assert 'class="pill-select"' in assignee_widget
     # SAT-1 is assigned to "Serge Colle" -- initials "SC" on a colored
     # circle, not plain name text with no icon.
     assert 'class="avatar-circle"' in assignee_widget
     assert ">SC<" in assignee_widget
-    trigger_start = assignee_widget.index('class="icon-select-trigger"')
-    trigger_end = assignee_widget.index("</button>", trigger_start)
-    # The closed trigger is avatar-only -- no "Serge Colle" name text --
-    # but the option row underneath still carries the name so picking a
-    # different assignee from the list is never ambiguous.
-    assert ">Serge Colle<" not in assignee_widget[trigger_start:trigger_end]
-    assert ">Serge Colle<" in assignee_widget[trigger_end:]
+    trigger_start = assignee_widget.index('class="pill-select-trigger"')
+    trigger_end = assignee_widget.index("</div>", trigger_start)
+    trigger_html = assignee_widget[trigger_start:trigger_end]
+    # The trigger is avatar-only -- no visible "Serge Colle" name text,
+    # which would spill this narrow column into the next one -- but it's
+    # still on the pill's own title tooltip (see _pill_html compact=True).
+    assert 'title="Serge Colle"' in trigger_html
+    assert "<span>Serge Colle</span>" not in trigger_html
+    options_html = _icon_select_template_content(response.text, assignee_widget[: trigger_end + len("</div>")])
+    assert ">Serge Colle<" in options_html
 
 
 def test_items_page_assignee_shows_a_real_photo_when_jira_has_one(tmp_path: Path) -> None:
@@ -2988,8 +3068,8 @@ def test_items_page_assignee_shows_a_real_photo_when_jira_has_one(tmp_path: Path
     row_end = response.text.index("</tr>", row_start)
     assignee_start = response.text.index('name="field" value="assignee"', row_start, row_end)
     assignee_widget = response.text[assignee_start : assignee_start + 1200]
-    trigger_start = assignee_widget.index('class="icon-select-trigger"')
-    trigger_end = assignee_widget.index("</button>", trigger_start)
+    trigger_start = assignee_widget.index('class="pill-select-trigger"')
+    trigger_end = assignee_widget.index("</div>", trigger_start)
     # The photo is only known for the CURRENT assignee (from the manifest) --
     # shown on the trigger -- while the option row for that same name (and
     # any other candidate) still falls back to plain initials.
@@ -3119,10 +3199,13 @@ def test_items_page_shows_unset_priority_as_a_distinct_dash_not_blank(tmp_path: 
 
     response = client.get("/")
 
-    # SAT isn't registered read-only, so this renders as the icon-select
-    # widget -- its own muted-dash convention for "no value" (no title
-    # needed there, since the trigger already shows "(none)" as text).
-    assert 'style="opacity: .4">—</span>' in response.text
+    # SAT isn't registered read-only, so this renders as the pill-select
+    # widget -- an unset value shows a plain "(none)" placeholder pill
+    # (see _pill_select_div_html), not the old bespoke muted-dash icon
+    # each field previously had to render for itself.
+    priority_start = response.text.index('name="field" value="priority"')
+    priority_widget = response.text[priority_start : priority_start + 900]
+    assert '<span class="pill-select-empty">(none)</span>' in priority_widget
 
 
 def test_items_page_sorts_by_priority_when_column_header_clicked(tmp_path: Path) -> None:
@@ -3172,6 +3255,9 @@ def _write_board_cache(tmp_path: Path) -> None:
             ],
         },
     )
+    from jira_workbench.db import recompute_board_membership
+
+    recompute_board_membership(tmp_path)
 
 
 def test_items_page_modified_board_appears_first_in_the_board_dropdown(tmp_path: Path) -> None:
@@ -3311,6 +3397,9 @@ def _write_sections_fixture(tmp_path: Path) -> None:
             ],
         },
     )
+    from jira_workbench.db import recompute_board_membership
+
+    recompute_board_membership(tmp_path)
 
 
 def test_items_page_sections_mode_splits_active_and_backlog(tmp_path: Path) -> None:
@@ -3779,14 +3868,16 @@ def test_items_page_fix_version_options_scoped_to_selected_project(tmp_path: Pat
     assert "plat-2.0" not in scoped
 
 
-def test_items_page_fix_version_edit_widget_is_a_checkbox_dropdown(tmp_path: Path) -> None:
+def test_items_page_fix_version_edit_widget_is_a_clickable_dropdown(tmp_path: Path) -> None:
     # Regression: the edit widget used to be a free-text input with an
     # autocomplete <datalist> -- its transparent border made it look like
     # plain static text rather than something interactive, and a value
-    # only ever surfaced if you already knew to type it. A real checkbox
-    # dropdown lists every known version (including ones with zero issues
-    # so far -- fix_version_options_for already sourced those correctly)
-    # as a browsable, clickable option.
+    # only ever surfaced if you already knew to type it. A real dropdown
+    # lists every known version (including ones with zero issues so far --
+    # fix_version_groups_for already sourced those correctly) as a
+    # browsable, clickable option -- no checkbox (misleading: it suggested
+    # you had to hit that exact target rather than the whole row), just a
+    # checkmark on whichever option is currently selected.
     write_json(
         tmp_path / "components/compA/SAT-1/issue.json",
         {
@@ -3814,15 +3905,26 @@ def test_items_page_fix_version_edit_widget_is_a_checkbox_dropdown(tmp_path: Pat
 
     widget_start = response.text.index('name="field" value="fixVersions"')
     widget = response.text[widget_start : widget_start + 1000]
-    assert 'type="checkbox" name="value" value="kube 1.3.0" checked' in widget
-    assert 'type="checkbox" name="value" value="kube 1.4.0"' in widget
+    # The option rows themselves are deduped into a shared <template>
+    # (see ensure_pill_template) -- never "selected" there, since the same
+    # template is cloned into every row regardless of that row's own
+    # values; jiraWbPillPopulate applies the .selected class (a checkmark,
+    # see CSS) at open time from the widget's own data-current attribute
+    # instead (see _icon_select_current_values).
+    options_html = _icon_select_template_content(response.text, widget)
+    assert 'data-value="kube 1.3.0"' in options_html
+    assert 'data-value="kube 1.4.0"' in options_html
+    assert 'onclick="jiraWbPillMultiToggle(this)"' in options_html
+    assert "checkbox" not in options_html
+    assert "selected" not in options_html
     assert "datalist" not in widget
+    assert _icon_select_current_values(widget) == ["kube 1.3.0"]
     # version_options() prepends "(none)" as a real, selectable value for
     # the single-select widgets it was originally built for -- here,
-    # leaving every real version unchecked already means "no fix version",
-    # so a literal "(none)" checkbox would be redundant (or contradictory
-    # if checked alongside a real one).
-    assert 'value="(none)"' not in widget
+    # leaving every real version unselected already means "no fix version",
+    # so a literal "(none)" option would be redundant (or contradictory if
+    # selected alongside a real one).
+    assert 'data-value="(none)"' not in options_html
 
 
 def test_icon_select_trigger_shows_a_dropdown_caret_like_a_native_select(tmp_path: Path) -> None:
@@ -3842,17 +3944,17 @@ def test_icon_select_trigger_shows_a_dropdown_caret_like_a_native_select(tmp_pat
 
 def test_items_page_fix_version_dropdown_is_not_clipped_by_the_row(tmp_path: Path) -> None:
     # Regression: Fix Version's checkbox dropdown lives in a
-    # .row-field-cell (it needs the wider, roomier trigger those get, not
-    # the compact icon-only .icon-select-cell one) -- but .row-field-cell
-    # was still subject to the blanket "clip a td's overflow" rule that
-    # Type/Priority/Assignee's .icon-select-cell was already excluded
-    # from, so the open dropdown was clipped right at the row's edge,
-    # looking like it vanished behind the row below.
+    # .pill-select-row-cell (it needs the wider, roomier trigger those get,
+    # not the compact .pill-select-cell one Type/Priority/Assignee use) --
+    # but the blanket "clip a td's overflow" rule has a `:has(.pill-select-menu)`
+    # escape hatch precisely so any open dropdown, in either cell kind,
+    # isn't clipped at the row's edge, looking like it vanished behind the
+    # row below.
     client = _synced_client(tmp_path)
 
     response = client.get("/")
 
-    assert ":not(:has(.icon-select-menu)) { overflow: hidden; }" in response.text
+    assert ":not(:has(.pill-select-menu)) { overflow: hidden; }" in response.text
 
 
 def test_item_detail_page_fix_version_edit_widget_keeps_every_current_value_checked(tmp_path: Path) -> None:
@@ -4176,6 +4278,9 @@ def test_items_page_status_component_assignee_options_scoped_to_selected_board(t
             "boards": [{"id": 1, "name": "SAT board", "predicate": {"op": "eq", "field": "project", "value": "SAT"}}],
         },
     )
+    from jira_workbench.db import recompute_board_membership
+
+    recompute_board_membership(tmp_path)
     client = TestClient(create_app(tmp_path, WorkbenchConfig()))
 
     response = client.get("/", params={"board": "SAT board"})
@@ -4264,7 +4369,8 @@ def test_items_page_assignee_edit_dropdown_falls_back_to_local_observation_witho
     row_start = response.text.index(">SAT-2<")
     widget_start = response.text.index('name="field" value="assignee"', row_start)
     widget = response.text[widget_start : widget_start + 1500]
-    assert "Al Baker" in widget
+    options_html = _icon_select_template_content(response.text, widget)
+    assert "Al Baker" in options_html
 
 
 def test_item_detail_page_assignee_dropdown_only_offers_active_members(tmp_path: Path) -> None:
@@ -4324,7 +4430,11 @@ def test_items_page_component_edit_dropdown_includes_options_never_used_by_any_i
     widget_start = response.text.index('name="field" value="customfield_10071"')
     widget = response.text[widget_start : widget_start + 1000]
     assert "helm-chart" in widget
-    assert "training" in widget
+    # "training" isn't the current value, so it only lives in the shared
+    # <template> the widget's own menu is lazily populated from (see
+    # _icon_select_template_content), not inline in the trigger's own pill.
+    options_html = _icon_select_template_content(response.text, widget)
+    assert "training" in options_html
 
 
 def test_items_page_component_edit_dropdown_falls_back_to_local_observation_without_a_refreshed_cache(

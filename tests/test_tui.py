@@ -11,7 +11,7 @@ from textual.widgets import DataTable, Input, SelectionList, Static, TextArea
 
 import jira_workbench.service
 from jira_workbench.config import load_config
-from jira_workbench.metadata import load_versions
+from jira_workbench.metadata import cache_versions, load_versions
 from jira_workbench.shadow import add_comment, load_shadow, set_field
 from jira_workbench.sync import SyncConfig, build_manifest, read_json, sync_project, write_json
 from jira_workbench.view import editable_detail_fields
@@ -257,6 +257,7 @@ def _set_issue_id(jira_dir: Path, key: str, issue_id: str) -> None:
     issue = read_json(issue_path)
     issue["id"] = issue_id
     write_json(issue_path, issue)
+    build_manifest(jira_dir, "customfield_10071")
 
 
 def _set_issue_fields(jira_dir: Path, key: str, fields: dict[str, Any]) -> None:
@@ -264,6 +265,7 @@ def _set_issue_fields(jira_dir: Path, key: str, fields: dict[str, Any]) -> None:
     issue = read_json(issue_path)
     issue.setdefault("fields", {}).update(fields)
     write_json(issue_path, issue)
+    build_manifest(jira_dir, "customfield_10071")
 
 
 def _app_with_client(jira_dir: Path, client: Any) -> JiraWorkbenchApp:
@@ -600,16 +602,15 @@ async def test_detail_screen_version_picker_is_scoped_to_project_and_component_f
     from jira_workbench.tui.widgets.prompts import OptionPickerScreen
 
     jira_dir = synced_jira_dir(tmp_path)  # SAT-1's component is "API Team"
-    write_json(
-        jira_dir / "meta/SAT/versions.json",
-        {
-            "versions": [
-                {"id": "1", "name": "api-team-sa 2026.07"},
-                {"id": "2", "name": "unrelated-sa 2026.07"},
-            ]
-        },
+    cache_versions(
+        jira_dir,
+        "SAT",
+        [
+            {"id": "1", "name": "api-team-sa 2026.07"},
+            {"id": "2", "name": "unrelated-sa 2026.07"},
+        ],
     )
-    write_json(jira_dir / "meta/PLAT/versions.json", {"versions": [{"id": "3", "name": "PLAT 2026.08"}]})
+    cache_versions(jira_dir, "PLAT", [{"id": "3", "name": "PLAT 2026.08"}])
     app = JiraWorkbenchApp(
         jira_dir,
         component_field="customfield_10071",
@@ -635,15 +636,14 @@ async def test_detail_screen_version_picker_toggle_reveals_released_but_not_arch
     from jira_workbench.tui.widgets.prompts import OptionPickerScreen
 
     jira_dir = synced_jira_dir(tmp_path)  # SAT-1
-    write_json(
-        jira_dir / "meta/SAT/versions.json",
-        {
-            "versions": [
-                {"id": "1", "name": "helm-chart-sa 3.4.2", "released": True},
-                {"id": "2", "name": "helm-chart-sa 3.4.4", "archived": True},
-                {"id": "3", "name": "helm-chart-sa 3.5.0", "released": False, "archived": False},
-            ]
-        },
+    cache_versions(
+        jira_dir,
+        "SAT",
+        [
+            {"id": "1", "name": "helm-chart-sa 3.4.2", "released": True},
+            {"id": "2", "name": "helm-chart-sa 3.4.4", "archived": True},
+            {"id": "3", "name": "helm-chart-sa 3.5.0", "released": False, "archived": False},
+        ],
     )
     app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
 
@@ -697,7 +697,7 @@ async def test_detail_screen_version_picker_toggle_reveals_released_but_not_arch
 async def test_detail_screen_fix_version_pill_shows_current_name_not_stale_embedded_one(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     _set_issue_fields(jira_dir, "SAT-1", {"fixVersions": [{"id": "10000", "name": "helm-chart-sa 3.4.4"}]})
-    write_json(jira_dir / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "helm-chart-sa 3.5.0"}]})
+    cache_versions(jira_dir, "SAT", [{"id": "10000", "name": "helm-chart-sa 3.5.0"}])
     app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
 
     async with app.run_test() as pilot:
@@ -3535,6 +3535,9 @@ def _write_board_cache(tmp_path: Path) -> None:
             ],
         },
     )
+    from jira_workbench.db import recompute_board_membership
+
+    recompute_board_membership(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -3744,6 +3747,9 @@ async def test_hide_done_after_days_applies_only_to_active_board_scope(tmp_path:
             ],
         },
     )
+    from jira_workbench.db import recompute_board_membership
+
+    recompute_board_membership(tmp_path)
     app = JiraWorkbenchApp(tmp_path, component_field="components", hide_done_after_days=7)
 
     async with app.run_test() as pilot:
@@ -4844,6 +4850,7 @@ async def test_detail_screen_status_change_recognizes_custom_done_status_via_cat
             "fields": {"summary": "Other", "status": {"name": "Solved", "statusCategory": {"key": "done"}}},
         },
     )
+    build_manifest(jira_dir, "customfield_10071")
     app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
 
     async with app.run_test() as pilot:

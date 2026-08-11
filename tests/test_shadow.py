@@ -368,6 +368,27 @@ def test_set_field_allowed_when_no_registry_exists_at_all(tmp_path: Path) -> Non
     assert shadow["fields"]["summary"] == "New summary"
 
 
+def test_set_field_and_delete_shadow_keep_the_sql_index_has_shadow_flag_current(tmp_path: Path) -> None:
+    # save_shadow/delete_shadow are the choke point that keeps
+    # db.items.has_shadow accurate between reindexes -- this must happen
+    # without a jira-wb sync in between, since load_manifest_items trusts
+    # the flag alone to decide whether an item needs its shadow content
+    # read at all.
+    from jira_workbench.db import list_items
+    from jira_workbench.shadow import delete_shadow
+
+    jira_dir = synced_jira_dir(tmp_path)
+    assert {item["key"]: item for item in list_items(jira_dir)}["SAT-1"]["hasShadow"] is False
+
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+
+    assert {item["key"]: item for item in list_items(jira_dir)}["SAT-1"]["hasShadow"] is True
+
+    delete_shadow(jira_dir, "SAT-1")
+
+    assert {item["key"]: item for item in list_items(jira_dir)}["SAT-1"]["hasShadow"] is False
+
+
 def test_push_applies_supported_fields_and_comments(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     set_field(jira_dir, "SAT-1", "description", "Local description")

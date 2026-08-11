@@ -13,7 +13,6 @@ from uuid import uuid4
 from .metadata import is_project_read_only
 from .sync import (
     build_manifest,
-    bump_manifest_generation,
     component_slug,
     find_existing_issue,
     issue_key_sort_key,
@@ -148,14 +147,18 @@ def new_shadow(jira_dir: Path, key: str) -> dict[str, Any]:
 def save_shadow(jira_dir: Path, key: str, shadow: dict[str, Any]) -> None:
     shadow["updatedAt"] = now()
     write_json(shadow_path(jira_dir, key), shadow)
-    bump_manifest_generation(jira_dir)
+    from . import db as _db  # deferred: avoid a module-level import cycle (db -> view -> shadow)
+
+    _db.set_item_has_shadow(jira_dir, key, True)
 
 
 def delete_shadow(jira_dir: Path, key: str) -> None:
     path = shadow_path(jira_dir, key)
     if path.exists():
         path.unlink()
-    bump_manifest_generation(jira_dir)
+    from . import db as _db  # deferred: avoid a module-level import cycle (db -> view -> shadow)
+
+    _db.set_item_has_shadow(jira_dir, key, False)
 
 
 def ensure_shadow(jira_dir: Path, key: str) -> dict[str, Any]:
@@ -717,7 +720,7 @@ def refresh_local_issue_after_push(
 
     if old_dest is not None and old_dest != dest and old_dest.exists():
         shutil.rmtree(old_dest)
-    build_manifest(jira_dir)
+    build_manifest(jira_dir, component_field)
 
 
 def push_key(
