@@ -545,3 +545,30 @@ def test_client_wraps_invalid_json_in_freshdesk_error() -> None:
 
     with pytest.raises(FreshdeskError, match="invalid JSON"):
         client.list_conversations(1)
+
+
+def test_sync_freshdesk_source_cursor_is_taken_before_listing_tickets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (#52 review): the cursor was taken when the sync finished,
+    # so a ticket updated during a long listing could be skipped for good.
+    import jira_workbench.freshdesk as freshdesk_module
+
+    events: list[str] = []
+    clock = iter(["2026-01-01T00:00:00Z", "2026-01-01T00:30:00Z", "2026-01-01T01:00:00Z"])
+
+    def fake_now() -> str:
+        value = next(clock)
+        events.append(f"clock {value}")
+        return value
+
+    class LoggingClient(FakeFreshdeskClient):
+        def list_tickets(self, *, updated_since: str | None = None) -> list[dict[str, Any]]:
+            events.append("list_tickets")
+            return super().list_tickets(updated_since=updated_since)
+
+    monkeypatch.setattr(freshdesk_module, "utc_now", fake_now)
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+
+    sync_freshdesk_source(settings, tmp_path, LoggingClient({1: _ticket(1)}), progress=None)
+
+    cursor = read_json(freshdesk_dir(tmp_path) / "last_sync.json")["syncedAt"]
+    assert events.index(f"clock {cursor}") < events.index("list_tickets")

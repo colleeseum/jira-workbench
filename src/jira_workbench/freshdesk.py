@@ -335,6 +335,10 @@ def sync_freshdesk_source(
 
     if progress:
         progress("[2/4] Listing tickets...")
+    # The next run's cursor is when this listing *started*: a ticket updated
+    # while a long paginated listing is in progress may be missing from it,
+    # and a cursor taken at the end would skip that update for good.
+    next_cursor = utc_now()
     tickets = client.list_tickets(updated_since=updated_since)
 
     if progress:
@@ -384,5 +388,5 @@ def sync_freshdesk_source(
     # computes (see recompute_board_membership's own docstring).
     _db.recompute_board_membership(jira_dir, source_slug=settings.slug)
 
-    write_json(last_sync_path, {"syncedAt": utc_now()})
+    write_json(last_sync_path, {"syncedAt": next_cursor})
     return FreshdeskSyncResult(ticket_count=count, changed_count=changed, failed_keys=tuple(failed))
