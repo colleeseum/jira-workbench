@@ -780,3 +780,60 @@ def test_sync_project_does_not_delete_an_issue_that_merely_aged_out_of_history_m
     assert result.deleted_keys == ()
     assert result.shadow_protected_deleted_keys == ()
     assert (tmp_path / "components/_unassigned/SAT-2/issue.json").exists()
+
+
+def test_sync_project_refreshes_assignees_components_and_boards(tmp_path: Path, monkeypatch: Any) -> None:
+    # One sync should leave every metadata cache `jira-wb meta refresh`
+    # covers fresh -- boards last, after the manifest exists, since
+    # refresh_boards_api recomputes each item's board membership.
+    import jira_workbench.metadata as metadata
+
+    calls: list[str] = []
+
+    def fake_assignees(jira_dir: Path, project: str, client: Any) -> dict[str, Any]:
+        calls.append(f"assignees:{project}")
+        return {"assignees": [{"displayName": "New Person"}], "source": "internal-access-api"}
+
+    def fake_field_options(jira_dir: Path, project: str, field_id: str, client: Any) -> dict[str, Any]:
+        calls.append(f"components:{project}:{field_id}")
+        return {"options": [{"value": "a"}, {"value": "b"}]}
+
+    def fake_boards(jira_dir: Path, project: str, client: Any, component_field: str) -> dict[str, Any]:
+        assert (jira_dir / "manifest.json").exists()
+        calls.append(f"boards:{project}")
+        return {"boards": [{"name": "SAT board"}]}
+
+    monkeypatch.setattr(metadata, "refresh_assignees_api", fake_assignees)
+    monkeypatch.setattr(metadata, "refresh_component_field_options_api", fake_field_options)
+    monkeypatch.setattr(metadata, "refresh_boards_api", fake_boards)
+
+    result = sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+        FakeJiraClient(),
+        progress=None,
+    )
+
+    assert calls == ["assignees:SAT", "components:SAT:customfield_10071", "boards:SAT"]
+    assert (result.assignee_count, result.component_count, result.board_count) == (1, 2, 1)
+
+
+def test_sync_project_survives_metadata_refresh_failures(tmp_path: Path, monkeypatch: Any) -> None:
+    import jira_workbench.metadata as metadata
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("nope")
+
+    for name in ("refresh_assignees_api", "refresh_component_field_options_api", "refresh_boards_api"):
+        monkeypatch.setattr(metadata, name, boom)
+    progress: list[str] = []
+
+    result = sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+        FakeJiraClient(),
+        progress=progress.append,
+    )
+
+    assert result.work_item_count == 2
+    assert (result.assignee_count, result.component_count, result.board_count) == (None, None, None)
+    assert any("assignee refresh skipped: nope" in line for line in progress)
+    assert any("board refresh skipped: nope" in line for line in progress)

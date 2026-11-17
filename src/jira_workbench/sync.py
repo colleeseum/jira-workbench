@@ -74,6 +74,9 @@ class SyncResult:
     backfilled_parent_count: int = 0
     deleted_keys: tuple[str, ...] = ()
     shadow_protected_deleted_keys: tuple[str, ...] = ()
+    assignee_count: int | None = None
+    component_count: int | None = None
+    board_count: int | None = None
 
 
 def utc_now() -> str:
@@ -553,6 +556,15 @@ def sync_project(
         if progress:
             progress(f"field name refresh skipped: {exc}")
 
+    # Everything `jira-wb meta refresh` covers is refreshed here too, so one
+    # sync leaves no metadata cache stale (users added to the project's
+    # Access page, new component options, ...). Each step is best-effort:
+    # a metadata failure is reported but never aborts the issue sync.
+    # Boards are refreshed later, after the manifest is rebuilt, because
+    # refresh_boards_api recomputes every item's board membership.
+    assignee_count = _refresh_assignees(jira_dir, config.project, client, progress)
+    component_count = _refresh_components(jira_dir, config.project, config.component_field, client, progress)
+
     if progress:
         progress("[2/7] Refreshing project index...")
     work_items = fetch_work_item_index(config.project, client, history_months=config.history_months)
@@ -641,6 +653,7 @@ def sync_project(
     if progress:
         progress("[6/7] Building manifest...")
     build_manifest(jira_dir, config.component_field)
+    board_count = _refresh_boards(jira_dir, config.project, config.component_field, client, progress)
     if progress:
         progress("[7/7] Done.")
     return SyncResult(
@@ -651,4 +664,55 @@ def sync_project(
         backfilled_parent_count=backfilled,
         deleted_keys=tuple(removed),
         shadow_protected_deleted_keys=tuple(shadow_protected),
+        assignee_count=assignee_count,
+        component_count=component_count,
+        board_count=board_count,
     )
+
+
+def _refresh_assignees(jira_dir: Path, project: str, client: Any, progress: Progress | None) -> int | None:
+    from .metadata import refresh_assignees_api
+
+    try:
+        cache = refresh_assignees_api(jira_dir, project, client)
+    except Exception as exc:  # noqa: BLE001 -- best-effort, see sync_project
+        if progress:
+            progress(f"assignee refresh skipped: {exc}")
+        return None
+    if cache.get("source") == "role-api-fallback" and progress:
+        progress(
+            "warning: Jira's internal Access-page API was unavailable -- assignees fell back to the "
+            "classic role-based API, which can include people who no longer have project access"
+        )
+    return len(cache.get("assignees", []))
+
+
+def _refresh_components(
+    jira_dir: Path, project: str, component_field: str, client: Any, progress: Progress | None
+) -> int | None:
+    from .metadata import refresh_component_field_options_api, refresh_components_api
+
+    try:
+        if component_field and component_field != "components":
+            cache = refresh_component_field_options_api(jira_dir, project, component_field, client)
+            return len(cache.get("options", []))
+        cache = refresh_components_api(jira_dir, project, client)
+        return len(cache.get("components", []))
+    except Exception as exc:  # noqa: BLE001 -- best-effort, see sync_project
+        if progress:
+            progress(f"component refresh skipped: {exc}")
+        return None
+
+
+def _refresh_boards(
+    jira_dir: Path, project: str, component_field: str, client: Any, progress: Progress | None
+) -> int | None:
+    from .metadata import refresh_boards_api
+
+    try:
+        cache = refresh_boards_api(jira_dir, project, client, component_field or "components")
+    except Exception as exc:  # noqa: BLE001 -- best-effort, see sync_project
+        if progress:
+            progress(f"board refresh skipped: {exc}")
+        return None
+    return len(cache.get("boards", []))
