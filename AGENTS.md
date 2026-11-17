@@ -77,12 +77,22 @@ For substantial tasks, do not work silently for long periods.
 - Target at least 80% branch-aware coverage once coverage is measured (tracked as an issue). Never
   lower an enforced threshold to accommodate a change.
 - Run the relevant focused tests while working. Before considering work complete, run what CI
-  runs: `ruff check .` and `pytest`.
+  runs: `python -m compileall -q src`, `ruff check .`, and `pytest`.
 - Commits should be coherent and reasonably atomic. Do not include unrelated user changes or
   untracked working material.
 
 ## GitHub work tracking
 
+- A maintainer request to review a pull request includes independently verifying each review
+  finding, fixing confirmed defects within the reviewed change (with regression tests), running the
+  relevant checks, and committing and pushing the scoped fixes, unless the request explicitly limits
+  the work to analysis. Deferring a confirmed defect requires the maintainer's explicit approval:
+  propose each deferral individually with its risk and justification, and track it as an issue
+  (reusing an existing issue when it already covers the defect).
+- Reply to every review finding with its status: fixed (with the commit), not reproduced (with
+  what was tried), already covered (with the issue), or deferral proposed or approved (with the
+  issue). An issue link alone does not resolve a finding. Merging still requires an explicit
+  request.
 - Start substantial feature and defect work from an issue in the
   [jira-workbench Roadmap](https://github.com/users/colleeseum/projects/4) Project (statuses:
   Todo, In Progress, Done), labelled `roadmap`.
