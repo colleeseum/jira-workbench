@@ -5992,6 +5992,27 @@ def test_post_assistant_renders_the_answer_after_redirect(tmp_path: Path, monkey
     assert f'value="{conversation_id}"' in response.text
 
 
+def test_post_assistant_settles_the_conversation_when_the_engine_raises(tmp_path: Path, monkeypatch) -> None:
+    # Regression (#52 review): an exception in the background run left the
+    # entry "running" forever and never saved it.
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+
+    def crashing_ask(engine, jira_dir, question, *, resume_id=None, on_step=None):
+        raise RuntimeError("engine crashed")
+
+    monkeypatch.setattr(jira_workbench.server, "assistant_ask_streaming", crashing_ask)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    post_response = client.post("/assistant", data={"engine": "claude", "question": "q"}, follow_redirects=False)
+    assert post_response.status_code == 303
+    conversation_id = _conversation_id_from_location(post_response.headers["location"])
+
+    page = client.get(post_response.headers["location"]).text
+    assert "assistant failed: engine crashed" in page
+    saved = jira_workbench.server._load_assistant_conversations(tmp_path)
+    assert saved[conversation_id]["status"] == "done"
+
+
 def test_post_assistant_follow_up_passes_the_resume_id_and_appends_the_transcript(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
     calls = []

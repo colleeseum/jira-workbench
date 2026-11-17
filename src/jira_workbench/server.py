@@ -6576,14 +6576,21 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             entry["steps"].append(step)
 
         def run() -> None:
-            result = assistant_ask_streaming(engine, jira_dir, question, resume_id=resume_id, on_step=on_step)
-            if result.error:
-                entry["error"] = result.error
-            else:
-                entry["turns"] = [*entry["turns"], {"question": question, "answer": result.answer}]
-                entry["engine_session_id"] = result.session_id
-            entry["status"] = "done"
-            _save_assistant_conversations(jira_dir, _assistant_conversations)
+            # Always settle the entry: an exception here (engine crash, I/O
+            # error) would otherwise leave it "running" forever, with the
+            # page polling indefinitely and nothing saved.
+            try:
+                result = assistant_ask_streaming(engine, jira_dir, question, resume_id=resume_id, on_step=on_step)
+                if result.error:
+                    entry["error"] = result.error
+                else:
+                    entry["turns"] = [*entry["turns"], {"question": question, "answer": result.answer}]
+                    entry["engine_session_id"] = result.session_id
+            except Exception as exc:  # noqa: BLE001 -- reported on the page, not raised in a daemon thread
+                entry["error"] = f"assistant failed: {exc}"
+            finally:
+                entry["status"] = "done"
+                _save_assistant_conversations(jira_dir, _assistant_conversations)
 
         threading.Thread(target=run, daemon=True).start()
         return RedirectResponse(url=f"/assistant?{urlencode({'conversation': new_conversation_id})}", status_code=303)
