@@ -423,7 +423,14 @@ def bulk_edit_label(
     separately so a caller can tell the user what was left untouched.
     """
     items: list[dict[str, Any]] = load_manifest_items(jira_dir, str(component_field) if component_field else None)
-    affected = [item for item in items if label in (item.get("labels") or [])]
+    # Scoped to `project`, matching the project-scoped Labels page this is
+    # driven from: the same label text in another project is a different
+    # set of issues the user never saw or confirmed.
+    affected = [
+        item
+        for item in items
+        if label in (item.get("labels") or []) and (project is None or item.get("project") == str(project))
+    ]
     skipped = [item for item in affected if is_project_read_only(jira_dir, item.get("project"))]
     affected = [item for item in affected if item not in skipped]
     skipped_keys = tuple(sorted((display_name(item.get("key")) for item in skipped), key=issue_key_sort_key))

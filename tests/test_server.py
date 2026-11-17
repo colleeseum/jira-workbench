@@ -6331,3 +6331,43 @@ def test_post_item_board_position_refuses_read_only_projects(
     assert response.json() == {"ok": False, "error": "project SAT is read-only"}
     assert fake.move_calls == [] and fake.rank_calls == []
     assert read_json(tmp_path / "meta/SAT/boards.json")["boards"][0]["backlogKeys"] == ["SAT-1"]
+
+
+def test_post_meta_label_rename_only_touches_the_selected_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression (#52 review): renaming a label from SAT's Labels page also
+    # staged and pushed the same label on other projects' issues.
+    client = _synced_client(tmp_path, _pushable_config())
+    issue_path = tmp_path / "components/api-team/SAT-1/issue.json"
+    issue = read_json(issue_path)
+    issue["fields"]["labels"] = ["urgent"]
+    write_json(issue_path, issue)
+    write_json(
+        tmp_path / "components/ops/OPS-1/issue.json",
+        {
+            "key": "OPS-1",
+            "fields": {
+                "summary": "Other project",
+                "issuetype": {"name": "Task"},
+                "project": {"key": "OPS"},
+                "labels": ["urgent"],
+                "updated": "2026-07-20T00:00:01.000+0000",
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    push_client = PushJiraClient(updated="2026-07-20T00:00:01.000+0000")
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: push_client)
+
+    response = client.post(
+        "/meta/labels/rename",
+        data={"project": "SAT", "label": "urgent", "new_name": "critical"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    pushed_keys = {call[0] for call in push_client.update_calls}
+    assert pushed_keys == {"SAT-1"}
+    assert load_shadow(tmp_path, "OPS-1") is None
+    assert read_json(tmp_path / "components/ops/OPS-1/issue.json")["fields"]["labels"] == ["urgent"]
