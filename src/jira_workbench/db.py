@@ -730,6 +730,10 @@ def _items_where_clause(
         values = (field_filters or {}).get(field)
         if not values:
             continue
+        if field == "assignee" and any(value.strip().lower() == "(assigned)" for value in values):
+            # "(assigned)" (view.VIRTUAL_ASSIGNED) matches every non-empty
+            # assignee -- no cheap narrowing to do; filter_items decides.
+            continue
         placeholders = ", ".join("?" for _ in values)
         conditions.append(f"(LOWER({column}) IN ({placeholders}) OR {column} IS NULL OR {column} = '')")
         params.extend(value.strip().lower() for value in values)

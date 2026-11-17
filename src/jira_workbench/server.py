@@ -94,6 +94,8 @@ from .sync import (
     write_json,
 )
 from .view import (
+    VIRTUAL_ASSIGNED,
+    VIRTUAL_NONE,
     ViewError,
     apply_shadow,
     archived_component_names,
@@ -1299,8 +1301,16 @@ def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any],
         extra=version_toggle,
         force_open=query.get("show_released") == "1",
     )
+    assignee_counts = _field_counts_all_sources(jira_dir, config, "assignee", **project_scope)
+    # "(assigned)" first: anything with an assignee, whoever it is (the
+    # existing "(none)" bucket is its unassigned counterpart).
+    assigned_total = sum(count for name, count in assignee_counts if name != VIRTUAL_NONE)
     assignee_field = _checkbox_field(
-        "Assignee", "assignee", _field_counts_all_sources(jira_dir, config, "assignee", **project_scope), query["assignee"], query
+        "Assignee",
+        "assignee",
+        [(VIRTUAL_ASSIGNED, assigned_total), *assignee_counts] if assigned_total else assignee_counts,
+        query["assignee"],
+        query,
     )
     pattern = html.escape(query.get("pattern") or "")
     active_checked = "checked" if query.get("active", "1") == "1" else ""

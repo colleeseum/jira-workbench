@@ -38,6 +38,9 @@ class ViewError(RuntimeError):
     pass
 DEFAULT_RESOLUTIONS = ["Done", "Won't Do", "Duplicate", "Cannot Reproduce"]
 VIRTUAL_NONE = "(none)"
+# Assignee-filter-only counterpart of VIRTUAL_NONE: matches any item that
+# has an assignee at all, whoever it is.
+VIRTUAL_ASSIGNED = "(assigned)"
 FILTER_ANY = "(any)"  # UI-only "no filter on this dimension" sentinel; never stored
 SWIMLANE_MODES = ("none", "epic", "version", "component", "board", "assignee")
 REPORT_FIELD_LABELS = {
@@ -277,6 +280,8 @@ def matches_field(item: dict[str, Any], field: str, values: list[str] | None) ->
     actual = field_value(item, field)
     normalized = {value.strip().lower() for value in values}
     if VIRTUAL_NONE.lower() in normalized and not actual:
+        return True
+    if field == "assignee" and VIRTUAL_ASSIGNED in normalized and actual:
         return True
     return actual.lower() in normalized
 
