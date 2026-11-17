@@ -789,3 +789,18 @@ def test_push_supports_custom_labels_type_field(tmp_path: Path) -> None:
 
     assert result.pushed == 1
     assert client.update_calls == [("SAT-1", {"customfield_10082": ["acme", "globex"]}, False)]
+
+
+def test_user_payload_resolves_a_project_member_not_on_any_synced_issue(tmp_path: Path) -> None:
+    # Someone just added to the project's Access list: only in the refreshed
+    # assignees cache, not assignee/reporter of any synced issue yet.
+    from jira_workbench.shadow import user_payload
+    from jira_workbench.sync import write_json
+
+    write_json(
+        tmp_path / "meta/SAT/assignees.json",
+        {"project": "SAT", "assignees": [{"accountId": "712020:abc", "displayName": "Elena Smith"}]},
+    )
+
+    assert user_payload(tmp_path, "Elena Smith") == {"accountId": "712020:abc"}
+    assert user_payload(tmp_path, "(unassigned)") is None
