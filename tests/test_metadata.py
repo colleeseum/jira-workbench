@@ -1328,3 +1328,35 @@ def test_load_component_summary_unscoped_still_returns_every_project(tmp_path: P
 
     names = {component["component"] for component in unscoped}
     assert names == {"helm-chart", "plat-only-component"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"errors": [{"message": "Not authorized"}], "data": None},
+        {"data": {}},
+        {"unexpected": True},
+    ],
+)
+def test_refresh_assignees_api_falls_back_when_internal_query_returns_errors(tmp_path: Path, payload: object) -> None:
+    # Regression (#52 review): an HTTP 200 GraphQL error or malformed payload
+    # read as "no members", skipped the fallback, and wrote an empty roster.
+    class ErrorPayloadClient(ApiClient):
+        def post(self, path: str, json: object = None, params: object = None) -> object:
+            return payload
+
+    cache = refresh_assignees_api(tmp_path, "SAT", ErrorPayloadClient())
+
+    assert cache["source"] == "role-api-fallback"
+    assert [user["displayName"] for user in cache["assignees"]] == ["Craig Oberg", "Serge Colle"]
+
+
+def test_refresh_assignees_api_accepts_a_genuinely_empty_internal_roster(tmp_path: Path) -> None:
+    class EmptyRosterClient(ApiClient):
+        def post(self, path: str, json: object = None, params: object = None) -> object:
+            return {"data": {"projectActors": {"actors": [], "isLastBatch": True}}}
+
+    cache = refresh_assignees_api(tmp_path, "SAT", EmptyRosterClient())
+
+    assert cache["source"] == "internal-access-api"
+    assert cache["assignees"] == []

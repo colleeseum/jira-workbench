@@ -837,10 +837,18 @@ def fetch_project_actors_internal(client: Any, project_id: object) -> list[dict[
             "query": _PROJECT_ACTORS_QUERY,
         }
         payload = client.post("rest/gira/1/", json=body, params={"operation": "ProjectActorsQuery"})
+        # GraphQL reports failures as HTTP 200 with an `errors` payload; a
+        # malformed or error response must raise (so refresh_assignees_api
+        # falls back to the public role API) rather than read as "no members",
+        # which would overwrite the roster cache with an empty list.
+        if isinstance(payload, dict) and payload.get("errors"):
+            raise MetadataError(f"internal Access API returned errors: {payload['errors']}")
         data = payload.get("data") if isinstance(payload, dict) else None
         project_actors = data.get("projectActors") if isinstance(data, dict) else None
         page_actors = project_actors.get("actors") if isinstance(project_actors, dict) else None
-        if not isinstance(page_actors, list) or not page_actors:
+        if not isinstance(page_actors, list):
+            raise MetadataError("internal Access API response has no projectActors.actors list")
+        if not page_actors:
             break
         actors.extend(actor for actor in page_actors if isinstance(actor, dict))
         if project_actors.get("isLastBatch"):
