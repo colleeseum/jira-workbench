@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+import requests
+
 from jira_workbench.config import FreshdeskSettings
 from jira_workbench.freshdesk import (
     DEFAULT_RETRY_AFTER_SECONDS,
@@ -508,3 +511,37 @@ def test_freshdesk_client_reports_rate_limit_waits_via_progress() -> None:
     client.list_agents()
 
     assert any("rate limited" in message and "4" in message for message in messages)
+
+
+class _RaisingSession:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        raise self.exc
+
+
+class _BadJsonResponse(_FakeResponse):
+    def json(self) -> Any:
+        raise ValueError("Expecting value: line 1 column 1")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [requests.ConnectionError("connection refused"), requests.Timeout("read timed out"), requests.exceptions.SSLError("tls")],
+)
+def test_client_wraps_transport_failures_in_freshdesk_error(exc: Exception) -> None:
+    # Regression (#52 review): requests exceptions escaped the client, so the
+    # per-ticket and per-source recovery (which catch FreshdeskError) never ran.
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="my-key")
+    client = FreshdeskClient(settings, session=_RaisingSession(exc), sleep=lambda _seconds: None)
+
+    with pytest.raises(FreshdeskError, match="request failed"):
+        client.list_conversations(1)
+
+
+def test_client_wraps_invalid_json_in_freshdesk_error() -> None:
+    client, _session = _client([_BadJsonResponse(200)])
+
+    with pytest.raises(FreshdeskError, match="invalid JSON"):
+        client.list_conversations(1)

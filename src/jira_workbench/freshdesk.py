@@ -118,7 +118,13 @@ class FreshdeskClient:
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         for attempt in range(1, MAX_RATE_LIMIT_RETRIES + 1):
-            response = self._session.get(f"{self._base_url}/{path}", params=params, auth=self._auth, timeout=30)
+            # Transport failures (timeouts, connection/TLS errors) become
+            # FreshdeskError like HTTP error statuses, so callers' per-ticket
+            # and per-source recovery handles them instead of a traceback.
+            try:
+                response = self._session.get(f"{self._base_url}/{path}", params=params, auth=self._auth, timeout=30)
+            except requests.RequestException as exc:
+                raise FreshdeskError(f"Freshdesk request failed for {path}: {exc}") from exc
             if response.status_code != 429:
                 break
             wait_seconds = self._retry_after_seconds(response)
@@ -130,7 +136,10 @@ class FreshdeskClient:
             self._sleep(wait_seconds)
         if response.status_code >= 400:
             raise FreshdeskError(f"Freshdesk API error {response.status_code} for {path}: {response.text[:200]}")
-        return response.json()
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise FreshdeskError(f"Freshdesk returned invalid JSON for {path}: {exc}") from exc
 
     @staticmethod
     def _retry_after_seconds(response: Any) -> float:
