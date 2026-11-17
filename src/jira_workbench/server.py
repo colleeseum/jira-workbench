@@ -3,15 +3,20 @@ from __future__ import annotations
 import html
 import json
 import re
+import threading
+import uuid
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import uvicorn
+from markdown_it import MarkdownIt
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from .assistant import ENGINES as ASSISTANT_ENGINES
+from .assistant import ask_streaming as assistant_ask_streaming
 from .config import ConfigError, WorkbenchConfig, save_view_defaults
 from .issue import (
     IssueError,
@@ -41,6 +46,7 @@ from .metadata import (
     rank_issue_before,
     refresh_boards_api,
     set_board_active,
+    set_component_archived,
     version_name,
 )
 from .service import (
@@ -87,10 +93,14 @@ from .sync import (
 from .view import (
     ViewError,
     apply_shadow,
+    archived_component_names,
+    archived_version_names,
     as_dict,
     as_list,
     avatar_url,
+    child_issues,
     comma_parts,
+    comments_text,
     component_counts,
     display_component,
     display_name,
@@ -100,10 +110,15 @@ from .view import (
     encode_edit_value,
     filter_items,
     filtered_manifest_items,
+    format_display_datetime,
     hierarchy_component,
     is_archived_version,
     issue_key_from_text,
+    issue_link_groups,
     label_counts,
+    last_changed_by,
+    linked_freshdesk_ticket_ids,
+    linked_jira_keys,
     list_comments,
     load_cached_boards,
     load_manifest_items,
@@ -114,9 +129,11 @@ from .view import (
     parent_options,
     pill_color,
     PRIORITY_RANK,
+    resolved_by,
     selectable_field_options,
     SWIMLANE_MODES,
     swimlane_label,
+    text_from_adf,
     version_options,
     sort_items_for_swimlane,
 )
@@ -145,14 +162,60 @@ ISSUE_KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 # to bump manifest_generation, e.g. a fix-version rename, silently served
 # stale data for up to its TTL). Revisit only if a future profile shows
 # this call actually dominating a page's render time again.
+def _freshdesk_indexed_items(jira_dir: Path, config: WorkbenchConfig) -> list[dict[str, Any]]:
+    """Every configured Freshdesk source's indexed tickets, tagged
+    item["source"] = <that source's slug> -- additive, since nothing
+    existing reads or breaks on an extra dict key. Read straight from the
+    SQL index (db.list_items), not through load_manifest_items/
+    manifest.json (Jira-only) or _enrich_indexed_item (Jira-specific
+    enrichment: fix-version name resolution, board membership from Jira's
+    own board cache) -- Freshdesk items are already fully computed at sync
+    time and have no board/version concept to enrich. Safe to append
+    unconditionally to any Jira-sourced item list before filter_items runs:
+    an empty boards list (Freshdesk items always have one) means a
+    board-scoped view correctly excludes them via filter_items' own
+    matches_board, with no special-casing needed here."""
+    if not config.freshdesk_sources:
+        return []
+    from .db import list_items as _list_indexed_items
+
+    items: list[dict[str, Any]] = []
+    for freshdesk_source in config.freshdesk_sources:
+        try:
+            indexed = _list_indexed_items(jira_dir, source_slug=freshdesk_source.slug)
+        except LookupError:
+            # Configured but never synced yet -- no sources row exists.
+            continue
+        items.extend(dict(item, source=freshdesk_source.slug) for item in indexed)
+    return items
+
+
 def all_items(jira_dir: Path, config: WorkbenchConfig) -> list[dict[str, Any]]:
-    """Every synced item, unfiltered -- raises ViewError if no manifest.
-    Shared by items_data (further filters this) and the GUI's filter panel
-    (needs the full set to compute each field's available options/counts,
-    independent of whatever's currently selected)."""
+    """Every synced item, unfiltered -- raises ViewError if no Jira manifest
+    AND no Freshdesk source is configured (a Freshdesk-only setup with no
+    Jira sync yet is a real, if unusual, starting point). Shared by
+    items_data (further filters this) and the GUI's filter panel (needs the
+    full set to compute each field's available options/counts, independent
+    of whatever's currently selected).
+
+    Every item is tagged with a "source" key ("jira" or a configured
+    Freshdesk source's slug) -- additive, since nothing existing reads or
+    breaks on an extra dict key. Freshdesk items are read straight from the
+    SQL index (db.list_items), not through load_manifest_items/manifest.json
+    (which is Jira-only, see the "Freshdesk as a second source" plan) --
+    they're already fully computed at sync time, so no further
+    Jira-specific enrichment is needed."""
     default_project = config.default_project_key()
     component_field = config.effective_component_field(default_project)
-    return load_manifest_items(jira_dir, component_field)
+    try:
+        jira_items = load_manifest_items(jira_dir, component_field)
+    except ViewError:
+        if not config.freshdesk_sources:
+            raise
+        jira_items = []
+    items = [dict(item, source="jira") for item in jira_items]
+    items.extend(_freshdesk_indexed_items(jira_dir, config))
+    return items
 
 
 def items_data(
@@ -203,6 +266,31 @@ def item_detail_data(jira_dir: Path, key: str) -> dict[str, Any] | None:
     )
     attachments = as_list(read_json(attachments_path)) if attachments_path.exists() else []
     return {"issue": effective, "comments": comments, "attachments": attachments}
+
+
+FRESHDESK_KEY_PATTERN = re.compile(r"^FD-(\d+)$")
+
+
+def freshdesk_ticket_detail_data(jira_dir: Path, key: str) -> dict[str, Any] | None:
+    """The Freshdesk equivalent of item_detail_data -- reads the raw
+    ticket.json/conversations.json directly rather than the flattened SQL
+    row, same as Jira's own Detail page never uses the SQL row either (see
+    the "Freshdesk as a second source" plan: the SQL index only needs to
+    carry what the Items list filters/sorts on, not full ticket content)."""
+    match = FRESHDESK_KEY_PATTERN.match(key)
+    if match is None:
+        return None
+    from .freshdesk import find_existing_ticket, freshdesk_dir
+
+    path = find_existing_ticket(freshdesk_dir(jira_dir), match.group(1))
+    if path is None:
+        return None
+    ticket = read_json(path)
+    if not isinstance(ticket, dict):
+        raise MetadataError(f"local Freshdesk ticket file for {key} is invalid")
+    conversations_path = path.parent / "conversations.json"
+    conversations = as_list(read_json(conversations_path)) if conversations_path.exists() else []
+    return {"ticket": ticket, "conversations": conversations}
 
 
 def meta_versions_data(jira_dir: Path, config: WorkbenchConfig, project: str | None) -> list[dict[str, Any]]:
@@ -442,6 +530,13 @@ def page(
     }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ border-bottom: 1px solid #9995; padding: 8px; text-align: left; vertical-align: top; }}
+    /* Meta > Versions/Components/Boards/Labels (see _versions_rows et al)
+    -- every row looks the same otherwise (just a thin border between
+    them), which makes it easy to misclick an action button (Archive,
+    Delete, ...) on the row above or below the one you meant, especially
+    once a table runs to dozens of rows. Alternating shading gives each
+    row's own action buttons a clearly bounded strip to land in. */
+    .meta-table tbody tr:nth-child(even) {{ background: #8881; }}
     /* z-index -- position: sticky alone doesn't guarantee this paints
     above the tbody rows that scroll underneath it: with no z-index, a
     sticky element and its later DOM siblings sit at the same stacking
@@ -478,6 +573,21 @@ def page(
     pre {{ overflow: auto; padding: 12px; background: #8882; white-space: pre-wrap; }}
     a {{ color: LinkText; }}
     .filters {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }}
+    /* The Items list's bulk-edit bar (see _bulk_edit_bar_html) -- one
+    field dropdown + whichever one value control matches it (see
+    .bulk-edit-value/jiraWbBulkFieldChanged) + one Apply button, all
+    posting to the one shared #bulk-edit-form every row's own bulk-select
+    checkbox submits into via form="..." (see BULK_EDIT_FORM_ID). Hidden
+    by default -- nothing is selected on a fresh page load, so a bar full
+    of controls with nothing to act on is just clutter -- revealed by
+    jiraWbBulkUpdateCount the moment a row's checkbox is actually checked. */
+    .bulk-edit-bar {{
+      display: none; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 12px;
+      padding: 8px 10px; border: 1px solid #8885; border-radius: 6px; background: #8881;
+    }}
+    .bulk-edit-bar.bulk-edit-bar-visible {{ display: flex; }}
+    #bulk-select-count {{ font-weight: 600; opacity: 0.8; }}
+    .bulk-edit-value {{ display: flex; align-items: center; gap: 4px; }}
     .pill {{ display: inline-block; padding: 1px 8px; border-radius: 10px; background: #8883; margin-right: 4px; }}
     .filter-field {{ position: relative; display: inline-block; }}
     .filter-field summary {{
@@ -548,6 +658,12 @@ def page(
     .detail-field select, .detail-field input[type="text"] {{ width: 100%; box-sizing: border-box; }}
     .detail-field-full {{ margin-bottom: 16px; }}
     .detail-field-full input[type="text"] {{ width: 100%; box-sizing: border-box; }}
+    /* An Epic's own children (see render_item_detail_page's child_issues
+    call) -- a plain list, not a grid cell, since it can run to dozens of
+    rows for a big Epic. */
+    .detail-children {{ list-style: none; margin: 0; padding: 0; }}
+    .detail-children li {{ padding: 3px 0; }}
+    .child-status {{ opacity: 0.6; font-size: 0.9em; }}
     /* A field present in the local shadow (i.e. edited but not yet pushed)
     gets a small colored accent -- otherwise there's no way to tell "this
     differs from Jira" apart from "this is just what Jira already has"
@@ -556,6 +672,18 @@ def page(
     .detail-summary.modified, .detail-description.modified {{
       border-left: 3px solid #2563eb; padding-left: 8px; margin-left: -11px;
     }}
+    /* Rendered Markdown from an Assistant answer (see
+    _render_assistant_answer) -- browser defaults handle paragraph/heading
+    spacing fine on their own; only the bits that'd otherwise look broken
+    in this app's own compact styling need a rule. */
+    .assistant-turn {{ margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #8883; }}
+    .assistant-answer ul, .assistant-answer ol {{ padding-left: 1.5em; }}
+    .assistant-answer li {{ margin: 2px 0; }}
+    .assistant-answer code {{ background: #8882; padding: 1px 4px; border-radius: 3px; }}
+    .assistant-answer pre {{ background: #8882; padding: 8px 12px; border-radius: 4px; overflow-x: auto; }}
+    .assistant-answer pre code {{ background: none; padding: 0; }}
+    .assistant-answer blockquote {{ margin: 8px 0; padding-left: 12px; border-left: 3px solid #8885; opacity: 0.85; }}
+    .assistant-answer hr {{ border: none; border-top: 1px solid #8885; margin: 16px 0; }}
     .modified-badge {{ color: #2563eb; font-size: 0.9em; cursor: default; }}
     .local-changes-bar {{ display: flex; align-items: center; gap: 10px; margin: 8px 0; }}
     .local-diff {{ flex: 1 1 auto; min-width: 0; }}
@@ -759,6 +887,7 @@ def page(
         <nav class="sidebar-nav">
           {nav_link("/", "items", "Items")}
           {nav_link("/meta", "meta", "Meta")}
+          {nav_link("/assistant", "assistant", "Assistant")}
         </nav>
         {_goto_section(form_wrapped)}
         {sidebar_extra}
@@ -850,6 +979,13 @@ def _checkbox_field(
 # rather than needing their own separate (and value-losing) form.
 ITEMS_FILTER_FORM_ID = "items-filter-form"
 
+# Same form="..." cross-DOM-subtree pattern as ITEMS_FILTER_FORM_ID above --
+# every row's own bulk-select checkbox lives inside the items table, well
+# outside the <form id="bulk-edit-form"> element itself (rendered once,
+# above the table, see _bulk_edit_bar_html), and still submits as part of
+# it via this id.
+BULK_EDIT_FORM_ID = "bulk-edit-form"
+
 # A synthetic "board" -- not a real Jira board, not even a user-defined
 # local board (metadata.py's add_local_board, which still matches by real
 # field values) -- selecting it filters to whatever currently has a local
@@ -928,6 +1064,7 @@ def _fields_from_query_string(query_string: str) -> dict[str, Any]:
         "board_scope": value("board_scope"),
         "swimlane": value("swimlane"),
         "show_released": value("show_released"),
+        "show_archived": value("show_archived"),
         "sort": value("sort"),
         "dir": value("dir", "desc"),
     }
@@ -1042,14 +1179,42 @@ def _clear_all_url(query: dict[str, Any]) -> str:
     return f"/?{urlencode(params, doseq=True)}"
 
 
+def _field_counts_all_sources(
+    jira_dir: Path, config: WorkbenchConfig, column: str, **kwargs: Any
+) -> list[tuple[str, int]]:
+    """field_counts, merged across the default Jira source and every
+    configured Freshdesk source -- without this, the sidebar's Project/
+    Status/Component/Assignee checklists could never offer a Freshdesk
+    value (e.g. the "FRESHDESK" pseudo-project, or one of Freshdesk's own
+    Open/Pending/Resolved/Closed statuses) to filter on at all, since
+    field_counts defaults to the Jira source alone. Safe to call
+    unconditionally with a `projects` scope that happens to name a Jira
+    project (or vice versa) -- the other source's query just returns no
+    rows for a project name it doesn't have, same "safe superset" pattern
+    _items_where_clause already relies on elsewhere in db.py."""
+    from .db import field_counts
+
+    merged: dict[str, int] = {}
+    for name, count in field_counts(jira_dir, column, **kwargs):
+        merged[name] = merged.get(name, 0) + count
+    for freshdesk_source in config.freshdesk_sources:
+        try:
+            rows = field_counts(jira_dir, column, source_slug=freshdesk_source.slug, **kwargs)
+        except LookupError:
+            continue
+        for name, count in rows:
+            merged[name] = merged.get(name, 0) + count
+    return sorted(merged.items())
+
+
 def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any], allowed_version_names: set[str]) -> str:
-    from .db import distinct_projects_for_board, field_counts
+    from .db import distinct_projects_for_board
 
     # Straight SQL GROUP BY counts instead of materializing/JSON-decoding
     # every indexed item to count them in Python -- project/status/
     # component/assignee are all plain promoted columns with no per-request
     # re-resolution concern (unlike fixVersion, see below).
-    project_counts = field_counts(jira_dir, "project")
+    project_counts = _field_counts_all_sources(jira_dir, config, "project")
     project_field = _checkbox_field("Project", "project", project_counts, query["project"], query)
 
     # Status/Component/Fix version/Assignee are all scoped to whichever
@@ -1077,12 +1242,12 @@ def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any],
         scoped_projects = None
     project_scope = {"projects": scoped_projects} if scoped_projects else {}
     status_field = _checkbox_field(
-        "Status", "status", field_counts(jira_dir, "status", **project_scope), query["status"], query
+        "Status", "status", _field_counts_all_sources(jira_dir, config, "status", **project_scope), query["status"], query
     )
     component_field = _checkbox_field(
         "Component",
         "component",
-        field_counts(jira_dir, "component", empty_bucket="_unassigned", **project_scope),
+        _field_counts_all_sources(jira_dir, config, "component", empty_bucket="_unassigned", **project_scope),
         query["component"],
         query,
     )
@@ -1129,12 +1294,32 @@ def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any],
         force_open=query.get("show_released") == "1",
     )
     assignee_field = _checkbox_field(
-        "Assignee", "assignee", field_counts(jira_dir, "assignee", **project_scope), query["assignee"], query
+        "Assignee", "assignee", _field_counts_all_sources(jira_dir, config, "assignee", **project_scope), query["assignee"], query
     )
     pattern = html.escape(query.get("pattern") or "")
     active_checked = "checked" if query.get("active", "1") == "1" else ""
+    show_archived_checked = "checked" if query.get("show_archived") == "1" else ""
     sort_value = html.escape(query.get("sort") or "")
     dir_value = html.escape(query.get("dir") or "desc")
+    # The synthetic Modified Items board always shows every locally
+    # modified item regardless of active/archived status (see
+    # items_page's own MODIFIED_BOARD_NAME branch) -- these two checkboxes
+    # would have no effect there, so they're hidden rather than left
+    # sitting on the page implying a filter that isn't actually applied,
+    # the same reasoning _board_scope_section already hides Scope/Swimlane
+    # for this board.
+    active_archived_toggles = (
+        ""
+        if query.get("board") == MODIFIED_BOARD_NAME
+        else f"""
+      <label title="Hide issues whose status is Done/Closed (anything Jira categorizes as a 'done' status)">
+        <input type="checkbox" name="active" value="1" {active_checked}> Active only
+      </label>
+      <label title="An item counts as archived if any of its own fix versions or its component is itself archived -- hidden by default, same as Done/Closed items">
+        <input type="checkbox" name="show_archived" value="1" {show_archived_checked}> Show archived items
+      </label>
+      """
+    )
     return f"""
     <form method="get" id="{ITEMS_FILTER_FORM_ID}" class="filters">
       <input name="pattern" value="{pattern}" placeholder="Search key, summary, status, type" style="flex: 1; min-width: 240px;">
@@ -1143,14 +1328,12 @@ def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any],
       {component_field}
       {fix_version_field}
       {assignee_field}
-      <label title="Hide issues whose status is Done/Closed (anything Jira categorizes as a 'done' status)">
-        <input type="checkbox" name="active" value="1" {active_checked}> Active only
-      </label>
+      {active_archived_toggles}
       <input type="hidden" name="sort" value="{sort_value}">
       <input type="hidden" name="dir" value="{dir_value}">
       <button type="submit" title="Reload the list using the project/status/component/etc. selections above">Apply filters</button>
       <button type="submit" formmethod="post" formaction="/save-filter" title="Write the current selections to config.toml as the default view everywhere">Save as default filter</button>
-      <a href="{_clear_all_url(query)}" class="button-link" title="Remove every filter below (search, project, status, component, fix version, assignee, active-only, board, scope, swimlane)">Clear all filters</a>
+      <a href="{_clear_all_url(query)}" class="button-link" title="Remove every filter below (search, project, status, component, fix version, assignee, active-only, archived, board, scope, swimlane)">Clear all filters</a>
       <a href="/" class="button-link" title="Discard the selections above and reload using the saved default filter">Reset to saved default filter</a>
     </form>
     """
@@ -1190,6 +1373,217 @@ def _sort_header(label: str, query: dict[str, Any]) -> str:
     params["dir"] = next_dir
     indicator = (" ▼" if current_dir == "desc" else " ▲") if current_sort == field else ""
     return f'<th><a href="/?{urlencode(params, doseq=True)}">{html.escape(label)}{indicator}</a></th>'
+
+
+def fix_version_groups(jira_dir: Path, project: str, observed_versions: set[str]) -> list[tuple[str, list[str]]]:
+    """Fix Version names for `project`, grouped into "Released"/
+    "Unreleased" sections -- matching Jira's own Fix Version dropdown look
+    -- shared by the Items list's own per-project cached wrapper
+    (render_items_page's fix_version_groups_for) and the Detail page's
+    fixVersions editor (_field_editor_html), so the two widgets always
+    offer the exact same options the exact same way. Archived versions are
+    always excluded -- archiving is what actually removes a version from
+    Jira's own picker for good.
+
+    `observed_versions` -- every fixVersion value actually assigned to one
+    of this project's own synced items -- covers a version this project's
+    issues carry but that's missing from the refreshed versions cache
+    entirely (deleted in Jira after being assigned, or the cache is simply
+    stale), same "extend with observed" safety net every other field's
+    template already uses, bucketed into Unreleased since there's no
+    released/archived signal available for it here. Excludes anything
+    that's actually a known ARCHIVED version, though -- regression: an
+    issue can still carry an archived version as its own current
+    fixVersions value, and this fallback used to reinstate it into the
+    Unreleased group just because it wasn't in the (already
+    archived-filtered) known set, defeating the "archived versions are
+    always excluded" rule above for the one case that rule exists to
+    cover."""
+    all_versions = [version for version in normalize_versions(load_versions(jira_dir, project)) if isinstance(version, dict)]
+    versions = [version for version in all_versions if not is_archived_version(version)]
+    released_names = sorted({version_name(version).strip() for version in versions if version.get("released")} - {""})
+    unreleased_names = sorted(
+        {version_name(version).strip() for version in versions if not version.get("released")} - {""}
+    )
+    archived_lower = {version_name(version).strip().lower() for version in all_versions if is_archived_version(version)}
+    known_lower = {name.strip().lower() for name in (*released_names, *unreleased_names)}
+    extra = sorted(
+        value
+        for value in observed_versions
+        if value.strip().lower() not in known_lower and value.strip().lower() not in archived_lower
+    )
+    groups: list[tuple[str, list[str]]] = []
+    if released_names:
+        groups.append(("Released", released_names))
+    if unreleased_names or extra:
+        groups.append(("Unreleased", [*unreleased_names, *extra]))
+    return groups
+
+
+# Deliberately plain native <select>s/<option>s here, not the pill-select
+# widget every per-row/Detail-page editor now uses -- this bar edits N
+# items at once, not one row's own current value, so there's no single
+# "current pill" to show and no per-project single/multi distinction to
+# honor client-side (post_bulk_fields resolves that per item, server-side,
+# from whichever selected items actually get updated). Matches how the
+# Meta pages' own bulk-ish admin forms are built (plain controls), not the
+# Items-list-row/Detail-page editors this app already unified separately.
+#
+# One field-select + one value control + one Apply button -- not five
+# independent (field, value, button) rows -- since exactly one field is
+# ever changed by one Apply click; every field's own value control is
+# still rendered (so switching the field dropdown is instant, no
+# server round-trip) but only the one matching the dropdown's current
+# value is visible at a time (jiraWbBulkFieldChanged). The whole bar
+# itself stays hidden (see .bulk-edit-bar's own CSS) until at least one
+# row is actually checked -- jiraWbBulkUpdateCount reveals it.
+def _bulk_edit_bar_html(
+    *,
+    status_options: list[str],
+    done_statuses: list[str],
+    resolution_options: list[str],
+    priority_options: list[str],
+    component_options: list[str],
+    assignee_options: list[str],
+    fix_version_groups_union: list[tuple[str, list[str]]],
+    return_to_url: str,
+    show_revert: bool = False,
+) -> str:
+    def options_html(values: list[str], *, placeholder: str = "(choose)") -> str:
+        return f'<option value="">{placeholder}</option>' + "".join(
+            f'<option value="{html.escape(value)}">{html.escape(value) or "(none)"}</option>' for value in values if value
+        )
+
+    def multi_options_html(groups: list[tuple[str, list[str]]] | None, flat: list[str] | None = None) -> str:
+        if groups is not None:
+            return "".join(
+                f'<optgroup label="{html.escape(label)}">'
+                + "".join(f'<option value="{html.escape(value)}">{html.escape(value)}</option>' for value in values)
+                + "</optgroup>"
+                for label, values in groups
+                if values
+            )
+        return "".join(f'<option value="{html.escape(value)}">{html.escape(value)}</option>' for value in flat or [])
+
+    done_json = html.escape(json.dumps(done_statuses), quote=True)
+    # formaction routes just this one button's submit to a different
+    # endpoint than the form's own default action (bulk-fields) -- same
+    # shared `keys` checkboxes and `return_to`, no second form needed.
+    # Only offered on the Modified Items board (see MODIFIED_BOARD_NAME):
+    # that's the one place a bulk selection is specifically "these are all
+    # locally modified", where "discard the lot" is a sensible one-click
+    # action -- elsewhere a selection is a mix of editable rows in general.
+    revert_button_html = (
+        '<button type="submit" formaction="/items/bulk-revert" class="btn btn-danger" '
+        'onclick="return jiraWbBulkRevertConfirm()" '
+        'title="Discard all local unpushed changes for every selected item">Revert</button>'
+        if show_revert
+        else ""
+    )
+    return f"""
+    <form id="{BULK_EDIT_FORM_ID}" method="post" action="/items/bulk-fields" class="bulk-edit-bar">
+      <input type="hidden" name="return_to" value="{html.escape(return_to_url)}">
+      <span id="bulk-select-count">0 selected</span>
+
+      <select name="bulk_field" id="bulk-field-select" onchange="jiraWbBulkFieldChanged(this)">
+        <option value="status">Status</option>
+        <option value="priority">Priority</option>
+        <option value="component">Component</option>
+        <option value="assignee">Assignee</option>
+        <option value="fixVersions">Fix version</option>
+      </select>
+
+      <span class="bulk-edit-value" data-bulk-field="status">
+        <select name="status_value" data-done="{done_json}" onchange="jiraWbBulkStatusChanged(this)">
+          {options_html(status_options)}
+        </select>
+        <select name="resolution" id="bulk-resolution-select" style="display: none;">
+          {options_html(resolution_options, placeholder="Resolution…")}
+        </select>
+      </span>
+
+      <span class="bulk-edit-value" data-bulk-field="priority" style="display: none;">
+        <select name="priority_value">{options_html(priority_options)}</select>
+      </span>
+
+      <span class="bulk-edit-value" data-bulk-field="component" style="display: none;">
+        <select name="component_value" multiple size="4">{multi_options_html(None, component_options)}</select>
+      </span>
+
+      <span class="bulk-edit-value" data-bulk-field="assignee" style="display: none;">
+        <select name="assignee_value">{options_html(["(unassigned)", *assignee_options])}</select>
+      </span>
+
+      <span class="bulk-edit-value" data-bulk-field="fixVersions" style="display: none;">
+        <select name="fixversions_value" multiple size="4">{multi_options_html(fix_version_groups_union)}</select>
+      </span>
+
+      <button type="submit" onclick="return jiraWbBulkConfirm()">Apply</button>
+      {revert_button_html}
+    </form>
+    """
+
+
+# jiraWbBulkConfirm reads the live checked count and the field dropdown's
+# current selection at click time (not values baked in at render time)
+# since a page reload is the only thing that ever changes what's checked
+# -- no separate state to keep in sync beyond the one visible counter span.
+BULK_EDIT_SCRIPT = """
+<script>
+function jiraWbBulkSelectedCount() {
+  return document.querySelectorAll('.bulk-row-checkbox:checked').length;
+}
+function jiraWbBulkUpdateCount() {
+  var count = jiraWbBulkSelectedCount();
+  var el = document.getElementById('bulk-select-count');
+  if (el) el.textContent = count + ' selected';
+  var all = document.querySelectorAll('.bulk-row-checkbox');
+  var checked = document.querySelectorAll('.bulk-row-checkbox:checked');
+  var selectAll = document.getElementById('bulk-select-all');
+  if (selectAll) selectAll.checked = all.length > 0 && checked.length === all.length;
+  var bar = document.getElementById('bulk-edit-form');
+  if (bar) bar.classList.toggle('bulk-edit-bar-visible', count > 0);
+}
+function jiraWbBulkToggleAll(headerCheckbox) {
+  document.querySelectorAll('.bulk-row-checkbox').forEach(function (cb) { cb.checked = headerCheckbox.checked; });
+  jiraWbBulkUpdateCount();
+}
+function jiraWbBulkFieldChanged(select) {
+  document.querySelectorAll('.bulk-edit-value').forEach(function (el) {
+    el.style.display = el.dataset.bulkField === select.value ? '' : 'none';
+  });
+}
+function jiraWbBulkConfirm() {
+  var count = jiraWbBulkSelectedCount();
+  if (count === 0) {
+    alert('Select at least one item first.');
+    return false;
+  }
+  var fieldSelect = document.getElementById('bulk-field-select');
+  var fieldLabel = fieldSelect.options[fieldSelect.selectedIndex].text;
+  return confirm(
+    'Set ' + fieldLabel + ' on ' + count + ' selected item(s)?\\n\\n' +
+    'This stages a local edit for each -- nothing is pushed to Jira until you review and push it separately.'
+  );
+}
+function jiraWbBulkRevertConfirm() {
+  var count = jiraWbBulkSelectedCount();
+  if (count === 0) {
+    alert('Select at least one item first.');
+    return false;
+  }
+  return confirm(
+    'Discard all local unpushed changes for ' + count + ' selected item(s)?\\n\\n' +
+    'This cannot be undone.'
+  );
+}
+function jiraWbBulkStatusChanged(select) {
+  var done = JSON.parse(select.dataset.done || '[]');
+  var resolutionSelect = document.getElementById('bulk-resolution-select');
+  if (resolutionSelect) resolutionSelect.style.display = done.indexOf(select.value) !== -1 ? '' : 'none';
+}
+</script>
+"""
 
 
 def render_items_page(
@@ -1236,9 +1630,8 @@ def render_items_page(
     # way status_categories above already is.
     # A leading "" entry (rendered as "(none)" by _pill_select_options_template_html's
     # own empty-label fallback) lets a status transition to Done submit with
-    # no resolution, or clear one already set -- matching the old native
-    # <select>'s explicit `<option value="">(none)</option>` (still present
-    # for the Detail page's own _status_select_widget_html).
+    # no resolution, or clear one already set -- the Detail page's own
+    # _status_pill_form_html carries the same leading "" convention.
     resolution_options = ["", *observed_field_options(jira_dir, "resolution")]
     options_cache: dict[tuple[str, str], list[str]] = {}
     version_groups_cache: dict[str, list[tuple[str, list[str]]]] = {}
@@ -1373,57 +1766,13 @@ def render_items_page(
         return options_cache[key]
 
     def fix_version_groups_for(project: str) -> list[tuple[str, list[str]]]:
-        # Grouped into "Released"/"Unreleased" sections with headers,
-        # matching Jira's own Fix Version dropdown look -- unlike
-        # fix_version_options_for (the New Issue/Detail pages' flat list,
-        # which hides released versions by default -- assigning new work to
-        # an already-shipped version is unusual enough to want a deliberate
-        # toggle there), this widget shows both groups straight away since
-        # Jira's own picker does too. Archived versions are still always
-        # excluded -- archiving is what actually removes a version from
-        # Jira's picker for good.
         if project not in version_groups_cache:
-            all_versions = [
-                version for version in normalize_versions(load_versions(jira_dir, project)) if isinstance(version, dict)
-            ]
-            versions = [version for version in all_versions if not is_archived_version(version)]
-            released_names = sorted({version_name(version).strip() for version in versions if version.get("released")} - {""})
-            unreleased_names = sorted(
-                {version_name(version).strip() for version in versions if not version.get("released")} - {""}
-            )
-            # A version this project's own issues actually carry but that's
-            # missing from the refreshed versions cache entirely (deleted in
-            # Jira after being assigned, or the cache is simply stale) --
-            # same "extend with observed" safety net every other field's
-            # template already uses, bucketed into Unreleased since there's
-            # no released/archived signal available for it here. Excludes
-            # anything that's actually a known ARCHIVED version, though --
-            # regression: an issue can still carry an archived version as
-            # its own current fixVersions value, and this fallback used to
-            # reinstate it into the Unreleased group just because it wasn't
-            # in the (already archived-filtered) known set, defeating the
-            # "archived versions are always excluded" rule above for the
-            # one case that rule exists to cover.
-            archived_lower = {
-                version_name(version).strip().lower() for version in all_versions if is_archived_version(version)
-            }
             observed = {
                 version
                 for scoped_item in project_scoped_items_for(project)
                 for version in (scoped_item.get("fixVersions") or [])
             }
-            known_lower = {name.strip().lower() for name in (*released_names, *unreleased_names)}
-            extra = sorted(
-                value
-                for value in observed
-                if value.strip().lower() not in known_lower and value.strip().lower() not in archived_lower
-            )
-            groups: list[tuple[str, list[str]]] = []
-            if released_names:
-                groups.append(("Released", released_names))
-            if unreleased_names or extra:
-                groups.append(("Unreleased", [*unreleased_names, *extra]))
-            version_groups_cache[project] = groups
+            version_groups_cache[project] = fix_version_groups(jira_dir, project, observed)
         return version_groups_cache[project]
 
     def component_template_options_for(project: str) -> list[str]:
@@ -1439,7 +1788,20 @@ def render_items_page(
             for scoped_item in project_scoped_items_for(project):
                 observed.update(comma_parts(str(scoped_item.get("component") or "")))
             observed.discard("_unassigned")
-            options_cache[key] = _extended_with_observed(component_options_for(project), observed)
+            # Not the generic _extended_with_observed helper -- same reason
+            # fix_version_groups_for inlines its own version of it: an item
+            # can still carry an archived component as its own current
+            # value, and the plain "not in the official list" fallback used
+            # to reinstate exactly that into the dropdown, since an
+            # archived component is deliberately missing from
+            # component_options_for's own official list too.
+            official = component_options_for(project)
+            archived = archived_component_names(jira_dir, project)
+            known_lower = {value.strip().lower() for value in official}
+            extra = sorted(
+                value for value in observed if value.strip().lower() not in known_lower and value.strip().lower() not in archived
+            )
+            options_cache[key] = [*official, *extra]
         return options_cache[key]
 
     def project_is_read_only(project: str) -> bool:
@@ -1508,6 +1870,11 @@ def render_items_page(
 
     rows = []
     any_editable = False
+    # Every project that actually rendered at least one editable row -- the
+    # bulk-edit bar's own option lists (built once, after the loop) are the
+    # union of these projects' own per-project option closures above,
+    # exactly the values any one of the selected rows could actually use.
+    bulk_projects: set[str] = set()
     lane_seen: object = object()  # sentinel guaranteed to differ from any real lane label
     current_lane = lane_seen
     section_seen: object = object()
@@ -1522,8 +1889,9 @@ def render_items_page(
             if lane != current_lane:
                 current_lane = lane
                 rows.append(
-                    '<tr class="swimlane-header" onclick="jiraWbToggleSwimlane(this)">'
-                    f'<td colspan="8">{html.escape(lane)}</td></tr>'
+                    f'<tr class="swimlane-header" data-lane="{html.escape(lane)}" '
+                    'onclick="jiraWbToggleSwimlane(this)">'
+                    f'<td colspan="9">{html.escape(lane)}</td></tr>'
                 )
         if sections_mode:
             section = item_scope(item)
@@ -1536,7 +1904,7 @@ def render_items_page(
                 rows.append(
                     f'<tr class="swimlane-header section-header" data-scope="{section}" '
                     'onclick="jiraWbToggleSection(this)" ondragover="jiraWbDragOver(event)" ondrop="jiraWbDrop(event)">'
-                    f'<td colspan="8">{label} '
+                    f'<td colspan="9">{label} '
                     f'<a href="{section_new_issue_href}" class="new-issue-fab-small" '
                     f'title="Create a new Jira issue in {label}" onclick="event.stopPropagation()">+</a>'
                     "</td></tr>"
@@ -1545,8 +1913,18 @@ def render_items_page(
         project = str(item.get("project") or "")
         item_type = str(item.get("type") or "")
         item_priority = str(item.get("priority") or "")
-        if project and not project_is_read_only(project):
+        # Non-Jira rows (e.g. a Freshdesk ticket, tagged item["source"] !=
+        # "jira" by all_items) are always read-only in this pass -- no
+        # shadow/push pipeline exists for them yet, same reasoning as a
+        # read-only Jira project, just source-wide instead of
+        # project-scoped. See the "Freshdesk as a second source" plan.
+        if project and item.get("source", "jira") == "jira" and not project_is_read_only(project):
             any_editable = True
+            bulk_projects.add(project)
+            bulk_checkbox_cell = (
+                f'<td><input type="checkbox" name="keys" value="{key}" form="{BULK_EDIT_FORM_ID}" '
+                f'class="bulk-row-checkbox" onchange="jiraWbBulkUpdateCount()"></td>'
+            )
             action = f"/items/{key}/fields"
             type_cell = _pill_select_row_trigger_html(
                 action,
@@ -1626,22 +2004,27 @@ def render_items_page(
             fix_version_current = list(item.get("fixVersions") or [])
             if fix_version_single:
                 fix_version_current = fix_version_current[:1]
-            fix_version_groups = fix_version_groups_for(project)
+            fix_version_project_groups = fix_version_groups_for(project)
             fix_version_cell = _pill_select_row_trigger_html(
                 action,
                 "fixVersions",
                 fix_version_current,
                 ensure_pill_template(
                     f"fixVersion::{project}",
-                    [name for _, names in fix_version_groups for name in names],
+                    [name for _, names in fix_version_project_groups for name in names],
                     single=fix_version_single,
-                    groups=fix_version_groups,
+                    groups=fix_version_project_groups,
                 ),
                 single=fix_version_single,
                 extra_hidden=extra_hidden,
             )
             summary_cell = _text_editor_html(action, "summary", str(item.get("summary") or ""), extra_hidden=extra_hidden)
         else:
+            # No bulk-select checkbox either -- a read-only project's rows
+            # can never actually be bulk-edited (post_bulk_fields skips
+            # them the same way single-row edits already are blocked here),
+            # so offering one would just be a checkbox that does nothing.
+            bulk_checkbox_cell = "<td></td>"
             type_cell = _type_icon_cell(item_type)
             priority_cell = _priority_icon_cell(item_priority)
             status_cell = html.escape(str(item.get("status", "")))
@@ -1664,6 +2047,7 @@ def render_items_page(
         )
         rows.append(
             f"<tr{row_drag_attrs}>"
+            f"{bulk_checkbox_cell}"
             f'<td class="pill-select-cell">{type_cell}</td>'
             f'<td><a href="/items/{key}">{key}</a>{modified_badge_html}</td>'
             f'<td class="pill-select-row-cell">{status_cell}</td>'
@@ -1674,7 +2058,17 @@ def render_items_page(
             f'<td class="pill-select-row-cell">{fix_version_cell}</td>'
             "</tr>"
         )
-    headers = "".join(
+    # Only a real "select all" control when at least one row actually has
+    # its own bulk-select checkbox -- an empty header cell (matching every
+    # read-only row's own empty placeholder) otherwise, same reasoning as
+    # pill_select_script's own any_editable gate below.
+    select_all_header = (
+        '<th><input type="checkbox" id="bulk-select-all" onclick="jiraWbBulkToggleAll(this)" '
+        'title="Select/deselect every row on this page"></th>'
+        if any_editable
+        else "<th></th>"
+    )
+    headers = select_all_header + "".join(
         _sort_header(label, query) for label in ("", "Key", "Status", "Component", "Summary", "Pr", "Assignee", "Fix version")
     )
     # return_to round-trips back through the New Issue form (a hidden
@@ -1693,6 +2087,47 @@ def render_items_page(
     pill_select_script = PILL_SELECT_SCRIPT + STATUS_PILL_SCRIPT if any_editable else ""
     swimlane_script = SWIMLANE_TOGGLE_SCRIPT if swimlane_mode != "none" else ""
     board_sections_script = BOARD_SECTIONS_SCRIPT if sections_mode else ""
+    bulk_edit_bar_html = ""
+    bulk_edit_script = ""
+    if any_editable:
+        # Union across every project that actually rendered an editable
+        # row -- the same per-project option closures each row's own
+        # widget already calls above, just merged across projects instead
+        # of scoped to one, since a bulk selection can span several.
+        bulk_status: set[str] = set()
+        bulk_done: set[str] = set()
+        bulk_priority: set[str] = set()
+        bulk_component: set[str] = set()
+        bulk_assignee: set[str] = set()
+        bulk_released: set[str] = set()
+        bulk_unreleased: set[str] = set()
+        for bulk_project in bulk_projects:
+            bulk_status.update(status_options_for(bulk_project))
+            bulk_done.update(done_statuses_for(bulk_project))
+            bulk_priority.update(priority_options_for(bulk_project))
+            bulk_component.update(component_template_options_for(bulk_project))
+            bulk_assignee.update(
+                value for value in assignee_template_options_for(bulk_project) if value != "(unassigned)"
+            )
+            for group_label, group_values in fix_version_groups_for(bulk_project):
+                (bulk_released if group_label == "Released" else bulk_unreleased).update(group_values)
+        bulk_fix_version_groups: list[tuple[str, list[str]]] = []
+        if bulk_released:
+            bulk_fix_version_groups.append(("Released", sorted(bulk_released)))
+        if bulk_unreleased:
+            bulk_fix_version_groups.append(("Unreleased", sorted(bulk_unreleased)))
+        bulk_edit_bar_html = _bulk_edit_bar_html(
+            status_options=sorted(bulk_status),
+            done_statuses=sorted(bulk_done),
+            resolution_options=resolution_options,
+            priority_options=sorted(bulk_priority, key=lambda name: PRIORITY_RANK.get(name.strip().lower(), len(PRIORITY_RANK))),
+            component_options=sorted(bulk_component),
+            assignee_options=sorted(bulk_assignee),
+            fix_version_groups_union=bulk_fix_version_groups,
+            return_to_url=return_to_url,
+            show_revert=board_value == MODIFIED_BOARD_NAME,
+        )
+        bulk_edit_script = BULK_EDIT_SCRIPT
     flash_banner = ""
     if flash:
         kind = flash_kind or "success"
@@ -1723,8 +2158,10 @@ def render_items_page(
           {flash_banner}
           {_filter_form(jira_dir, config, query, allowed_version_names)}
         </header>
-        <table class="items-table">
+        {bulk_edit_bar_html}
+        <table class="items-table" id="items-table" data-board="{html.escape(board_value)}" data-swimlane="{html.escape(swimlane_mode)}">
           <colgroup>
+            <col style="width: 24px;">
             <col style="width: 36px;">
             <col style="width: 90px;">
             <col style="width: 130px;">
@@ -1740,6 +2177,7 @@ def render_items_page(
         {bottom_fab_html}
         {"".join(pill_templates_html)}
         {pill_select_script}
+        {bulk_edit_script}
         {swimlane_script}
         {board_sections_script}
     """
@@ -1772,7 +2210,6 @@ def _require_same_origin(request: Request) -> None:
 
 
 _MULTI_VALUE_ONLY_FIELD = "labels"
-_SELECT_ONLY_FIELDS = {"fixVersions"}
 
 
 def _current_multi_values(fields: dict[str, Any], field: str) -> list[str]:
@@ -1861,6 +2298,15 @@ def _active_component_options(
         names = set(_project_scoped_options(project_scoped_items, "component"))
     names.discard("")
     names.discard("_unassigned")
+    # A component this project has locally marked archived (see
+    # metadata.set_component_archived) is no longer offered for assignment
+    # here -- same treatment archived Fix Versions already get -- even
+    # though it's still a real, currently-cached component name; an
+    # already-assigned archived component still shows on its own item
+    # (this only narrows what a *fresh* pick can choose).
+    archived = archived_component_names(jira_dir, project)
+    if archived:
+        names = {name for name in names if name.strip().lower() not in archived}
     return sorted(names)
 
 
@@ -1903,60 +2349,6 @@ def _tag_input_editor_html(
     """
 
 
-def _multi_select_editor_html(
-    action: str,
-    field: str,
-    options: list[str],
-    current: list[str],
-    *,
-    extra_hidden: str = "",
-) -> str:
-    """A dropdown of checkboxes for a multi-valued field with a genuinely
-    bounded option set (Fix Versions -- confirmed in practice to run to a
-    few dozen per project at most, unlike Labels/Components which can run
-    into the hundreds and stay on _tag_input_editor_html's free-text-plus-
-    datalist instead, see that function's own docstring for why a
-    checkbox stack doesn't scale there). Reuses the same .icon-select/
-    jiraWbIconToggle open/close plumbing as the single-select icon
-    dropdown, but with real checkboxes instead of click-to-select rows --
-    each one submits the form immediately on change, matching every other
-    edit widget's own auto-submit-on-change behavior, rather than adding
-    a separate Apply step found nowhere else on this page. Checking a box
-    only removed from the request's own "value" list when *unchecked*
-    (standard HTML checkbox semantics), so the /items/{key}/fields route
-    needs no changes -- it already accepts Form(value: list[str])."""
-    current_lower = {value.strip().lower() for value in current}
-    # "(none)" is a real, selectable placeholder in the single-select
-    # widgets version_options()/etc. were originally built for -- here,
-    # "nothing checked" already means "no fix version", so a literal
-    # "(none)" checkbox would be redundant at best (and a contradictory
-    # state at worst, if checked alongside a real value).
-    display_options = [option for option in options if option != "(none)"]
-    known_lower = {option.strip().lower() for option in display_options}
-    display_options.extend(value for value in current if value.strip().lower() not in known_lower)
-    trigger_label = html.escape(", ".join(current)) if current else "(none)"
-    rows = []
-    for option in display_options:
-        checked = " checked" if option.strip().lower() in current_lower else ""
-        escaped = html.escape(option)
-        rows.append(
-            f'<label class="icon-select-option checkbox-row"><input type="checkbox" name="value" '
-            f'value="{escaped}"{checked} onchange="this.form.submit()"> {escaped}</label>'
-        )
-    return f"""
-    <form method="post" action="{action}">
-      <input type="hidden" name="field" value="{html.escape(field)}">
-      {extra_hidden}
-      <div class="icon-select">
-        <button type="button" class="icon-select-trigger" onclick="jiraWbIconToggle(this)">
-          <span>{trigger_label}</span>
-        </button>
-        <div class="icon-select-menu" role="listbox">{"".join(rows)}</div>
-      </div>
-    </form>
-    """
-
-
 def _tag_input_bare_html(name: str, options: list[str], current: list[str]) -> str:
     """Same comma-separated text-input-plus-<datalist> as
     _tag_input_editor_html, but with no <form>/auto-submit of its own --
@@ -1969,25 +2361,6 @@ def _tag_input_bare_html(name: str, options: list[str], current: list[str]) -> s
     <input type="text" name="{name}" value="{html.escape(current_text)}" list="{datalist_id}"
       placeholder="Comma-separated" style="width: 100%;">
     <datalist id="{datalist_id}">{datalist_html}</datalist>
-    """
-
-
-def _select_editor_html(
-    action: str, field: str, options: list[str], current: str, *, extra_hidden: str = ""
-) -> str:
-    display_options = list(options)
-    if current not in display_options:
-        display_options = [current, *display_options]
-    options_html = "".join(
-        f'<option value="{html.escape(option)}"{" selected" if option == current else ""}>{html.escape(option) or "(none)"}</option>'
-        for option in display_options
-    )
-    return f"""
-    <form method="post" action="{action}">
-      <input type="hidden" name="field" value="{html.escape(field)}">
-      {extra_hidden}
-      <select name="value" onchange="this.form.submit()">{options_html}</select>
-    </form>
     """
 
 
@@ -2269,17 +2642,74 @@ function jiraWbPending(form, label) {
 # clickable row, not a native <details> -- <details> can't legally wrap a
 # run of sibling <tr> elements inside a <table>, so collapsing is done by
 # hiding every row between one header and the next (or the table's end).
+#
+# Which lanes are collapsed is remembered across a reload, scoped per
+# board (read from the <table>'s own data-board attribute -- the same
+# board key the server already keys its per-board filter cookie on, see
+# LAST_VIEW_COOKIE) via localStorage: purely a display toggle over
+# already-rendered rows, never affects what's fetched/filtered
+# server-side, so there's no need to round-trip it through a cookie the
+# server reads. Stored alongside the swimlane mode it was recorded under
+# (data-swimlane, e.g. "component" vs "status") so switching the grouping
+# starts every lane expanded again instead of replaying stale collapse
+# state that named a now-irrelevant set of lanes.
 SWIMLANE_TOGGLE_SCRIPT = """
 <script>
-function jiraWbToggleSwimlane(header) {
-  header.classList.toggle('collapsed');
-  var collapsed = header.classList.contains('collapsed');
+function jiraWbSwimlaneStorageKey() {
+  var table = document.getElementById('items-table');
+  return 'jiraWbSwimlaneCollapse:' + (table ? table.dataset.board : '');
+}
+function jiraWbSwimlaneMode() {
+  var table = document.getElementById('items-table');
+  return table ? table.dataset.swimlane : '';
+}
+function jiraWbSwimlaneStorageRead() {
+  try {
+    var raw = localStorage.getItem(jiraWbSwimlaneStorageKey());
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+function jiraWbSwimlaneStorageWrite(collapsedLanes) {
+  try {
+    localStorage.setItem(
+      jiraWbSwimlaneStorageKey(),
+      JSON.stringify({ mode: jiraWbSwimlaneMode(), collapsed: collapsedLanes })
+    );
+  } catch (e) {
+    // Private browsing / storage disabled -- collapse still works for
+    // this page view, it just won't survive a reload.
+  }
+}
+function jiraWbSwimlaneSetCollapsed(header, collapsed) {
+  header.classList.toggle('collapsed', collapsed);
   var row = header.nextElementSibling;
   while (row && !row.classList.contains('swimlane-header')) {
     row.style.display = collapsed ? 'none' : '';
     row = row.nextElementSibling;
   }
 }
+function jiraWbToggleSwimlane(header) {
+  jiraWbSwimlaneSetCollapsed(header, !header.classList.contains('collapsed'));
+  var collapsedLanes = [];
+  document.querySelectorAll('.swimlane-header.collapsed').forEach(function (h) {
+    collapsedLanes.push(h.dataset.lane || '');
+  });
+  jiraWbSwimlaneStorageWrite(collapsedLanes);
+}
+(function jiraWbRestoreSwimlaneCollapse() {
+  var stored = jiraWbSwimlaneStorageRead();
+  if (!stored || stored.mode !== jiraWbSwimlaneMode()) {
+    jiraWbSwimlaneStorageWrite([]);
+    return;
+  }
+  var collapsedSet = {};
+  (stored.collapsed || []).forEach(function (lane) { collapsedSet[lane] = true; });
+  document.querySelectorAll('.swimlane-header').forEach(function (header) {
+    if (collapsedSet[header.dataset.lane || '']) jiraWbSwimlaneSetCollapsed(header, true);
+  });
+})();
 </script>
 """
 
@@ -2442,15 +2872,23 @@ def _icon_select_editor_html(
     """
 
 
-def _pill_html(value: str, icon_html: str = "", *, removable: bool = False, compact: bool = False) -> str:
+def _pill_html(
+    value: str, icon_html: str = "", *, removable: bool = False, compact: bool = False, label: str | None = None
+) -> str:
     """compact=True renders the icon/avatar with no visible text label at
     all -- just a native `title` tooltip carrying it -- for the handful of
     row-trigger fields (Type, Priority, Assignee) narrow enough that a
     label would either get clipped or spill into the next column; every
     other pill (including these same fields' own dropdown *options*, via
     _pill_select_options_template_html, which never goes compact) still
-    shows its label normally."""
-    escaped = html.escape(value) or "(none)"
+    shows its label normally.
+
+    label overrides the displayed text (Parent's own value is a bare issue
+    key, submitted as-is, but shown as its emoji type + summary -- see
+    _parent_pill_options) -- the tooltip/remove-click JSON still carry the
+    real `value`, never the label, since that's what actually gets
+    submitted/matched."""
+    escaped = html.escape(label if label is not None else value) or "(none)"
     remove_html = ""
     if removable:
         value_json = html.escape(json.dumps(value), quote=True)
@@ -2473,6 +2911,7 @@ def _pill_select_options_template_html(
     icon_renderer: Callable[[str], str] | None = None,
     single: bool,
     groups: list[tuple[str, list[str]]] | None = None,
+    label_map: dict[str, str] | None = None,
 ) -> str:
     """The Items list's one shared dropdown option list -- rendered once
     per distinct (field, project) pair into an inert <template> (see
@@ -2486,7 +2925,13 @@ def _pill_select_options_template_html(
     headers -- "Released"/"Unreleased" -- ahead of their own options,
     matching Jira's own Fix Version dropdown look, instead of one flat
     list; `options` is ignored when `groups` is given (still computed by
-    the caller as the flattened equivalent, harmlessly unused here)."""
+    the caller as the flattened equivalent, harmlessly unused here).
+
+    label_map overrides an option's displayed text (keyed by its own
+    value) -- Parent's own option values are bare issue keys, but shown as
+    "emoji + summary" (see _parent_pill_options), the one field migrated
+    to this widget so far where the submitted value and the displayed text
+    were never the same string to begin with."""
 
     def icon_for(value: str) -> str:
         if icon_renderer is not None:
@@ -2498,9 +2943,10 @@ def _pill_select_options_template_html(
         return _icon_span(value, icon_map or {}, default_icon or ("", "currentColor"))
 
     def option_row(option: str) -> str:
-        label = html.escape(option) or "(none)"
+        label_text = (label_map or {}).get(option, option)
+        label = html.escape(label_text) or "(none)"
         escaped = html.escape(option)
-        label_attr = html.escape(option.strip().lower())
+        label_attr = html.escape(label_text.strip().lower())
         # No checkbox, either mode -- a checkbox suggested you had to hit
         # that exact target, when the whole row has always been the click
         # target; a plain row (hover highlight + a checkmark once selected,
@@ -2533,6 +2979,7 @@ def _pill_select_div_html(
     *,
     single: bool,
     pill_icon_html: Callable[[str], str] | None = None,
+    pill_label: Callable[[str], str] | None = None,
     value_field_name: str = "value",
     on_select: str | None = None,
     placeholder: str = "(none)",
@@ -2546,7 +2993,13 @@ def _pill_select_div_html(
     sharing a single <form> instead of two independent ones."""
     pills_html = (
         "".join(
-            _pill_html(value, pill_icon_html(value) if pill_icon_html else "", removable=not single, compact=compact)
+            _pill_html(
+                value,
+                pill_icon_html(value) if pill_icon_html else "",
+                removable=not single,
+                compact=compact,
+                label=pill_label(value) if pill_label else None,
+            )
             for value in current
             if value
         )
@@ -2584,6 +3037,7 @@ def _pill_select_row_trigger_html(
     *,
     single: bool,
     pill_icon_html: Callable[[str], str] | None = None,
+    pill_label: Callable[[str], str] | None = None,
     value_field_name: str = "value",
     on_select: str | None = None,
     placeholder: str = "(none)",
@@ -2619,6 +3073,7 @@ def _pill_select_row_trigger_html(
         template_id,
         single=single,
         pill_icon_html=pill_icon_html,
+        pill_label=pill_label,
         value_field_name=value_field_name,
         on_select=on_select,
         placeholder=placeholder,
@@ -2735,7 +3190,17 @@ def _field_editor_html(
         if field == "labels":
             options = [label for label, _ in label_counts(project_scoped_items)]
         else:
-            options = [name for name, _ in component_counts(project_scoped_items) if name != "_unassigned"]
+            # component_counts is pure local observation (unlike
+            # _active_component_options, this native-multi-value editor has
+            # no refreshed-cache source to prefer) -- still needs the same
+            # archived-component exclusion so an archived one can't be
+            # freshly assigned here either.
+            archived = archived_component_names(jira_dir, project) if project else set()
+            options = [
+                name
+                for name, _ in component_counts(project_scoped_items)
+                if name != "_unassigned" and name.strip().lower() not in archived
+            ]
         current = _current_multi_values(fields, field)
         return _tag_input_editor_html(action, field, options, current)
 
@@ -2783,7 +3248,9 @@ def _field_editor_html(
             else _project_scoped_options(project_scoped_items, "component")
         )
         if options:
-            return _select_editor_html(action, field, options, current_value)
+            if current_value and current_value not in options:
+                options = [current_value, *options]
+            return _detail_pill_field_html(action, field, options, current_value, "detailComponent")
     elif field == "parent":
         options = selectable_field_options(
             jira_dir,
@@ -2794,84 +3261,29 @@ def _field_editor_html(
             component=hierarchy_component(issue, component_field),
             version_filters_by_component=config.version_filters_by_component,
         )
-        return _parent_field_editor_html(action, options, current_value)
-    elif field in _SELECT_ONLY_FIELDS:
-        options = selectable_field_options(
-            jira_dir,
-            field,
-            component_field,
-            current_issue=issue,
-            project=project,
-            component=hierarchy_component(issue, component_field),
-            version_filters_by_component=config.version_filters_by_component,
+        values, labels = _parent_pill_options(options)
+        if current_value and current_value not in values:
+            values.append(current_value)
+            labels[current_value] = current_value
+        return _detail_pill_field_html(action, "parent", values, current_value, "detailParent", label_map=labels)
+    elif field == "fixVersions":
+        # Same fix_version_groups the Items list's own fixVersion widget
+        # calls (render_items_page's fix_version_groups_for) -- both pages
+        # now offer the exact same Released/Unreleased-grouped options the
+        # exact same way, instead of this page going through
+        # selectable_field_options' own separate (ungrouped, released-
+        # hidden-by-default) logic.
+        observed = {version for scoped_item in project_scoped_items for version in (scoped_item.get("fixVersions") or [])}
+        groups = fix_version_groups(jira_dir, project, observed) if project else []
+        # A real (if rare) issue can carry more than one fix version --
+        # current_value above is editable_field_value's own comma-joined
+        # string of ALL of them, which would collapse a multi-valued issue
+        # down to just one on the next save. _current_multi_values keeps
+        # them as a real list instead.
+        return _detail_pill_multi_field_html(
+            action, field, _current_multi_values(fields, field), "detailFixVersions", groups=groups
         )
-        if options:
-            if field == "fixVersions":
-                # A real (if rare) issue can carry more than one fix
-                # version -- current_value above is editable_field_value's
-                # own comma-joined string of ALL of them, which never
-                # matches a single <option> and would silently collapse
-                # a multi-valued issue down to just one on the next save.
-                # _current_multi_values keeps them as a real list instead.
-                return _multi_select_editor_html(action, field, options, _current_multi_values(fields, field))
-            return _select_editor_html(action, field, options, current_value)
     return _text_editor_html(action, field, current_value, multiline=field == "description")
-
-
-def _status_select_widget_html(
-    action: str,
-    status_options: list[str],
-    current_status: str,
-    done_statuses: list[str],
-    resolution_options: list[str],
-    *,
-    extra_hidden: str = "",
-) -> str:
-    options_html = "".join(
-        f'<option value="{html.escape(status)}"{" selected" if status == current_status else ""}>{html.escape(status)}</option>'
-        for status in status_options
-    )
-    done_json = html.escape(json.dumps(done_statuses), quote=True)
-    resolution_options_html = "".join(
-        f'<option value="{html.escape(resolution)}">{html.escape(resolution)}</option>' for resolution in resolution_options
-    )
-    # Auto-submits on change like every other field -- but a transition
-    # into a Done-category status also needs a resolution, so rather than
-    # always showing a resolution select nobody needs most of the time,
-    # this reveals one right at the moment of transition (mirroring Jira's
-    # own workflow transition screen). Was a native prompt() (free-text,
-    # no validation against real resolution names) -- now a real <select>
-    # of this instance's own observed resolutions (same local-observation
-    # pattern status_options/done_statuses above already use), matching
-    # every other dropdown on this page rather than a one-off text box.
-    # Picking "(none)" (an explicit, real option -- not just leaving the
-    # select untouched) submits with a blank resolution, same as typing
-    # nothing into the old prompt() and hitting OK.
-    on_change = (
-        "var done=JSON.parse(this.dataset.done);"
-        "var picker=this.form.querySelector('.resolution-picker');"
-        "if(done.indexOf(this.value)!==-1){"
-        "picker.style.display='';"
-        "picker.querySelector('select').focus();"
-        "}else{"
-        "picker.style.display='none';"
-        "picker.querySelector('select').value='';"
-        "this.form.submit();"
-        "}"
-    )
-    return f"""
-    <form method="post" action="{action}">
-      {extra_hidden}
-      <select name="status" data-done="{done_json}" onchange="{on_change}">{options_html}</select>
-      <span class="resolution-picker" style="display: none;">
-        <select name="resolution" onchange="this.form.submit()">
-          <option value="" disabled selected>Resolution…</option>
-          <option value="">(none)</option>
-          {resolution_options_html}
-        </select>
-      </span>
-    </form>
-    """
 
 
 def _status_pill_widget_html(
@@ -2883,13 +3295,15 @@ def _status_pill_widget_html(
     *,
     extra_hidden: str = "",
 ) -> str:
-    """The Items list's unified-pill-select version of
-    _status_select_widget_html (still used by the Detail page, untouched)
-    -- same behavior, auto-submits on a plain status change but reveals a
-    resolution picker first for a transition into a Done-category status
-    (see STATUS_PILL_SCRIPT's jiraWbStatusSelected) -- composed from two
-    _pill_select_div_html instances sharing one <form> instead of two
-    native <select>s, since status and resolution submit together."""
+    """The unified pill-select version of the status widget -- shared by
+    the Items list (_status_pill_widget_html called directly, per-project
+    templates) and the Detail page (_status_pill_form_html, its own
+    inline-embedded templates) -- auto-submits on a plain status change
+    but reveals a resolution picker first for a transition into a
+    Done-category status (see STATUS_PILL_SCRIPT's jiraWbStatusSelected),
+    composed from two _pill_select_div_html instances sharing one <form>
+    instead of two native <select>s, since status and resolution submit
+    together."""
     done_json = html.escape(json.dumps(done_statuses), quote=True)
     status_div = _pill_select_div_html(
         [current_status] if current_status else [],
@@ -2917,13 +3331,18 @@ def _status_pill_widget_html(
     """
 
 
-def _status_form_html(
+def _status_pill_form_html(
     jira_dir: Path,
     key: str,
     issue: dict[str, Any],
     project_scoped_items: list[dict[str, Any]],
     resolution_options: list[str],
 ) -> str:
+    """Detail-page counterpart to the Items list's own status pill widget
+    -- there's only ever one item on this page, so its own <template>s are
+    embedded inline right alongside the widget instead of being deduped/
+    shared across rows the way the Items list's ensure_pill_template
+    registry does."""
     fields = as_dict(issue.get("fields"))
     current_status = display_name(fields.get("status"))
     status_options = _project_scoped_options(project_scoped_items, "status")
@@ -2931,9 +3350,18 @@ def _status_form_html(
         status_options = [current_status, *status_options]
     categories = observed_status_category_map(jira_dir)
     done_statuses = [status for status in status_options if categories.get(status) == "done"]
-    return _status_select_widget_html(
-        f"/items/{html.escape(key)}/status", status_options, current_status, done_statuses, resolution_options
+    # A leading "" entry (rendered as "(none)" by the shared template
+    # renderer's own empty-label fallback) lets a status transition to
+    # Done submit with no resolution, or clear one already set -- same
+    # convention the Items list's own resolution_options already carries
+    # (see render_items_page).
+    resolution_template_options = ["", *resolution_options]
+    status_template = _pill_select_options_template_html("detailStatus", status_options, single=True)
+    resolution_template = _pill_select_options_template_html("detailResolution", resolution_template_options, single=True)
+    widget = _status_pill_widget_html(
+        f"/items/{html.escape(key)}/status", "detailStatus", current_status, done_statuses, "detailResolution"
     )
+    return status_template + resolution_template + widget
 
 
 def _comment_row_html(key: str, row: dict[str, str]) -> str:
@@ -3173,7 +3601,7 @@ def render_item_detail_page(
         (
             "Status",
             "status",
-            _status_form_html(jira_dir, key, issue, project_scoped_items, observed_field_options(jira_dir, "resolution"))
+            _status_pill_form_html(jira_dir, key, issue, project_scoped_items, observed_field_options(jira_dir, "resolution"))
             if "status" in editable_fields
             else display_value("status"),
         ),
@@ -3184,10 +3612,56 @@ def render_item_detail_page(
             cell(component_editable_key, html.escape(hierarchy_component(issue, component_field))),
         ),
         ("Assignee", "assignee", assignee_field_html),
-        ("Reporter", None, display_value("reporter")),
         ("Fix versions", "fixVersions", cell("fixVersions")),
         ("Parent", "parent", cell("parent", parent_link)),
     ]
+    # Jira's own issue links (Blocks/Is blocked by/Relates to/Duplicates/
+    # ...) -- "dependencies" in the broader sense, not just the
+    # parent/child hierarchy above. Already part of a regular sync
+    # (fields="*all" covers fields.issuelinks), so this needs no extra
+    # fetching; one grid row per distinct link phrase, right next to
+    # Parent since both are "how this issue relates to others" fields.
+    # Never editable here (read-only display only, matching how the CLI's
+    # own detail_field_rows treats these) -- managing links isn't wired up
+    # in this app yet.
+    for phrase, linked_keys in issue_link_groups(issue):
+        linked_html = ", ".join(
+            f'<a href="/items/{html.escape(linked_key)}">{html.escape(linked_key)}</a>' for linked_key in linked_keys
+        )
+        grid_fields.append((phrase.capitalize(), None, linked_html))
+    # Created/Updated/Resolved each paired with a "who" -- Reporter is
+    # real, already-synced data for Created; the other two have no such
+    # field on the issue itself (Jira only exposes *when*, never *who*,
+    # for an update or a resolution -- see last_changed_by/resolved_by's
+    # own docstrings), so those fall back to the date alone when the
+    # issue's own embedded changelog can't answer it (too old a sync
+    # before expand="changelog" existed, or a changelog with more entries
+    # than fit in one page -- see _changelog_histories).
+    def dated_who(date_display: str, who: str) -> str:
+        return f"{date_display} by {who}" if who else date_display
+
+    created_value = dated_who(format_display_datetime(fields.get("created")), display_value("reporter"))
+    grid_fields.append(("Created / Reporter", None, created_value))
+    updated_value = dated_who(format_display_datetime(fields.get("updated")), last_changed_by(issue))
+    grid_fields.append(("Updated / Who", None, updated_value))
+    # Jira's own "Resolved" timestamp (fields.resolutiondate) -- set the
+    # moment a resolution is assigned, not merely when the status last
+    # changed category (statusCategoryChangeDate can move for other
+    # reasons too, e.g. a workflow transition through a Done-category
+    # status and back) -- the same field Jira's own issue view itself
+    # labels "Resolved". Omitted entirely for an issue that's never been
+    # resolved, rather than showing an empty row for the common case.
+    resolved_display = format_display_datetime(fields.get("resolutiondate"))
+    if resolved_display:
+        grid_fields.append(("Resolved / Who", None, dated_who(resolved_display, resolved_by(issue))))
+    # The resolution itself (Won't Do, Fixed, Duplicate, ...) -- Jira
+    # tracks this separately from the "Resolved" timestamp above (an issue
+    # is resolved with a resolution, the date is just when that happened),
+    # so both are shown, each omitted for an issue that's never been
+    # resolved rather than showing an empty row.
+    resolution_display = display_value("resolution")
+    if resolution_display:
+        grid_fields.append(("Resolution", None, resolution_display))
     grid_html = "".join(
         f'<div class="detail-field{" modified" if field_key in modified_fields else ""}">'
         f"<label>{html.escape(label)}{modified_badge(field_key)}</label>{value}</div>"
@@ -3195,6 +3669,51 @@ def render_item_detail_page(
     )
     labels_class = "detail-field-full modified" if "labels" in modified_fields else "detail-field-full"
     labels_html = f'<div class="{labels_class}"><label>Labels{modified_badge("labels")}</label>{cell("labels")}</div>'
+
+    # An Epic's own children (or any issue's, in principle -- this just
+    # asks "does anything point at this issue as its parent", not "is this
+    # issue itself an Epic") -- shown ahead of Labels since knowing what's
+    # actually under this issue matters more than its tags. child_issues
+    # does a whole-tree scan (every synced issue's own issue.json+shadow),
+    # same cost the CLI's own hierarchy_section already accepts for this.
+    children = child_issues(jira_dir, key)
+    children_html = ""
+    if children:
+        children_rows = "".join(
+            f'<li><a href="/items/{html.escape(display_name(child.get("key")))}">'
+            f'{html.escape(display_name(child.get("key")))}</a> '
+            f'{html.escape(display_name(as_dict(child.get("fields")).get("summary")))} '
+            f'<span class="child-status">({html.escape(display_name(as_dict(child.get("fields")).get("status")))})</span></li>'
+            for child in children
+        )
+        children_html = (
+            f'<div class="detail-field-full"><label>Children ({len(children)})</label>'
+            f'<ul class="detail-children">{children_rows}</ul></div>'
+        )
+
+    # Read-only "jump to related item" navigation into Freshdesk -- see the
+    # cross-source links plan. Only ever renders a link once
+    # find_existing_ticket confirms that ticket is actually synced
+    # locally; no known-id filtering beforehand (unlike the Jira-key
+    # direction) since any number here could plausibly be a real ticket.
+    from .freshdesk import find_existing_ticket, freshdesk_dir
+
+    raw_description = fields.get("description")
+    description_plain = text_from_adf(raw_description) if isinstance(raw_description, dict) else display_name(raw_description)
+    linked_freshdesk_ids = [
+        ticket_id
+        for ticket_id in linked_freshdesk_ticket_ids(description_plain, comments_text(jira_dir, key, shadow))
+        if find_existing_ticket(freshdesk_dir(jira_dir), ticket_id) is not None
+    ]
+    linked_freshdesk_html = ""
+    if linked_freshdesk_ids:
+        linked_freshdesk_rows = "".join(
+            f'<li><a href="/items/FD-{ticket_id}">FD-{ticket_id}</a></li>' for ticket_id in linked_freshdesk_ids
+        )
+        linked_freshdesk_html = (
+            f'<div class="detail-field-full"><label>Linked Freshdesk tickets</label>'
+            f'<ul class="detail-children">{linked_freshdesk_rows}</ul></div>'
+        )
 
     description_value = display_name(fields.get("description")) if "description" not in editable_fields else ""
     description_html = (
@@ -3262,18 +3781,39 @@ def render_item_detail_page(
     # page (Type/Priority are editable) -- no point shipping JS a
     # read-only view of this page will never call.
     icon_select_script = ICON_SELECT_SCRIPT if ("type" in editable_fields or "priority" in editable_fields) else ""
+    # Same idea for the pill-select widgets (Status/Component/Parent, see
+    # _status_pill_form_html/_detail_pill_field_html) -- coexists with
+    # ICON_SELECT_SCRIPT above (Type/Priority/Assignee/Labels stay on the
+    # older icon-select widget on this page for now, distinct function
+    # names on both sides, no conflict).
+    pill_select_script = (
+        PILL_SELECT_SCRIPT + STATUS_PILL_SCRIPT
+        if (
+            "status" in editable_fields
+            or component_editable_key in editable_fields
+            or "parent" in editable_fields
+            or "fixVersions" in editable_fields
+        )
+        else ""
+    )
     push_pending_script = PUSH_PENDING_SCRIPT if shadow is not None else ""
+    # PARENT/ITEM when a parent exists (the parent half links to its own
+    # Detail page, same href the grid's own Parent row already uses) --
+    # otherwise just the item's own key, unchanged.
+    title_html = f'<a href="/items/{parent_key}">{parent_key}</a>/{escaped_key}' if parent_key else escaped_key
 
     body = f"""
     <header>
       <p><a href="/">Back to items</a></p>
-      <h1>{escaped_key}</h1>
+      <h1>{title_html}</h1>
       {flash_banner}
       {read_only_notice}
       {revert_push}
     </header>
     <div class="{summary_class}">{summary_html}{modified_badge("summary")}</div>
     <div class="detail-fields">{grid_html}</div>
+    {children_html}
+    {linked_freshdesk_html}
     {labels_html}
     <h2>Description{modified_badge("description")}</h2>
     <div class="{description_class}">{description_html}</div>
@@ -3281,7 +3821,132 @@ def render_item_detail_page(
     {comment_html}
     {add_comment_form}
     {icon_select_script}
+    {pill_select_script}
     {push_pending_script}
+    """
+    return page(body, title=f"{key} - Jira Workbench", active_nav="items", form_wrapped=False)
+
+
+_FRESHDESK_PRIORITY_NAMES = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
+
+
+def render_freshdesk_detail_page(
+    jira_dir: Path,
+    config: WorkbenchConfig,
+    key: str,
+    detail: dict[str, Any],
+    *,
+    flash: str | None = None,
+    flash_kind: str | None = None,
+) -> str:
+    """A deliberately minimal, read-only Detail page for a Freshdesk
+    ticket -- distinct from render_item_detail_page rather than routed
+    through it, since that function (format_issue/other_field_rows/etc.)
+    assumes Jira's raw fields.* shape throughout. No edit widgets, no
+    push/revert -- this source is read-only for this pass (see the
+    "Freshdesk as a second source" plan)."""
+    from .freshdesk import STATUS_NAMES as FRESHDESK_STATUS_NAMES
+    from .freshdesk import freshdesk_dir
+
+    ticket = detail["ticket"]
+    escaped_key = html.escape(key)
+    base_dir = freshdesk_dir(jira_dir)
+    agents_by_id = read_json(base_dir / "agents.json") if (base_dir / "agents.json").exists() else {}
+    groups_by_id = read_json(base_dir / "groups.json") if (base_dir / "groups.json").exists() else {}
+    status_names = read_json(base_dir / "statuses.json") if (base_dir / "statuses.json").exists() else {}
+    if not isinstance(agents_by_id, dict):
+        agents_by_id = {}
+    if not isinstance(groups_by_id, dict):
+        groups_by_id = {}
+    if not isinstance(status_names, dict):
+        status_names = {}
+    group_name = groups_by_id.get(str(ticket.get("group_id")), "") if ticket.get("group_id") else ""
+    responder = agents_by_id.get(str(ticket.get("responder_id")), "") if ticket.get("responder_id") else ""
+    # Only present when the ticket was synced with ?include=requester (see
+    # FreshdeskClient.list_tickets) -- a nested object, not flat ticket
+    # fields, so a ticket.json synced before that param existed will just
+    # show these two rows blank until the next resync, not crash.
+    requester = ticket.get("requester") if isinstance(ticket.get("requester"), dict) else {}
+    requester_name = requester.get("name") or ""
+    requester_email = requester.get("email") or ""
+
+    def field(label: str, value: Any) -> str:
+        text = html.escape(str(value)) if value not in (None, "") else ""
+        return f'<div class="detail-field"><label>{html.escape(label)}</label>{text}</div>'
+
+    status_name = status_names.get(str(ticket.get("status"))) or FRESHDESK_STATUS_NAMES.get(
+        ticket.get("status"), f"Status {ticket.get('status')}"
+    )
+    priority_name = _FRESHDESK_PRIORITY_NAMES.get(ticket.get("priority"), "")
+    tags = ticket.get("tags") if isinstance(ticket.get("tags"), list) else []
+    grid_html = "".join(
+        [
+            field("Status", status_name),
+            field("Priority", priority_name),
+            field("Type", ticket.get("type")),
+            field("Group", group_name),
+            field("Responder", responder),
+            field("Requester", requester_name),
+            field("Requester email", requester_email),
+            field("Updated", ticket.get("updated_at")),
+            field("Due by", ticket.get("due_by")),
+            field("Tags", ", ".join(str(tag) for tag in tags)),
+        ]
+    )
+
+    description_html = ticket.get("description") or html.escape(str(ticket.get("description_text") or ""))
+
+    conversation_rows = "".join(
+        f'<li><p><strong>{html.escape(str(conversation.get("updated_at") or conversation.get("created_at") or ""))}'
+        f"</strong></p><div>{conversation.get('body') or html.escape(str(conversation.get('body_text') or ''))}</div></li>"
+        for conversation in detail["conversations"]
+        if isinstance(conversation, dict)
+    )
+    comment_html = f'<ul class="detail-children">{conversation_rows}</ul>' if conversation_rows else "<p>No conversation yet.</p>"
+
+    # Read-only "jump to related item" navigation -- see the cross-source
+    # links plan. known_projects (not a directory scan) is what keeps this
+    # from treating a coincidentally similar-shaped id from an unrelated
+    # system (this account's own Craft.io idea ids look exactly like a
+    # Jira key) as a real link; find_existing_issue below is what keeps it
+    # from ever rendering a link to a Jira issue that isn't actually
+    # synced locally.
+    known_projects = {project.key for project in config.resolved_projects()}
+    linked_keys = [
+        jira_key
+        for jira_key in linked_jira_keys(ticket, detail["conversations"], known_projects)
+        if find_existing_issue(jira_dir / "components", jira_key) is not None
+    ]
+    linked_jira_html = ""
+    if linked_keys:
+        linked_rows = "".join(
+            f'<li><a href="/items/{html.escape(jira_key)}">{html.escape(jira_key)}</a></li>' for jira_key in linked_keys
+        )
+        linked_jira_html = (
+            f'<div class="detail-field-full"><label>Linked Jira issues</label>'
+            f'<ul class="detail-children">{linked_rows}</ul></div>'
+        )
+
+    flash_banner = ""
+    if flash:
+        kind = flash_kind or "success"
+        flash_banner = f'<p class="flash flash-{html.escape(kind)}">{html.escape(flash)}</p>'
+
+    body = f"""
+    <header>
+      <p><a href="/">Back to items</a></p>
+      <h1>{escaped_key}</h1>
+      {flash_banner}
+      <p><em>This is a Freshdesk ticket -- read-only in this workbench.</em></p>
+    </header>
+    <div class="detail-fields">{grid_html}</div>
+    {linked_jira_html}
+    <h2>Subject</h2>
+    <p>{html.escape(str(ticket.get("subject") or ""))}</p>
+    <h2>Description</h2>
+    <div>{description_html}</div>
+    <h2>Conversation</h2>
+    {comment_html}
     """
     return page(body, title=f"{key} - Jira Workbench", active_nav="items", form_wrapped=False)
 
@@ -3378,15 +4043,81 @@ def _parent_select(options: list[str], current: str) -> str:
     return f'<select name="parent">{_parent_option_tags(options, current)}</select>'
 
 
-def _parent_field_editor_html(action: str, options: list[str], current: str) -> str:
-    """Detail page version -- its own independent auto-submitting form,
-    matching every other single-value field editor on that page."""
-    return f"""
-    <form method="post" action="{action}">
-      <input type="hidden" name="field" value="parent">
-      <select name="value" onchange="this.form.submit()">{_parent_option_tags(options, current)}</select>
-    </form>
-    """
+def _parent_pill_options(options: list[str]) -> tuple[list[str], dict[str, str]]:
+    """parent_options()/selectable_field_options() return "Type: KEY
+    summary" display strings with no separate machine value at all -- the
+    pill-select widget needs the two split apart: a bare issue key as the
+    real value (what build_create_fields/encode_edit_value expect on
+    submit, matching _parent_option_tags' own native-<option> value), and
+    the type's emoji + summary as the displayed label (see _pill_html's
+    own `label` override) -- Parent is the one field migrated to this
+    widget so far where the submitted value and the shown text were never
+    the same string. A leading "" value represents "no parent" (rendered
+    as "(none)" by the widget's own empty-label fallback, same convention
+    every other single-select pill field already uses)."""
+    values: list[str] = [""]
+    labels: dict[str, str] = {}
+    seen_keys: set[str] = set()
+    for option in options:
+        if option == "(none)":
+            continue
+        key = issue_key_from_text(option) or option.split(" ", 1)[0]
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        type_part, _, rest = option.partition(":")
+        emoji = TYPE_EMOJI.get(type_part.strip().lower(), DEFAULT_TYPE_EMOJI)
+        labels[key] = f"{emoji} {rest.strip()}".strip() or option
+        values.append(key)
+    return values, labels
+
+
+def _detail_pill_field_html(
+    action: str,
+    field: str,
+    options: list[str],
+    current: str,
+    template_id: str,
+    *,
+    pill_icon_html: Callable[[str], str] | None = None,
+    label_map: dict[str, str] | None = None,
+    placeholder: str = "(none)",
+) -> str:
+    """A Detail-page single-select field using the same unified pill-select
+    widget the Items list uses (see _pill_select_row_trigger_html) --
+    there's only ever one item on this page, so its own <template> is
+    embedded inline right alongside the widget instead of being deduped/
+    shared across rows the way the Items list's ensure_pill_template
+    registry does."""
+    template_html = _pill_select_options_template_html(template_id, options, single=True, label_map=label_map)
+    widget_html = _pill_select_row_trigger_html(
+        action,
+        field,
+        [current] if current else [],
+        template_id,
+        single=True,
+        pill_icon_html=pill_icon_html,
+        pill_label=(lambda value: (label_map or {}).get(value, value)) if label_map else None,
+        placeholder=placeholder,
+    )
+    return template_html + widget_html
+
+
+def _detail_pill_multi_field_html(
+    action: str, field: str, current: list[str], template_id: str, *, groups: list[tuple[str, list[str]]]
+) -> str:
+    """Detail-page multi-select field using the same unified pill-select
+    widget the Items list uses -- see _detail_pill_field_html for the
+    single-select case this mirrors. `groups` (Fix Versions is the only
+    field that needs this so far, see fix_version_groups) renders
+    Released/Unreleased section headers, matching Jira's own Fix Version
+    dropdown look -- and, just as importantly, matching the Items list's
+    own fixVersion widget exactly, instead of the two pages showing
+    different option sets via two different mechanisms."""
+    flattened = [name for _, names in groups for name in names]
+    template_html = _pill_select_options_template_html(template_id, flattened, single=False, groups=groups)
+    widget_html = _pill_select_row_trigger_html(action, field, current, template_id, single=False)
+    return template_html + widget_html
 
 
 def _strip_sentinel(value: str, sentinel: str) -> str:
@@ -3686,7 +4417,7 @@ def _boards_rows(boards: list[dict[str, Any]]) -> str:
             f"<td><code>{detail}</code></td>"
             "</tr>"
         )
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    return f'<table class="meta-table"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
 def _generic_rows(items: list[dict[str, Any]], columns: list[str]) -> str:
@@ -3695,7 +4426,7 @@ def _generic_rows(items: list[dict[str, Any]], columns: list[str]) -> str:
     for item in items:
         cells = "".join(f"<td>{html.escape(str(item.get(c, '')))}</td>" for c in columns)
         body_rows.append(f"<tr>{cells}</tr>")
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    return f'<table class="meta-table"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
 def _filter_by_name(
@@ -3718,30 +4449,50 @@ def _filter_by_name(
     return [item for item in items if needle in get_name(item).lower()]
 
 
-def _components_rows(components: list[dict[str, Any]]) -> str:
+def _components_rows(components: list[dict[str, Any]], project: str, archived_names: set[str]) -> str:
     # Unlike versions/boards, a component dict's shape depends on where it
     # was loaded from: a manifest usage summary uses "component"/"count",
     # while a custom field's option cache (or the native Jira components
     # API) uses "name"/"id"/"active"/"total" -- component_name() and the
     # total/count fallback below normalize across both rather than
     # rendering blank cells for whichever shape wasn't used this time.
-    head = "<th>Name</th><th>ID</th><th>Active</th><th>Total</th>"
+    #
+    # "Archived" here is jira-wb's own local annotation (see
+    # metadata.set_component_archived), not a Jira-sourced field like a
+    # version's -- archived_names is looked up once by the caller rather
+    # than read from the component dict itself. Archived components stay
+    # listed (per the "manage them here" decision) rather than disappearing
+    # from this admin page the way they do from the Items list/assignment
+    # dropdowns.
+    head = "<th>Name</th><th>ID</th><th>Active</th><th>Total</th><th>Archived</th><th>Actions</th>"
     body_rows = []
     for component in components:
         name = component_name(component)
+        is_archived = name.strip().lower() in archived_names
         total = component.get("total")
         if total is None:
             total = component.get("count")
         active = component.get("active")
+        project_field = f'<input type="hidden" name="project" value="{html.escape(project)}">'
+        name_field = f'<input type="hidden" name="name" value="{html.escape(name)}">'
+        actions = f"""
+        <form method="post" action="/meta/components/archive" style="display:inline-block">
+          {project_field}{name_field}
+          <input type="hidden" name="archived" value="{"0" if is_archived else "1"}">
+          <button type="submit">{"Unarchive" if is_archived else "Archive"}</button>
+        </form>
+        """
         body_rows.append(
             "<tr>"
             f"<td>{html.escape(name)}</td>"
             f"<td>{html.escape(str(component.get('id') or ''))}</td>"
             f"<td>{html.escape(str(active)) if active is not None else ''}</td>"
             f"<td>{html.escape(str(total)) if total is not None else ''}</td>"
+            f"<td>{'Archived' if is_archived else ''}</td>"
+            f"<td>{actions}</td>"
             "</tr>"
         )
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    return f'<table class="meta-table"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
 def _versions_rows(versions: list[dict[str, Any]], project: str) -> str:
@@ -3777,11 +4528,11 @@ def _versions_rows(versions: list[dict[str, Any]], project: str) -> str:
             f"<td>{name}</td>"
             f"<td>{identifier}</td>"
             f"<td>{html.escape(str(version.get('released', '')))}</td>"
-            f"<td>{html.escape(str(version.get('archived', '')))}</td>"
+            f"<td>{html.escape(str(is_archived_version(version)))}</td>"
             f"<td>{actions}</td>"
             "</tr>"
         )
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    return f'<table class="meta-table"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
 def _add_version_form(project: str) -> str:
@@ -3864,7 +4615,7 @@ def _boards_rows_with_actions(boards: list[dict[str, Any]], project: str) -> str
             f"<td>{toggle_form}{delete_form}</td>"
             "</tr>"
         )
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    return f'<table class="meta-table"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
 def _add_local_board_form(project: str) -> str:
@@ -3903,7 +4654,7 @@ def _labels_rows(counts: list[tuple[str, int]], project: str) -> str:
         </form>
         """
         body_rows.append(f"<tr><td>{escaped_label}</td><td>{count}</td><td>{actions}</td></tr>")
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    return f'<table class="meta-table"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
 def _label_bulk_edit_flash(result: LabelBulkEditResult, action_desc: str) -> tuple[str, str]:
@@ -3935,6 +4686,31 @@ META_SECTIONS: tuple[tuple[str, str], ...] = (
     ("labels", "Labels"),
 )
 
+# Versions/Components/Labels all currently render via Jira-specific data
+# paths for the FRESHDESK pseudo-project: Versions/Components have no
+# Freshdesk equivalent at all (meta_versions_data/meta_components_data
+# fetch real Jira version/component objects, always empty for it); Labels
+# is worse than merely empty -- meta_labels_page filters
+# load_manifest_items, which is Jira-only (see the "Freshdesk as a second
+# source" plan's own key finding), so it would silently claim "no labels
+# found" even though Freshdesk tickets' tags really are mapped to labels
+# elsewhere. Boards is the one section already genuinely correct for it
+# (local boards, see the "Local boards for Freshdesk" plan). Rather than
+# show three sections that are empty-at-best and misleading-at-worst, Meta
+# only ever offers Boards for this pseudo-project.
+_FRESHDESK_META_SECTIONS = frozenset({"boards"})
+
+
+def _meta_sections_for(project: str | None) -> tuple[tuple[str, str], ...]:
+    if project == "FRESHDESK":
+        return tuple((key, label) for key, label in META_SECTIONS if key in _FRESHDESK_META_SECTIONS)
+    return META_SECTIONS
+
+
+def _default_meta_section(project: str | None) -> str:
+    sections = _meta_sections_for(project)
+    return sections[0][0] if sections else "versions"
+
 
 def _meta_sidebar(projects: list[str], project: str | None, section: str | None) -> str:
     """The Meta area's own two-tier nav, distinct from the Items page's
@@ -3944,11 +4720,15 @@ def _meta_sidebar(projects: list[str], project: str | None, section: str | None)
     as two separate <nav> blocks rather than folding everything onto one
     page, since versions/components/boards for a real project can each run
     long enough that showing all three at once just becomes noise."""
-    default_section = section or "versions"
-
     def project_link(key: str) -> str:
         css_class = ' class="active"' if key == project else ""
-        href = f"/meta/{default_section}?{urlencode({'project': key})}"
+        # Stay on the current section when it applies to the target
+        # project too (e.g. switching SAT -> PLAT while on Boards); fall
+        # back to that project's own default otherwise, so switching to
+        # FRESHDESK while on Versions/Components/Labels lands on Boards
+        # instead of a hidden-from-nav-but-still-reachable empty page.
+        target_section = section if section in dict(_meta_sections_for(key)) else _default_meta_section(key)
+        href = f"/meta/{target_section}?{urlencode({'project': key})}"
         return f'<a href="{href}"{css_class}>{html.escape(key)}</a>'
 
     projects_nav = f"""
@@ -3969,17 +4749,22 @@ def _meta_sidebar(projects: list[str], project: str | None, section: str | None)
     sections_nav = f"""
     <div class="sidebar-section"><label>{html.escape(project)}</label></div>
     <nav class="sidebar-nav">
-      {"".join(section_link(key, label) for key, label in META_SECTIONS)}
+      {"".join(section_link(key, label) for key, label in _meta_sections_for(project))}
     </nav>
     """
     return projects_nav + sections_nav
 
 
 def render_meta_projects_page(projects: list[str], section: str | None = None) -> str:
-    default_section = section or "versions"
+    # When landing here from a specific section's own route (e.g. someone
+    # visited /meta/versions with no ?project= yet), a project that
+    # doesn't support that section (FRESHDESK, for versions/components/
+    # labels) is left off the list entirely rather than offered as a link
+    # to its own hidden-from-nav empty page.
     links = "".join(
-        f'<li><a href="/meta/{default_section}?{urlencode({"project": p})}">{html.escape(p)}</a></li>'
+        f'<li><a href="/meta/{section or _default_meta_section(p)}?{urlencode({"project": p})}">{html.escape(p)}</a></li>'
         for p in projects
+        if section is None or section in dict(_meta_sections_for(p))
     )
     body = f"""
     <header><h1>Meta</h1></header>
@@ -4030,6 +4815,196 @@ def render_meta_section_page(
     )
 
 
+# Claude/Codex answers are always Markdown-formatted prose (headers via
+# bold, bullet lists, horizontal rules, code spans) -- rendering them as
+# plain html.escape()'d text collapses all of that into one unreadable
+# run-on line, since HTML ignores source newlines. html=False keeps this
+# safe against an answer that happens to contain something that looks
+# like a raw HTML/script tag (unlikely from a local CLI's own output, but
+# this still renders straight into a browser) -- such text is escaped and
+# shown literally instead of being interpreted as markup.
+_ANSWER_MARKDOWN = MarkdownIt("commonmark", {"html": False})
+
+
+def _render_assistant_answer(text: str) -> str:
+    return _ANSWER_MARKDOWN.render(text)
+
+
+def _assistant_conversations_path(jira_dir: Path) -> Path:
+    return jira_dir / "assistant_conversations.json"
+
+
+def _load_assistant_conversations(jira_dir: Path) -> dict[str, dict[str, Any]]:
+    """Restores completed conversations from the last time this process
+    (or a previous one) wrote them -- see _save_assistant_conversations.
+    Only the settled fields are ever persisted (engine/turns/
+    engine_session_id); "status" always comes back "done" and "steps"/
+    "error" always come back empty -- a conversation that was still
+    "running" when the server stopped has nothing meaningful to resume
+    (its subprocess is gone), so it's simply not there to load: the
+    background thread only ever persists a conversation once its current
+    turn has actually finished."""
+    path = _assistant_conversations_path(jira_dir)
+    if not path.exists():
+        return {}
+    try:
+        raw = read_json(path)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    restored: dict[str, dict[str, Any]] = {}
+    for conversation_id, value in raw.items():
+        if not isinstance(value, dict) or not isinstance(value.get("turns"), list):
+            continue
+        restored[conversation_id] = {
+            "engine": value.get("engine"),
+            "status": "done",
+            "steps": [],
+            "turns": value["turns"],
+            "engine_session_id": value.get("engine_session_id"),
+            "error": None,
+        }
+    return restored
+
+
+def _save_assistant_conversations(jira_dir: Path, conversations: dict[str, dict[str, Any]]) -> None:
+    # Rewrites the whole (small -- this is exploratory Q&A history, not a
+    # growing production dataset) file each time, same "just rewrite it"
+    # pattern metadata.py's own write_board_settings already uses for its
+    # similarly small local-only JSON file. Only the settled fields are
+    # written -- see _load_assistant_conversations' own docstring for why
+    # "status"/"steps"/"error" are deliberately left out.
+    persisted = {
+        conversation_id: {
+            "engine": value["engine"],
+            "turns": value["turns"],
+            "engine_session_id": value.get("engine_session_id"),
+        }
+        for conversation_id, value in conversations.items()
+    }
+    write_json(_assistant_conversations_path(jira_dir), persisted)
+
+
+def _assistant_poll_script(conversation_id: str) -> str:
+    # A self-rescheduling fetch() loop, same idiom as this app's other
+    # inline scripts (e.g. PUSH_PENDING_SCRIPT) -- polls every ~1s while a
+    # turn is running, then does one full reload once it's done rather
+    # than building separate client-side logic to render the finished
+    # answer (the normal server-rendered "done" branch below already does
+    # that). json.dumps, not manual escaping, for a safe JS string literal.
+    return f"""
+    <script>
+    (function () {{
+      var conversationId = {json.dumps(conversation_id)};
+      function poll() {{
+        fetch('/assistant/poll?conversation=' + encodeURIComponent(conversationId))
+          .then(function (r) {{ return r.json(); }})
+          .then(function (data) {{
+            var list = document.getElementById('assistant-steps');
+            if (list) {{
+              list.innerHTML = '';
+              (data.steps || []).forEach(function (step) {{
+                var li = document.createElement('li');
+                li.textContent = step;
+                list.appendChild(li);
+              }});
+            }}
+            if (data.status === 'done') {{
+              window.location.reload();
+            }} else {{
+              setTimeout(poll, 1000);
+            }}
+          }});
+      }}
+      poll();
+    }})();
+    </script>
+    """
+
+
+def render_assistant_page(
+    conversation_id: str | None,
+    conversation: dict[str, Any] | None,
+    *,
+    flash: str | None = None,
+    flash_kind: str | None = None,
+) -> str:
+    """Ask Claude/Codex about the locally synced data -- see the "Ask
+    Claude/Codex about your local data" and "Show live progress on the
+    Assistant page" plans. Read-only: this page only ever renders a
+    question box and past turns, never an edit control."""
+    running = bool(conversation) and conversation["status"] == "running"
+    selected_engine = conversation["engine"] if conversation else ASSISTANT_ENGINES[0]
+    engine_options = "".join(
+        f'<option value="{html.escape(engine)}"{" selected" if engine == selected_engine else ""}>'
+        f"{html.escape(engine.capitalize())}</option>"
+        for engine in ASSISTANT_ENGINES
+    )
+    turns_html = ""
+    new_conversation_link = ""
+    if conversation:
+        turns_html = "".join(
+            f'<div class="assistant-turn"><p><strong>You:</strong> {html.escape(turn["question"])}</p>'
+            f'<p><strong>{html.escape(conversation["engine"].capitalize())}:</strong></p>'
+            f'<div class="assistant-answer">{_render_assistant_answer(turn["answer"])}</div></div>'
+            for turn in conversation["turns"]
+        )
+        new_conversation_link = '<p><a href="/assistant">Start a new conversation</a></p>'
+
+    flash_banner = ""
+    error = conversation.get("error") if conversation else None
+    if error or flash:
+        kind = "error" if error else (flash_kind or "error")
+        flash_banner = f'<p class="flash flash-{html.escape(kind)}">{html.escape(error or flash)}</p>'
+
+    conversation_field = (
+        f'<input type="hidden" name="conversation" value="{html.escape(conversation_id)}">' if conversation_id else ""
+    )
+
+    running_html = ""
+    poll_script = ""
+    ask_form_html = ""
+    if running:
+        running_html = f"""
+        <p><em>Asking {html.escape(conversation["engine"].capitalize())}… this can take a minute.</em></p>
+        <ul id="assistant-steps"></ul>
+        """
+        poll_script = _assistant_poll_script(conversation_id)
+    else:
+        ask_form_html = f"""
+        <form method="post" action="/assistant">
+          {conversation_field}
+          <div class="detail-field">
+            <label>Engine</label>
+            <select name="engine">{engine_options}</select>
+          </div>
+          <div class="detail-field-full">
+            <label>Question</label>
+            <textarea name="question" rows="4" required
+              placeholder="Ask about your locally synced Jira/Freshdesk data..."></textarea>
+          </div>
+          <button type="submit">Ask</button>
+        </form>
+        """
+
+    body = f"""
+    <header>
+      <p><a href="/">Back to items</a></p>
+      <h1>Assistant</h1>
+      {flash_banner}
+      <p><em>Read-only -- asks the chosen local CLI (already logged in on this machine) to look at
+      your synced Jira/Freshdesk data and answer; it can never edit anything.</em></p>
+      {new_conversation_link}
+    </header>
+    {turns_html}
+    {running_html}
+    {ask_form_html}
+    {poll_script}
+    """
+    return page(body, title="Assistant - Jira Workbench", active_nav="assistant", form_wrapped=False)
+
+
 def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None = None) -> FastAPI:
     app = FastAPI(title="Jira Workbench API")
 
@@ -4059,6 +5034,26 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         if "value" not in _rank_field_id_state:
             _rank_field_id_state["value"] = fetch_rank_field_id(client)
         return _rank_field_id_state["value"]
+
+    # In-memory only, keyed by a locally-minted id (never the engine's own
+    # session/thread id -- see the "Show live progress on the Assistant
+    # page" plan). A completed conversation's settled fields (engine/
+    # turns/engine_session_id) are persisted to assistant_conversations.json
+    # (see _save_assistant_conversations) and reloaded here on startup, so
+    # a server restart no longer silently drops history -- only a turn
+    # that was still "running" at the moment of a restart is lost (its
+    # subprocess is gone regardless of what jira-wb does).
+    #
+    # Each entry: {"engine": str, "status": "running"|"done", "steps":
+    # [str, ...] (this turn's steps so far), "turns": [{"question":...,
+    # "answer":...}, ...] (completed turns, including this one once
+    # status=="done"), "engine_session_id": str | None (for the *next*
+    # turn's --resume), "error": str | None}. Mutated from both a
+    # request-handling thread and the background thread post_assistant
+    # starts -- left unguarded by an explicit lock; the individual dict/
+    # list operations involved (key assignment, list.append) are atomic
+    # enough under the GIL for this single-local-user tool.
+    _assistant_conversations: dict[str, dict[str, Any]] = _load_assistant_conversations(jira_dir)
 
     @app.get("/api/items")
     def list_items(
@@ -4142,6 +5137,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         board_scope: str | None = None,
         swimlane: str | None = None,
         show_released: str | None = None,
+        show_archived: str | None = None,
         sort: str | None = None,
         dir: str | None = None,  # noqa: A002 -- matches the query param name
         flash: str | None = None,
@@ -4154,7 +5150,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
 
         def _apply_remembered(fields: dict[str, Any], *, keep_board: str | None) -> None:
             nonlocal project, status, component, fixVersion, assignee, pattern
-            nonlocal active, board, board_scope, swimlane, show_released, sort, dir
+            nonlocal active, board, board_scope, swimlane, show_released, show_archived, sort, dir
             project = fields["project"]
             status = fields["status"]
             component = fields["component"]
@@ -4165,6 +5161,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             board_scope = fields["board_scope"]
             swimlane = fields["swimlane"]
             show_released = fields["show_released"]
+            show_archived = fields["show_archived"]
             sort = fields["sort"]
             dir = fields["dir"]
             if keep_board is not None:
@@ -4210,10 +5207,19 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 new_board = board
                 project = status = component = fixVersion = assignee = []
                 pattern = None
-                active = "1"
+                # The synthetic "Modified Items" board exists to review
+                # locally staged edits before pushing -- Active-only
+                # defaulting on (like every real board) would silently
+                # hide exactly the modifications most worth reviewing
+                # (e.g. a status change to Done/Closed is itself the
+                # pending edit), leaving "0 of N synced items match" with
+                # no clue that the real cause is the Active-only filter,
+                # not an absence of modified items.
+                active = "0" if new_board == MODIFIED_BOARD_NAME else "1"
                 board_scope = None
                 swimlane = None
                 show_released = None
+                show_archived = None
                 sort = None
                 dir = "desc"
                 board = new_board
@@ -4230,7 +5236,11 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             if values
         }
         active_only = active == "1"
-        if not (jira_dir / "manifest.json").exists():
+        # A Freshdesk-only setup (no Jira project ever synced, so no
+        # manifest.json) is a real, if unusual, starting point -- only bail
+        # out here if there's neither a Jira manifest nor any configured
+        # Freshdesk source to show instead.
+        if not (jira_dir / "manifest.json").exists() and not config.freshdesk_sources:
             return page("<h1>Jira Workbench</h1><p>No manifest found. Run <code>jira-wb sync</code>.</p>")
         component_field = config.effective_component_field(config.default_project_key())
         from .db import count_items, reindex_items
@@ -4258,24 +5268,63 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             for field, values in field_filters.items()
             if field in {"project", "status", "component", "assignee"}
         }
+        show_archived_only = show_archived == "1"
+
+        def _archived_by_project(
+            candidate_items: list[dict[str, Any]],
+        ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+            # Built from whichever projects are actually present in the
+            # (already SQL-narrowed) candidate set, not every synced
+            # project -- same project-scoping discipline as the fix-version
+            # checklist's own per-project version lookups.
+            projects = {str(item.get("project") or "") for item in candidate_items}
+            projects.discard("")
+            return (
+                {project_name: archived_version_names(jira_dir, project_name) for project_name in projects},
+                {project_name: archived_component_names(jira_dir, project_name) for project_name in projects},
+            )
+
         if board == MODIFIED_BOARD_NAME:
             # Not a real board -- bypasses matches_board entirely in favor
             # of filter_items' own modified_only/modified_keys, which
             # nothing in this app's web GUI used until now -- and isn't a
             # board list_items' json_each check could match against either.
+            # Active-only and archived-exclusion are bypassed outright here
+            # too (active=False, show_archived=True), not just left at
+            # whatever the checkboxes say -- this board exists specifically
+            # to review every pending local edit before pushing, and a
+            # modified item can easily also be Done/Closed (that's often
+            # the edit itself) or tagged with an archived fix
+            # version/component for entirely unrelated reasons; either one
+            # silently hiding it from its own review board would defeat
+            # the board's whole purpose.
+            # Freshdesk items never carry a shadow (no edit pipeline exists
+            # for them yet), so modified_only naturally excludes them below
+            # without needing to skip merging them in here.
             narrowed = filtered_manifest_items(jira_dir, component_field, field_filters=sql_field_filters)
+            narrowed += _freshdesk_indexed_items(jira_dir, config)
+            archived_names, archived_component_names_by_project = _archived_by_project(narrowed)
             filtered = filter_items(
                 narrowed,
                 field_filters=field_filters,
                 pattern=pattern,
-                active=active_only,
+                active=False,
                 modified_only=True,
                 modified_keys=modified_issue_keys(jira_dir),
+                show_archived=True,
+                archived_names_by_project=archived_names,
+                archived_component_names_by_project=archived_component_names_by_project,
             )
         else:
             narrowed = filtered_manifest_items(
                 jira_dir, component_field, field_filters=sql_field_filters, board=board or None
             )
+            # An explicit board filters Freshdesk items out on their own
+            # (they always have an empty boards list, see
+            # _freshdesk_indexed_items' own docstring) -- merged in
+            # unconditionally rather than only when no board is selected.
+            narrowed += _freshdesk_indexed_items(jira_dir, config)
+            archived_names, archived_component_names_by_project = _archived_by_project(narrowed)
             filtered = filter_items(
                 narrowed,
                 field_filters=field_filters,
@@ -4283,6 +5332,9 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 active=active_only,
                 board=board or None,
                 board_scope=board_scope or None,
+                show_archived=show_archived_only,
+                archived_names_by_project=archived_names,
+                archived_component_names_by_project=archived_component_names_by_project,
             )
         show_released_only = show_released == "1"
         query: dict[str, Any] = {
@@ -4297,6 +5349,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             "board_scope": board_scope or "",
             "swimlane": normalize_swimlane(swimlane),
             "show_released": "1" if show_released_only else "",
+            "show_archived": "1" if show_archived_only else "",
             "sort": sort or "",
             "dir": dir or "desc",
         }
@@ -4330,7 +5383,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         allowed_version_names = {name.strip().lower() for name in allowed_version_names}
         return render_items_page(
             filtered,
-            count_items(jira_dir),
+            count_items(jira_dir) + len(_freshdesk_indexed_items(jira_dir, config)),
             query,
             boards,
             allowed_version_names,
@@ -4373,6 +5426,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         board_scope: str = Form(""),
         swimlane: str = Form(""),
         show_released: str = Form(""),
+        show_archived: str = Form(""),
         sort: str = Form(""),
         dir: str = Form("desc"),  # noqa: A002 -- matches the form field name
     ) -> RedirectResponse:
@@ -4397,9 +5451,10 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                     # explicitly -- matches board/board_scope's own None-
                     # clears-the-key convention above.
                     "swimlane": normalized_swimlane if normalized_swimlane != "none" else None,
-                    # show_released is deliberately not saved -- like the
-                    # TUI's own version-picker toggle, it's a transient
-                    # per-view reveal, not a persisted default.
+                    # show_released/show_archived are deliberately not
+                    # saved -- like the TUI's own version-picker toggle,
+                    # they're a transient per-view reveal, not a persisted
+                    # default.
                 },
             )
         except ConfigError as exc:
@@ -4417,6 +5472,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 "board_scope": board_scope,
                 "swimlane": normalized_swimlane,
                 "show_released": show_released,
+                "show_archived": show_archived,
                 "sort": sort,
                 "dir": dir,
             },
@@ -4725,7 +5781,12 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
     def item_page(key: str, flash: str | None = None, flash_kind: str | None = None) -> str:
         detail = item_detail_data(jira_dir, key)
         if detail is None:
-            raise HTTPException(status_code=404, detail=f"work item {key} is not synced locally")
+            freshdesk_detail = freshdesk_ticket_detail_data(jira_dir, key)
+            if freshdesk_detail is None:
+                raise HTTPException(status_code=404, detail=f"work item {key} is not synced locally")
+            return render_freshdesk_detail_page(
+                jira_dir, config, key, freshdesk_detail, flash=flash, flash_kind=flash_kind
+            )
         project = issue_project_key(detail["issue"])
         read_only = is_project_read_only(jira_dir, project)
         shadow = load_shadow(jira_dir, key)
@@ -4797,6 +5858,125 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         except ShadowError as exc:
             return _redirect_after_edit(key, flash=str(exc), flash_kind="error", return_to=return_to)
         return _redirect_after_edit(key, flash=f"Status changed to {status}", return_to=return_to)
+
+    _BULK_EDIT_FIELDS = {"status", "priority", "assignee", "component", "fixVersions"}
+
+    def _redirect_after_bulk_edit(*, flash: str, flash_kind: str = "success", return_to: str = "") -> RedirectResponse:
+        # Same shape as _redirect_after_edit, but there's no single "key"
+        # to fall back to when return_to is empty -- a bulk action always
+        # originates from the Items list, so that's the sensible home
+        # instead of a single item's own Detail page.
+        query_string = urlencode({"flash": flash, "flash_kind": flash_kind})
+        target = return_to or "/"
+        separator = "&" if "?" in target else "?"
+        return RedirectResponse(url=f"{target}{separator}{query_string}", status_code=303)
+
+    @app.post("/items/bulk-fields", dependencies=[Depends(_require_same_origin)])
+    def post_bulk_fields(
+        keys: list[str] = Form([]),
+        bulk_field: str = Form(...),
+        status_value: str = Form(""),
+        resolution: str = Form(""),
+        priority_value: str = Form(""),
+        assignee_value: str = Form(""),
+        component_value: list[str] = Form([]),
+        fixversions_value: list[str] = Form([]),
+        return_to: str = Form(""),
+    ) -> RedirectResponse:
+        # Mirrors bulk_edit_label's own per-item try/except + read-only
+        # pre-filter (service.py) -- one unsynced/read-only/failing key
+        # never aborts the rest of the batch. Unlike bulk_edit_label, this
+        # only ever stages a shadow (set_field/set_status_change), the
+        # same as every other Items-list field edit -- it does not push to
+        # Jira itself; "Review & push" is still the one place that happens.
+        # Named "bulk_field", not "field" -- the per-row widgets already
+        # use a hidden input literally named "field" (post_item_field), and
+        # reusing that name here made a substring search for one match the
+        # other (see the regression this caused in tests before this
+        # comment existed).
+        if bulk_field not in _BULK_EDIT_FIELDS:
+            raise HTTPException(status_code=400, detail=f"unsupported bulk field: {bulk_field}")
+        if bulk_field == "status":
+            selected_values = [status_value] if status_value.strip() else []
+        elif bulk_field == "priority":
+            selected_values = [priority_value] if priority_value.strip() else []
+        elif bulk_field == "assignee":
+            selected_values = [assignee_value] if assignee_value.strip() else []
+        elif bulk_field == "component":
+            selected_values = component_value
+        else:
+            selected_values = fixversions_value
+        if not selected_values:
+            return _redirect_after_bulk_edit(flash="Choose a value first", flash_kind="error", return_to=return_to)
+
+        updated = 0
+        skipped_read_only = 0
+        skipped_unsynced = 0
+        failed: list[str] = []
+        for key in {raw_key.strip() for raw_key in keys if raw_key.strip()}:
+            detail = item_detail_data(jira_dir, key)
+            if detail is None:
+                skipped_unsynced += 1
+                continue
+            project = issue_project_key(detail["issue"])
+            if is_project_read_only(jira_dir, project):
+                skipped_read_only += 1
+                continue
+            try:
+                if bulk_field == "status":
+                    categories = observed_status_category_map(jira_dir)
+                    effective_resolution = resolution.strip() if categories.get(selected_values[0]) == "done" else ""
+                    set_field(jira_dir, key, "status", selected_values[0])
+                    set_status_change(jira_dir, key, resolution=effective_resolution or None)
+                else:
+                    component_field = config.effective_component_field(project)
+                    actual_field = (component_field or "components") if bulk_field == "component" else bulk_field
+                    # A single-select project (a custom component field, or
+                    # fix_version_single_select) only ever wants one value --
+                    # the same [:1] truncation the Items list's own row
+                    # widget applies (see render_items_page) -- extra picks
+                    # from a multi-project bulk selection are silently
+                    # dropped for that item rather than rejected outright.
+                    is_single = (bulk_field == "component" and bool(component_field)) or (
+                        bulk_field == "fixVersions" and config.fix_version_single_select_project(project)
+                    )
+                    values_for_item = selected_values[:1] if is_single else selected_values
+                    encoded = encode_edit_value(
+                        actual_field, ",".join(values_for_item), component_field=component_field
+                    )
+                    set_field(jira_dir, key, actual_field, encoded)
+                updated += 1
+            except ShadowError as exc:
+                failed.append(f"{key}: {exc}")
+
+        parts = [f"Updated {updated} item(s)"]
+        if skipped_read_only:
+            parts.append(f"{skipped_read_only} skipped (read-only project)")
+        if skipped_unsynced:
+            parts.append(f"{skipped_unsynced} skipped (not synced)")
+        if failed:
+            parts.append(f"{len(failed)} failed")
+        flash_kind = "error" if failed and not updated else "success"
+        return _redirect_after_bulk_edit(flash=", ".join(parts), flash_kind=flash_kind, return_to=return_to)
+
+    @app.post("/items/bulk-revert", dependencies=[Depends(_require_same_origin)])
+    def post_bulk_revert(keys: list[str] = Form([]), return_to: str = Form("")) -> RedirectResponse:
+        # No read-only-project check, unlike post_bulk_fields -- discarding
+        # a local shadow never touches Jira, so it's never blocked by that
+        # (matches the single-item /items/{key}/revert route).
+        reverted = 0
+        skipped_unsynced = 0
+        for key in {raw_key.strip() for raw_key in keys if raw_key.strip()}:
+            if item_detail_data(jira_dir, key) is None:
+                skipped_unsynced += 1
+                continue
+            delete_shadow(jira_dir, key)
+            reverted += 1
+
+        parts = [f"Reverted {reverted} item(s)"]
+        if skipped_unsynced:
+            parts.append(f"{skipped_unsynced} skipped (not synced)")
+        return _redirect_after_bulk_edit(flash=", ".join(parts), return_to=return_to)
 
     @app.post("/items/{key}/board-position", dependencies=[Depends(_require_same_origin)])
     def post_item_board_position(
@@ -4956,7 +6136,17 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         return redirect(f"{pushed} pushed to Jira", "success")
 
     def _configured_projects() -> list[str]:
-        return [p.key for p in config.resolved_projects()]
+        # "FRESHDESK" -- the same pseudo-project freshdesk_ticket_fields
+        # already assigns every synced ticket, and the same value the
+        # Items list's own Project filter already exposes -- lets Meta >
+        # Boards (the only section a Freshdesk-scoped local board actually
+        # needs) reach a page for it. Versions/Components have no
+        # Freshdesk equivalent and just render their existing empty state
+        # for it, same as any project Jira's API has no data for.
+        projects = [p.key for p in config.resolved_projects()]
+        if config.freshdesk_sources:
+            projects.append("FRESHDESK")
+        return projects
 
     def _redirect_to_meta_section(
         section: str, project: str, *, flash: str, flash_kind: str = "success", q: str | None = None
@@ -4992,8 +6182,11 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             # can accumulate dozens of them over time, crowding out the
             # handful of current versions this page is normally opened
             # for. Hidden by default, one checkbox away when you do need
-            # to find one.
-            versions = [version for version in versions if not version.get("archived")]
+            # to find one. is_archived_version, not the raw flag -- also
+            # hides a version literally named "_archived" here, the same
+            # local archived-in-all-but-Jira's-own-flag convention every
+            # other archived-exclusion in the app already honors.
+            versions = [version for version in versions if not is_archived_version(version)]
         filtered = _filter_by_name(versions, q)
         table = _versions_rows(filtered, project) if filtered else ""
         empty_message = "No versions match that filter." if q else "No versions loaded for this project."
@@ -5084,7 +6277,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         except MetadataError:
             components = []
         filtered = _filter_by_name(components, q, name_fn=component_name)
-        table = _components_rows(filtered) if filtered else ""
+        table = _components_rows(filtered, project, archived_component_names(jira_dir, project)) if filtered else ""
         empty_message = "No components match that filter." if q else "No components loaded for this project."
         component_field = config.effective_component_field(project)
         return render_meta_section_page(
@@ -5130,6 +6323,22 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         except MetadataError as exc:
             message, flash_kind = str(exc), "error"
         return _redirect_to_meta_section("components", project, flash=message.splitlines()[0], flash_kind=flash_kind)
+
+    @app.post("/meta/components/archive", dependencies=[Depends(_require_same_origin)])
+    def post_meta_component_archive(
+        project: str = Form(...), name: str = Form(...), archived: str = Form("1")
+    ) -> RedirectResponse:
+        # Purely local -- no Jira API call at all (Jira has no archived
+        # concept for components), unlike every other /meta/*/archive-style
+        # route in this file, which all mutate real Jira state.
+        archive_on = archived == "1"
+        try:
+            set_component_archived(jira_dir, project, name, archive_on)
+            message = f"{'Archived' if archive_on else 'Unarchived'} component {name}"
+            flash_kind = "success"
+        except MetadataError as exc:
+            message, flash_kind = str(exc), "error"
+        return _redirect_to_meta_section("components", project, flash=message, flash_kind=flash_kind)
 
     @app.get("/meta/boards", response_class=HTMLResponse)
     def meta_boards_page(
@@ -5259,6 +6468,77 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             return _redirect_to_meta_section("labels", project, flash=str(exc), flash_kind="error")
         flash, flash_kind = _label_bulk_edit_flash(result, f"deleted '{label}'")
         return _redirect_to_meta_section("labels", project, flash=flash, flash_kind=flash_kind)
+
+    @app.get("/assistant", response_class=HTMLResponse)
+    def assistant_page(conversation: str | None = None, flash: str | None = None, flash_kind: str | None = None) -> str:
+        stored = _assistant_conversations.get(conversation) if conversation else None
+        return render_assistant_page(
+            conversation if stored else None, stored, flash=flash, flash_kind=flash_kind
+        )
+
+    @app.get("/assistant/poll")
+    def get_assistant_poll(conversation: str) -> dict[str, Any]:
+        # JSON only, no HTML -- used solely by ASSISTANT_POLL_SCRIPT's own
+        # fetch() loop while a turn is running. An unknown id (e.g. the
+        # server restarted mid-conversation -- the store is in-memory
+        # only) reports "done" so the poller stops rather than looping
+        # forever against an id that will never resolve.
+        stored = _assistant_conversations.get(conversation)
+        if stored is None:
+            return {"status": "done", "steps": []}
+        return {"status": stored["status"], "steps": stored["steps"]}
+
+    @app.post("/assistant", dependencies=[Depends(_require_same_origin)])
+    def post_assistant(
+        engine: str = Form(...), question: str = Form(...), conversation: str = Form("")
+    ) -> RedirectResponse:
+        question = question.strip()
+        # Cheap, free-of-a-subprocess validation up front -- assistant.ask_streaming
+        # checks these too, but doing it here means a plainly invalid
+        # request gets an immediate flash instead of a "running" page that
+        # resolves to an error a second later.
+        if engine not in ASSISTANT_ENGINES:
+            return RedirectResponse(url=f"/assistant?{urlencode({'flash': f'unknown engine: {engine!r}', 'flash_kind': 'error'})}", status_code=303)
+        if not question:
+            return RedirectResponse(url=f"/assistant?{urlencode({'flash': 'question must not be empty', 'flash_kind': 'error'})}", status_code=303)
+
+        stored = _assistant_conversations.get(conversation) if conversation else None
+        resuming = bool(stored) and stored["engine"] == engine
+        resume_id = stored.get("engine_session_id") if resuming and stored else None
+        prior_turns = stored["turns"] if resuming and stored else []
+
+        # The conversation id in the URL is always locally minted, never
+        # the engine's own session/thread id -- see the "Show live
+        # progress on the Assistant page" plan. This is what lets this
+        # route redirect immediately, before the engine has produced
+        # anything at all: it never has to wait to learn an id from the
+        # subprocess.
+        new_conversation_id = uuid.uuid4().hex
+        entry: dict[str, Any] = {
+            "engine": engine,
+            "status": "running",
+            "steps": [],
+            "turns": prior_turns,
+            "engine_session_id": None,
+            "error": None,
+        }
+        _assistant_conversations[new_conversation_id] = entry
+
+        def on_step(step: str) -> None:
+            entry["steps"].append(step)
+
+        def run() -> None:
+            result = assistant_ask_streaming(engine, jira_dir, question, resume_id=resume_id, on_step=on_step)
+            if result.error:
+                entry["error"] = result.error
+            else:
+                entry["turns"] = [*entry["turns"], {"question": question, "answer": result.answer}]
+                entry["engine_session_id"] = result.session_id
+            entry["status"] = "done"
+            _save_assistant_conversations(jira_dir, _assistant_conversations)
+
+        threading.Thread(target=run, daemon=True).start()
+        return RedirectResponse(url=f"/assistant?{urlencode({'conversation': new_conversation_id})}", status_code=303)
 
     return app
 

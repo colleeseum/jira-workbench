@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import jira_workbench.cli
+import jira_workbench.freshdesk
 import jira_workbench.service
 from jira_workbench.cli import (
     main,
@@ -140,31 +141,31 @@ def test_sync_progress_printer_rewrites_issue_progress_on_tty() -> None:
     stream = _FakeStream()
     progress = sync_progress_printer(stream)
 
-    progress("[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0")
-    progress("[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0")
-    progress("[4/6] Building manifest...")
+    progress("[3/7] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0")
+    progress("[3/7] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0")
+    progress("[6/7] Building manifest...")
 
-    assert "\r[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in stream.output
-    assert "\r[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in stream.output
-    assert "\n[4/6] Building manifest...\n" in stream.output
+    assert "\r[3/7] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in stream.output
+    assert "\r[3/7] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in stream.output
+    assert "\n[6/7] Building manifest...\n" in stream.output
 
 
 def test_sync_progress_printer_prefixes_every_line_with_the_project() -> None:
     stream = _FakeStream()
     progress = sync_progress_printer(stream, project="PLAT")
 
-    progress("[1/6] Refreshing project metadata...")
+    progress("[1/7] Refreshing project metadata...")
 
-    assert stream.output == "PLAT [1/6] Refreshing project metadata...\n"
+    assert stream.output == "PLAT [1/7] Refreshing project metadata...\n"
 
 
 def test_sync_progress_printer_project_prefix_also_applies_to_tty_rewrite() -> None:
     stream = _FakeStream()
     progress = sync_progress_printer(stream, project="PLAT")
 
-    progress("[3/6] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0")
+    progress("[3/7] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0")
 
-    assert "\rPLAT [3/6] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0" in stream.output
+    assert "\rPLAT [3/7] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0" in stream.output
 
 
 def test_sync_force_flag_threads_through_to_sync_config(tmp_path: Path, monkeypatch) -> None:
@@ -197,6 +198,119 @@ def test_sync_force_flag_threads_through_to_sync_config(tmp_path: Path, monkeypa
 
     assert captured_configs[0].force is True
     assert captured_configs[1].force is False
+
+
+def test_sync_source_freshdesk_force_flag_threads_through(tmp_path: Path, monkeypatch) -> None:
+    captured_force: list[bool] = []
+
+    def fake_sync_freshdesk_source(settings, jira_dir, client, *, force=False, progress=None):
+        captured_force.append(force)
+        from jira_workbench.freshdesk import FreshdeskSyncResult
+
+        return FreshdeskSyncResult(ticket_count=0, changed_count=0)
+
+    monkeypatch.setattr(jira_workbench.freshdesk, "FreshdeskClient", lambda settings, **kwargs: object())
+    monkeypatch.setattr(jira_workbench.freshdesk, "sync_freshdesk_source", fake_sync_freshdesk_source)
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{tmp_path / "jira"}"',
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'domain = "acme"',
+                'api_key = "key"',
+            ]
+        )
+    )
+
+    assert jira_workbench.cli.main(["--config", str(config_path), "sync", "--source", "freshdesk", "--force"]) == 0
+    assert jira_workbench.cli.main(["--config", str(config_path), "sync", "--source", "freshdesk"]) == 0
+
+    assert captured_force == [True, False]
+
+
+@pytest.mark.parametrize("source", [None, "all", "jira", "freshdesk"])
+@pytest.mark.parametrize("has_jira", [True, False])
+def test_sync_selects_configured_source_kinds(tmp_path: Path, monkeypatch, source, has_jira) -> None:
+    from jira_workbench.freshdesk import FreshdeskSyncResult
+    from jira_workbench.sync import SyncResult
+
+    calls = []
+
+    def sync_jira(config, client, progress=None):
+        calls.append(("jira", config.force))
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0)
+
+    def sync_freshdesk(settings, jira_dir, client, *, force=False, progress=None):
+        assert jira_dir == tmp_path / "jira"
+        calls.append((settings.slug, force))
+        return FreshdeskSyncResult(ticket_count=0, changed_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", sync_jira)
+    monkeypatch.setattr(jira_workbench.freshdesk, "FreshdeskClient", lambda settings, **kw: object())
+    monkeypatch.setattr(jira_workbench.freshdesk, "sync_freshdesk_source", sync_freshdesk)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'jira_dir = "{tmp_path / "jira"}"\n'
+        + ('project = "SAT"\njira_url = "https://example.atlassian.net"\n'
+           'jira_email = "user@example.com"\njira_api_token = "token"\n' if has_jira else "")
+        + '\n'.join(
+            f'[[sources]]\nkind = "freshdesk"\nslug = "{slug}"\ndomain = "acme"\napi_key = "key"'
+            for slug in ("support", "helpdesk")
+        )
+    )
+    argv = ["--config", str(config_path), "sync", "--force"]
+    if source:
+        argv += ["--source", source]
+    expected = []
+    if has_jira and source != "freshdesk":
+        expected.append(("jira", True))
+    if source != "jira":
+        expected.extend([("support", True), ("helpdesk", True)])
+    assert main(argv) == (2 if source == "jira" and not has_jira else 0)
+    assert calls == expected
+
+
+@pytest.mark.parametrize("failure", ["jira", "jira_config", "freshdesk", "ticket"])
+def test_sync_all_reports_failures_and_continues(tmp_path: Path, monkeypatch, failure) -> None:
+    from jira_workbench.freshdesk import FreshdeskError, FreshdeskSyncResult
+    from jira_workbench.sync import SyncError, SyncResult
+
+    calls = []
+
+    def sync_jira(config, client, progress=None):
+        calls.append("jira")
+        if failure == "jira":
+            raise SyncError("Jira unavailable")
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0)
+
+    def sync_freshdesk(settings, jira_dir, client, **kwargs):
+        calls.append(settings.slug)
+        if settings.slug == "support":
+            if failure == "freshdesk":
+                raise FreshdeskError("Freshdesk unavailable")
+            if failure == "ticket":
+                return FreshdeskSyncResult(ticket_count=1, changed_count=0, failed_keys=("FD-1",))
+        return FreshdeskSyncResult(ticket_count=0, changed_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", sync_jira)
+    monkeypatch.setattr(jira_workbench.freshdesk, "FreshdeskClient", lambda settings, **kw: object())
+    monkeypatch.setattr(jira_workbench.freshdesk, "sync_freshdesk_source", sync_freshdesk)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'jira_dir = "{tmp_path / "jira"}"\nproject = "SAT"\n'
+        + ('' if failure == "jira_config" else
+           'jira_url = "https://example.atlassian.net"\njira_email = "user@example.com"\njira_api_token = "token"\n')
+        + '\n'.join(
+            f'[[sources]]\nkind = "freshdesk"\nslug = "{slug}"\ndomain = "acme"\napi_key = "key"'
+            for slug in ("support", "helpdesk")
+        )
+    )
+    assert main(["--config", str(config_path), "sync"]) == (2 if failure == "jira_config" else 1)
+    assert calls == ([] if failure == "jira_config" else ["jira"]) + ["support", "helpdesk"]
 
 
 def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -295,7 +409,7 @@ def test_sync_multi_project_run_prefixes_progress_lines_with_the_project(
 
     def fake_sync_project(config, client, progress=None):
         if progress:
-            progress("[1/6] Refreshing project metadata...")
+            progress("[1/7] Refreshing project metadata...")
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
     monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
@@ -321,8 +435,8 @@ def test_sync_multi_project_run_prefixes_progress_lines_with_the_project(
 
     captured = capsys.readouterr()
     assert code == 0
-    assert "SAT [1/6] Refreshing project metadata..." in captured.err
-    assert "OTHERPROJ [1/6] Refreshing project metadata..." in captured.err
+    assert "SAT [1/7] Refreshing project metadata..." in captured.err
+    assert "OTHERPROJ [1/7] Refreshing project metadata..." in captured.err
 
 
 def test_sync_single_project_run_does_not_prefix_progress_lines(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -330,7 +444,7 @@ def test_sync_single_project_run_does_not_prefix_progress_lines(tmp_path: Path, 
 
     def fake_sync_project(config, client, progress=None):
         if progress:
-            progress("[1/6] Refreshing project metadata...")
+            progress("[1/7] Refreshing project metadata...")
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
     monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
@@ -352,8 +466,8 @@ def test_sync_single_project_run_does_not_prefix_progress_lines(tmp_path: Path, 
 
     captured = capsys.readouterr()
     assert code == 0
-    assert "[1/6] Refreshing project metadata...\n" in captured.err
-    assert "SAT [1/6]" not in captured.err
+    assert "[1/7] Refreshing project metadata...\n" in captured.err
+    assert "SAT [1/7]" not in captured.err
 
 
 def test_sync_writes_project_registry_even_for_a_single_project_sync(
@@ -1869,4 +1983,3 @@ def test_meta_ctrl_c_exits_without_traceback(tmp_path: Path, monkeypatch, capsys
     captured = capsys.readouterr()
     assert code == 130
     assert "Traceback" not in captured.err
-

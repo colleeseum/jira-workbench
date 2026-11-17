@@ -11,14 +11,29 @@ from jira_workbench.db import (
     db_path,
     distinct_item_values,
     distinct_projects_for_board,
+    ensure_source,
     field_counts,
     item_id,
     list_items,
+    reindex_freshdesk_items,
     reindex_items,
     set_item_has_shadow,
     source_id,
 )
 from jira_workbench.sync import write_json
+
+
+def _write_ticket(jira_dir: Path, ticket_id: int, **fields: object) -> None:
+    write_json(
+        jira_dir / f"freshdesk/tickets/{ticket_id}/ticket.json",
+        {
+            "id": ticket_id,
+            "subject": f"Ticket {ticket_id}",
+            "status": 2,
+            "priority": 2,
+            **fields,
+        },
+    )
 
 
 def _write_issue(jira_dir: Path, key: str, component: str, **fields: object) -> None:
@@ -283,6 +298,27 @@ def test_reindex_items_populates_board_membership(tmp_path: Path) -> None:
     assert items["SAT-2"]["boards"] == []
 
 
+def test_recompute_board_membership_all_sources_covers_jira_and_freshdesk(tmp_path: Path) -> None:
+    from jira_workbench.metadata import add_local_board
+
+    _write_issue(tmp_path, "SAT-1", "helm-chart")
+    reindex_items(tmp_path, "customfield_10071")
+
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    _write_ticket(tmp_path, 1)
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+
+    # add_local_board writes board_settings.json and (via write_board_settings)
+    # is the real call site recompute_board_membership_all_sources backs --
+    # exercising it directly is the actual integration, not just the helper.
+    add_local_board(tmp_path, "FD Board", {"project": ["FRESHDESK"]})
+
+    jira_items = {item["key"]: item for item in list_items(tmp_path)}
+    freshdesk_items = {item["key"]: item for item in list_items(tmp_path, source_slug="freshdesk")}
+    assert freshdesk_items["FD-1"]["boards"] == ["FD Board"]
+    assert jira_items["SAT-1"]["boards"] == []
+
+
 def test_recompute_board_membership_picks_up_a_boards_cache_change_without_a_reindex(tmp_path: Path) -> None:
     # This is the whole point: board data (boards.json/board_settings.json)
     # can change independently of a resync -- recompute_board_membership
@@ -441,3 +477,94 @@ def test_count_items(tmp_path: Path) -> None:
     reindex_items(tmp_path)
 
     assert count_items(tmp_path) == 2
+
+
+def test_ensure_source_creates_a_new_sources_row(tmp_path: Path) -> None:
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+
+    conn = connect(tmp_path)
+    try:
+        row = conn.execute("SELECT slug, kind, display_name FROM sources WHERE slug = 'freshdesk'").fetchone()
+    finally:
+        conn.close()
+    assert (row["slug"], row["kind"], row["display_name"]) == ("freshdesk", "freshdesk", "Freshdesk (acme)")
+
+
+def test_ensure_source_is_idempotent_and_preserves_id(tmp_path: Path) -> None:
+    first_id = ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    second_id = ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme), renamed")
+
+    assert first_id == second_id
+    conn = connect(tmp_path)
+    try:
+        row = conn.execute("SELECT display_name FROM sources WHERE slug = 'freshdesk'").fetchone()
+    finally:
+        conn.close()
+    assert row["display_name"] == "Freshdesk (acme), renamed"
+
+
+def test_reindex_freshdesk_items_populates_items_from_disk(tmp_path: Path) -> None:
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    _write_ticket(tmp_path, 1, subject="Login broken", tags=["vip"])
+    _write_ticket(tmp_path, 2, subject="Feature request")
+
+    count = reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+
+    assert count == 2
+    items = {item["key"]: item for item in list_items(tmp_path, source_slug="freshdesk")}
+    assert set(items) == {"FD-1", "FD-2"}
+    assert items["FD-1"]["summary"] == "Login broken"
+    assert items["FD-1"]["project"] == "FRESHDESK"
+    assert items["FD-1"]["labels"] == ["vip"]
+
+
+def test_reindex_freshdesk_items_uses_the_cached_real_status_names(tmp_path: Path) -> None:
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    _write_ticket(tmp_path, 1, status=7)
+    write_json(tmp_path / "freshdesk/statuses.json", {"7": "Waiting on Engineering"})
+
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+
+    items = {item["key"]: item for item in list_items(tmp_path, source_slug="freshdesk")}
+    assert items["FD-1"]["status"] == "Waiting on Engineering"
+    assert items["FD-1"]["statusCategory"] == "indeterminate"
+
+
+def test_reindex_freshdesk_items_preserves_id_for_an_unchanged_row(tmp_path: Path) -> None:
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    _write_ticket(tmp_path, 1)
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+    first_id = item_id(tmp_path, "FD-1", source_slug="freshdesk")
+    assert first_id is not None
+
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+
+    assert item_id(tmp_path, "FD-1", source_slug="freshdesk") == first_id
+
+
+def test_reindex_freshdesk_items_deletes_rows_for_tickets_removed_from_disk(tmp_path: Path) -> None:
+    import shutil
+
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    _write_ticket(tmp_path, 1)
+    _write_ticket(tmp_path, 2)
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+    assert item_id(tmp_path, "FD-2", source_slug="freshdesk") is not None
+
+    shutil.rmtree(tmp_path / "freshdesk/tickets/2")
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+
+    assert item_id(tmp_path, "FD-2", source_slug="freshdesk") is None
+    assert item_id(tmp_path, "FD-1", source_slug="freshdesk") is not None
+
+
+def test_reindex_freshdesk_items_does_not_touch_the_jira_source(tmp_path: Path) -> None:
+    _write_issue(tmp_path, "SAT-1", "helm-chart")
+    reindex_items(tmp_path)
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    _write_ticket(tmp_path, 1)
+
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+
+    assert {item["key"] for item in list_items(tmp_path)} == {"SAT-1"}
+    assert {item["key"] for item in list_items(tmp_path, source_slug="freshdesk")} == {"FD-1"}

@@ -9,6 +9,7 @@ import pytest
 from jira_workbench.config import (
     DEFAULT_JIRA_DIR,
     ConfigError,
+    FreshdeskSettings,
     ProjectSettings,
     WorkbenchConfig,
     load_config,
@@ -550,3 +551,137 @@ def test_save_view_defaults_rejects_unparseable_existing_file(tmp_path: Path) ->
 
     with pytest.raises(ConfigError):
         save_view_defaults(path, {"component": "helm-chart"})
+
+
+def test_load_config_reads_freshdesk_sources(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'domain = "acme"',
+                'api_key = "secret"',
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources == (FreshdeskSettings(slug="freshdesk", domain="acme", api_key="secret"),)
+
+
+def test_load_config_freshdesk_domain_strips_an_accidental_scheme(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "https://acme.freshdesk.com"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].domain == "acme"
+
+
+def test_load_config_freshdesk_domain_strips_the_freshdesk_com_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme.freshdesk.com"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].domain == "acme"
+
+
+def test_load_config_freshdesk_domain_strips_a_trailing_path(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme.freshdesk.com/api/v2"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].domain == "acme"
+
+
+def test_load_config_rejects_a_custom_cname_domain(tmp_path: Path) -> None:
+    # Freshdesk's API explicitly doesn't work via a custom CNAME even if
+    # the support portal itself is branded with one -- a value like this
+    # would otherwise silently build an unreachable
+    # "support.example.com.freshdesk.com" URL.
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "support.example.com"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_freshdesk_source_slug_defaults_to_kind(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].slug == "freshdesk"
+
+
+def test_load_config_reads_freshdesk_source_explicit_slug(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[[sources]]\nkind = "freshdesk"\nslug = "support"\ndomain = "acme"\napi_key = "secret"\n'
+    )
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].slug == "support"
+
+
+def test_load_config_rejects_unrecognized_source_kind(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "linear"\ndomain = "acme"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_freshdesk_source_without_domain(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_freshdesk_source_without_api_key(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_duplicate_source_slugs(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'slug = "support"',
+                'domain = "acme"',
+                'api_key = "secret"',
+                "",
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'slug = "support"',
+                'domain = "other"',
+                'api_key = "secret2"',
+            ]
+        )
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_with_no_sources_array_has_no_freshdesk_sources(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('project = "SAT"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources == ()

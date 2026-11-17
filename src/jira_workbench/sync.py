@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,6 +72,8 @@ class SyncResult:
     skipped_count: int
     version_count: int = 0
     backfilled_parent_count: int = 0
+    deleted_keys: tuple[str, ...] = ()
+    shadow_protected_deleted_keys: tuple[str, ...] = ()
 
 
 def utc_now() -> str:
@@ -269,6 +271,80 @@ def fetch_work_item_index(
     return normalize_work_items(payload)
 
 
+def _chunked(items: list[str], size: int) -> Iterator[list[str]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def detect_deleted_issues(
+    jira_dir: Path,
+    project: str,
+    client: JiraSyncClient,
+    fresh_keys: set[str],
+) -> tuple[list[str], list[str]]:
+    """Finds locally-synced issues that no longer exist in Jira at all.
+
+    A key indexed locally but missing from `fresh_keys` (this sync's own
+    fresh index fetch) isn't necessarily deleted -- it can simply have aged
+    out of `history_months`'s cutoff (an old Done issue Jira still has, just
+    not listed by this sync's own scoped JQL). Disambiguates with one extra
+    `key in (...)` query, scoped to just the candidates and ignoring
+    history_months entirely: a key Jira still returns there is still real,
+    just out of this sync's scope; only a key Jira no longer returns at all
+    is a genuine deletion. Queried in batches to stay well under Jira's JQL
+    clause-length limits regardless of how many candidates there are.
+
+    Returns (genuinely_deleted, shadow_protected): the second list is
+    genuinely-deleted keys deliberately left untouched -- they still carry
+    an unpushed local shadow.json, so the caller must report them, never
+    silently delete their local files.
+    """
+    from . import db as _db
+
+    components_dir = jira_dir / "components"
+    local_keys = _db.project_item_keys(jira_dir, project)
+    candidates = sorted(local_keys - fresh_keys)
+    if not candidates:
+        return [], []
+
+    still_exists: set[str] = set()
+    for batch in _chunked(candidates, 200):
+        jql = f"project={project} AND key in ({', '.join(batch)})"
+        payload = client.enhanced_jql_get_list_of_tickets(jql, fields=["key"])
+        still_exists.update(
+            item.get("key") for item in normalize_work_items(payload) if isinstance(item.get("key"), str)
+        )
+
+    genuinely_deleted = []
+    shadow_protected = []
+    for key in candidates:
+        if key in still_exists:
+            continue
+        existing = find_existing_issue(components_dir, key)
+        has_shadow = existing is not None and (existing.parent / "shadow.json").exists()
+        (shadow_protected if has_shadow else genuinely_deleted).append(key)
+    return genuinely_deleted, shadow_protected
+
+
+def remove_deleted_issues(jira_dir: Path, keys: list[str]) -> list[str]:
+    """Deletes the local directory for each confirmed-deleted key, skipping
+    (never deleting) any that carry a shadow.json -- belt-and-suspenders on
+    top of detect_deleted_issues already excluding shadow-protected keys,
+    in case one appeared between detection and this call. Returns the keys
+    actually removed."""
+    components_dir = jira_dir / "components"
+    removed = []
+    for key in keys:
+        existing = find_existing_issue(components_dir, key)
+        if existing is None:
+            continue
+        if (existing.parent / "shadow.json").exists():
+            continue
+        shutil.rmtree(existing.parent)
+        removed.append(key)
+    return removed
+
+
 def issue_attachments(issue: dict[str, Any]) -> Any:
     fields = issue.get("fields")
     if isinstance(fields, dict) and isinstance(fields.get("attachment"), list):
@@ -420,9 +496,9 @@ def backfill_missing_parents(
         progressed = False
         for index, key in enumerate(missing_keys, start=1):
             if progress:
-                progress(f"[4/6] Backfilling parents excluded by the history cutoff... {index}/{total} {key}")
+                progress(f"[5/7] Backfilling parents excluded by the history cutoff... {index}/{total} {key}")
             try:
-                issue = normalize_issue(client.get_issue(key, fields="*all"), key)
+                issue = normalize_issue(client.get_issue(key, fields="*all", expand="changelog"), key)
             except Exception as exc:
                 unfetchable.add(key)
                 if progress:
@@ -454,7 +530,7 @@ def sync_project(
     components_dir.mkdir(parents=True, exist_ok=True)
 
     if progress:
-        progress("[1/6] Refreshing project metadata...")
+        progress("[1/7] Refreshing project metadata...")
     from .issue import fetch_all_field_names
     from .metadata import refresh_versions_api, remember_field_names
 
@@ -478,12 +554,12 @@ def sync_project(
             progress(f"field name refresh skipped: {exc}")
 
     if progress:
-        progress("[2/6] Refreshing project index...")
+        progress("[2/7] Refreshing project index...")
     work_items = fetch_work_item_index(config.project, client, history_months=config.history_months)
     write_json(jira_dir / "project.json", work_items)
 
     if progress:
-        progress("[3/6] Syncing changed issues...")
+        progress("[3/7] Syncing changed issues...")
     changed = 0
     skipped = 0
     total = len(work_items)
@@ -494,7 +570,7 @@ def sync_project(
 
         if progress:
             progress(
-                f"[3/6] Syncing changed issues... {index}/{total} {key} "
+                f"[3/7] Syncing changed issues... {index}/{total} {key} "
                 f"changed={changed} unchanged={skipped}"
             )
 
@@ -506,7 +582,13 @@ def sync_project(
                 skipped += 1
                 continue
 
-        issue = normalize_issue(client.get_issue(key, fields="*all"), key)
+        # expand="changelog" -- Jira's issue fields alone carry no
+        # "updated by"/"resolved by" person, only timestamps; the embedded
+        # changelog (written verbatim into issue.json below, no extra
+        # plumbing needed) is what view.py's last_changed_by/resolved_by
+        # read from for the Detail page. Free-riding on this same call
+        # already made for every changed issue, not a separate request.
+        issue = normalize_issue(client.get_issue(key, fields="*all", expand="changelog"), key)
 
         if not config.force and existing is not None:
             existing_issue = read_json(existing)
@@ -538,18 +620,35 @@ def sync_project(
         changed += 1
 
     if progress:
-        progress("[4/6] Backfilling parents excluded by the history cutoff...")
+        progress("[4/7] Checking for issues deleted in Jira...")
+    fresh_keys = {
+        key for work_item in work_items if isinstance(key := work_item.get("key"), str) and ISSUE_KEY_PATTERN.fullmatch(key)
+    }
+    deletable, shadow_protected = detect_deleted_issues(jira_dir, config.project, client, fresh_keys)
+    removed = remove_deleted_issues(jira_dir, deletable)
+    if progress and removed:
+        progress(f"[4/7] Removed {len(removed)} item(s) deleted in Jira: {', '.join(removed)}")
+    if progress and shadow_protected:
+        progress(
+            f"[4/7] {len(shadow_protected)} item(s) deleted in Jira were kept locally "
+            f"because of unpushed changes: {', '.join(shadow_protected)}"
+        )
+
+    if progress:
+        progress("[5/7] Backfilling parents excluded by the history cutoff...")
     backfilled = backfill_missing_parents(jira_dir, config.project, client, config.component_field, progress=progress)
 
     if progress:
-        progress("[5/6] Building manifest...")
+        progress("[6/7] Building manifest...")
     build_manifest(jira_dir, config.component_field)
     if progress:
-        progress("[6/6] Done.")
+        progress("[7/7] Done.")
     return SyncResult(
         work_item_count=len(work_items),
         changed_count=changed,
         skipped_count=skipped,
         version_count=version_count,
         backfilled_parent_count=backfilled,
+        deleted_keys=tuple(removed),
+        shadow_protected_deleted_keys=tuple(shadow_protected),
     )

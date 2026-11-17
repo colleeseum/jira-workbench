@@ -16,6 +16,7 @@ from .metadata import (
     load_all_boards_with_settings,
     load_all_components,
     load_all_versions,
+    load_component_settings,
     load_field_names,
     load_versions,
     normalize_versions,
@@ -38,7 +39,7 @@ class ViewError(RuntimeError):
 DEFAULT_RESOLUTIONS = ["Done", "Won't Do", "Duplicate", "Cannot Reproduce"]
 VIRTUAL_NONE = "(none)"
 FILTER_ANY = "(any)"  # UI-only "no filter on this dimension" sentinel; never stored
-SWIMLANE_MODES = ("none", "epic", "version", "component", "board")
+SWIMLANE_MODES = ("none", "epic", "version", "component", "board", "assignee")
 REPORT_FIELD_LABELS = {
     "assignee": "assignee",
     "fixVersions": "version",
@@ -204,6 +205,58 @@ def is_active_item(item: dict[str, Any]) -> bool:
     return display_name(item.get("status")).strip().lower() not in FALLBACK_DONE_STATUS_NAMES
 
 
+def archived_version_names(jira_dir: Path, project: str) -> set[str]:
+    """Lowercased display names of every version `project`'s own versions
+    cache marks archived -- one of the sets is_archived_item checks an
+    item's own fields against. Archiving is the one unambiguous "this is
+    really gone" signal Jira gives for a version (unlike released, which
+    is routine and doesn't by itself mean an item tied to it should
+    disappear)."""
+    versions = normalize_versions(load_versions(jira_dir, project))
+    return {
+        version_name(version).strip().lower()
+        for version in versions
+        if isinstance(version, dict) and is_archived_version(version)
+    }
+
+
+def archived_component_names(jira_dir: Path, project: str) -> set[str]:
+    """Lowercased names of every component `project` has locally marked
+    archived (see metadata.set_component_archived) -- unlike
+    archived_version_names, this has no Jira source at all (Jira's REST
+    API has no archived concept for components), so it's read straight
+    from component_settings.json, jira-wb's own local-only annotation file
+    that a Jira metadata refresh never touches."""
+    settings = load_component_settings(jira_dir)
+    return {name.strip().lower() for name in settings["archivedComponents"].get(project, [])}
+
+
+def is_archived_item(
+    item: dict[str, Any],
+    archived_names_by_project: dict[str, set[str]],
+    archived_component_names_by_project: dict[str, set[str]] | None = None,
+) -> bool:
+    """An item counts as archived if any of its own fix versions is itself
+    an archived version (see archived_version_names), or if its component
+    is itself an archived component (see archived_component_names) --
+    expected to grow other criteria later (hence a single named predicate
+    here, rather than an inline check at each call site). A native
+    multi-valued component is stored as one comma-joined display string
+    (see component_template_options_for's own comma-splitting in
+    server.py) -- comma_parts here matches a single-valued component just
+    as well, so this doesn't need to special-case either shape."""
+    project = str(item.get("project") or "")
+    fix_version_names = archived_names_by_project.get(project)
+    if fix_version_names and any(
+        str(version).strip().lower() in fix_version_names for version in item.get("fixVersions") or []
+    ):
+        return True
+    component_names = (archived_component_names_by_project or {}).get(project)
+    if component_names:
+        return any(part.strip().lower() in component_names for part in comma_parts(str(item.get("component") or "")))
+    return False
+
+
 def field_value(item: dict[str, Any], field: str) -> str:
     """Generic display-value extraction for an equality-filterable field.
 
@@ -273,6 +326,21 @@ def is_stale_done(item: dict[str, Any], *, max_age_days: int) -> bool:
     return (now - changed_at).days > max_age_days
 
 
+def format_display_datetime(value: str | None) -> str:
+    """Jira's own timestamp format (e.g. "2025-08-19T14:57:06.203-0400")
+    shown as something a person actually reads at a glance, for the Detail
+    page's Created/Updated fields -- kept in the timestamp's own reported
+    offset rather than converted to any particular timezone (there's no
+    single "local" timezone to convert to on a server-rendered page)."""
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
 def filter_items(
     items: list[dict[str, Any]],
     *,
@@ -284,9 +352,13 @@ def filter_items(
     board: str | None = None,
     board_scope: str | None = None,
     max_done_age_days: int | None = None,
+    show_archived: bool = False,
+    archived_names_by_project: dict[str, set[str]] | None = None,
+    archived_component_names_by_project: dict[str, set[str]] | None = None,
 ) -> list[dict[str, Any]]:
     field_filters = field_filters or {}
     modified_keys = modified_keys or set()
+    archived_names_by_project = archived_names_by_project or {}
     # Modified combines with the other filters like any of them: picking a
     # specific component while Modified is on narrows to that component's
     # modified items; leaving component at "(any)" (an empty field_filters
@@ -301,6 +373,7 @@ def filter_items(
         and (not modified_only or display_name(item.get("key")) in modified_keys)
         and matches_board(item, board, board_scope)
         and (max_done_age_days is None or not is_stale_done(item, max_age_days=max_done_age_days))
+        and (show_archived or not is_archived_item(item, archived_names_by_project, archived_component_names_by_project))
     ]
 
 
@@ -446,6 +519,8 @@ def swimlane_label(item: dict[str, Any], swimlane: str | None) -> str | None:
         return virtual_none(item_fix_version(item))
     if mode == "component":
         return virtual_none(display_name(item.get("component")))
+    if mode == "assignee":
+        return virtual_none(display_name(item.get("assignee")))
     if mode == "board":
         # An item can genuinely belong to more than one board (board
         # membership is a JQL filter match, not an exclusive field) -- shown
@@ -1247,6 +1322,59 @@ def hierarchy_component(issue: dict[str, Any], component_field: str | None) -> s
     return display_name(fields.get("components")).strip()
 
 
+def _changelog_histories(issue: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The issue's own embedded changelog (sync.py fetches issues with
+    expand="changelog", written verbatim into issue.json), oldest-first --
+    or None if it's known to be incomplete (an issue with more field
+    changes than fit in one page: Jira's embedded expand is paginated,
+    default page size 100, and only ever returns the first/oldest page of
+    it) rather than [] (which would look the same as "genuinely zero
+    changes" to a caller). last_changed_by/resolved_by both refuse to
+    guess from a known-incomplete history rather than silently reporting
+    a wrong "most recent" author -- fetching the remaining pages to make
+    this always-complete is a real, larger follow-up (walking
+    /rest/api/2/issue/{key}/changelog the same way fetch_issue_comments
+    already walks comment pages), not done yet."""
+    changelog = issue.get("changelog")
+    if not isinstance(changelog, dict):
+        return None
+    histories = changelog.get("histories")
+    if not isinstance(histories, list):
+        return None
+    total = changelog.get("total")
+    max_results = changelog.get("maxResults")
+    if isinstance(total, int) and isinstance(max_results, int) and total > max_results:
+        return None
+    return histories
+
+
+def last_changed_by(issue: dict[str, Any]) -> str:
+    """Who made the most recent field change recorded in the issue's own
+    changelog -- Jira's issue fields alone only expose *when* it was last
+    updated (fields.updated), never a person, unlike created/reporter."""
+    histories = _changelog_histories(issue)
+    if not histories:
+        return ""
+    return display_name(as_dict(histories[-1]).get("author"))
+
+
+def resolved_by(issue: dict[str, Any]) -> str:
+    """Who made the changelog entry that set (not cleared) the issue's own
+    resolution field -- the last such entry, in case it was resolved,
+    reopened, and resolved again. Jira's fields.resolutiondate is only a
+    timestamp, same gap as fields.updated has for last_changed_by."""
+    histories = _changelog_histories(issue)
+    if not histories:
+        return ""
+    resolvers = [
+        as_dict(history).get("author")
+        for history in histories
+        for item in (as_dict(history).get("items") or [])
+        if isinstance(item, dict) and item.get("field") == "resolution" and item.get("to")
+    ]
+    return display_name(resolvers[-1]) if resolvers else ""
+
+
 def hierarchy_child_identity(issue: dict[str, Any], component_field: str | None) -> str:
     identity = issue_identity(issue)
     component = hierarchy_component(issue, component_field)
@@ -1531,7 +1659,18 @@ def component_options(jira_dir: Path) -> list[str]:
 
 
 def is_archived_version(version: dict[str, Any]) -> bool:
-    return bool(version.get("archived"))
+    """True for a version Jira itself marks archived, or one literally
+    named "_archived" -- a local convention for treating a version as
+    archived (excluded from every dropdown/selection the same way, an
+    item still tagged with it hidden from the Items list by default) even
+    when it can't or hasn't been marked archived in Jira itself. This is
+    the one place that convention needs to live: every caller here
+    (archived_version_names, version_options, fix_version_groups, the
+    Meta > Versions page) already funnels through this single predicate,
+    so nothing downstream needs its own special case."""
+    if bool(version.get("archived")):
+        return True
+    return version_name(version).strip().lower() == "_archived"
 
 
 def _component_version_filter(
@@ -1650,7 +1789,20 @@ def parent_options(
         if is_valid_parent_candidate(issue, current_issue)
         and (not active or is_active_issue(issue))
     ]
-    return ["(none)", *sorted((option for option in options if option), key=issue_key_option_sort_key)]
+    # A real instance can have hundreds of valid parent candidates once
+    # every synced project's own epics are pooled together -- plain
+    # key-sorted, the current issue's own project's epics (almost always
+    # the ones actually wanted) end up buried wherever its project key
+    # happens to fall alphabetically among every other synced project's,
+    # rather than surfacing first the way a same-project parent should.
+    current_project = issue_project_key(current_issue) if current_issue else None
+
+    def parent_option_sort_key(option: str) -> tuple[int, tuple[str, int, str]]:
+        sort_key = issue_key_option_sort_key(option)
+        same_project = current_project is not None and sort_key[0] == current_project.upper()
+        return (0 if same_project else 1, sort_key)
+
+    return ["(none)", *sorted((option for option in options if option), key=parent_option_sort_key)]
 
 
 def is_active_issue(issue: dict[str, Any]) -> bool:
@@ -1884,6 +2036,65 @@ def list_comments(jira_dir: Path, key: str, shadow: dict[str, Any] | None = None
 
     rows.sort(key=lambda row: row["created"], reverse=True)
     return rows
+
+
+# "PLAT-8618", "SAT-248", etc. -- deliberately not anchored to a specific
+# project list here (see linked_jira_keys' own known_projects filter for
+# that); this pattern alone also matches Craft.io idea-board ids
+# ("STA-1234") and other PREFIX-NUMBER shapes that aren't Jira at all,
+# confirmed against this project's own real synced data.
+JIRA_KEY_MENTION_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]+)-(\d+)\b")
+
+# The Freshdesk-Jira sync bot's own comment phrasing ("Ticket ID: 1293
+# Note Added by ... in Freshdesk: ..."), plus the two real portal URL
+# shapes seen in this account's data (a support.<domain>.com custom-domain
+# link and the underlying stardog.freshdesk.com one) -- both end in
+# "tickets/<id>".
+FRESHDESK_TICKET_MENTION_PATTERN = re.compile(r"(?:Ticket ID:\s*(\d+)|(?:freshdesk\.com|/support/)[^\s]*?tickets/(\d+))")
+
+
+def linked_jira_keys(
+    ticket: dict[str, Any], conversations: list[dict[str, Any]], known_projects: set[str]
+) -> list[str]:
+    """Every Jira key a Freshdesk ticket's own tags/description/conversation
+    text mention, restricted to `known_projects` (the locally-synced Jira
+    project keys) -- without that filter, a coincidentally similar-shaped
+    id from an unrelated system (this account's own Craft.io idea ids look
+    exactly like a Jira key, e.g. "STA-1234") would be treated as a real
+    Jira link. Read-only navigation only -- see the "jump to related item"
+    scope in the architecture memory; this never writes anything back."""
+    keys: set[str] = set()
+
+    def scan(text: str) -> None:
+        for match in JIRA_KEY_MENTION_PATTERN.finditer(text):
+            project, number = match.group(1), match.group(2)
+            if project in known_projects:
+                keys.add(f"{project}-{number}")
+
+    for tag in ticket.get("tags") or []:
+        scan(str(tag))
+    scan(str(ticket.get("description_text") or ticket.get("description") or ""))
+    for conversation in conversations:
+        if isinstance(conversation, dict):
+            scan(str(conversation.get("body_text") or conversation.get("body") or ""))
+
+    return sorted(keys, key=issue_key_sort_key)
+
+
+def linked_freshdesk_ticket_ids(description_text: str, comment_text: str) -> list[str]:
+    """Every Freshdesk ticket id a Jira issue's own description/comments
+    mention -- the sync bot's "Ticket ID: N" phrasing, or a
+    support.stardog.com/stardog.freshdesk.com ticket URL. No known-id
+    filtering here (unlike linked_jira_keys) since any number could
+    plausibly be a real ticket -- the caller is expected to only render a
+    link once it's confirmed to actually exist locally (see
+    find_existing_ticket), the same "never a dead link" rule applied to
+    the Jira-key direction."""
+    ids: set[str] = set()
+    for text in (description_text, comment_text):
+        for match in FRESHDESK_TICKET_MENTION_PATTERN.finditer(text or ""):
+            ids.add(match.group(1) or match.group(2))
+    return sorted(ids, key=int)
 
 
 def other_field_rows(issue: dict[str, Any], component_field: str | None) -> list[tuple[str, str]]:

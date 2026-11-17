@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import html
+import json
 import re
+import threading
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+import jira_workbench.server
 import jira_workbench.service
+from jira_workbench.assistant import AssistantResult
 from jira_workbench.config import ProjectSettings, WorkbenchConfig
-from jira_workbench.metadata import write_project_registry
-from jira_workbench.server import ISSUE_KEY_PATTERN, ITEMS_FILTER_FORM_ID, _diff_display_value, all_items, create_app
+from jira_workbench.metadata import load_component_settings, set_component_archived, write_project_registry
+from jira_workbench.server import (
+    BULK_EDIT_FORM_ID,
+    ISSUE_KEY_PATTERN,
+    ITEMS_FILTER_FORM_ID,
+    _diff_display_value,
+    _parent_pill_options,
+    all_items,
+    create_app,
+)
 from jira_workbench.shadow import add_comment, load_shadow, set_field, set_status_change
 from jira_workbench.sync import SyncConfig, build_manifest, read_json, sync_project, write_json
+from test_freshdesk import FakeFreshdeskClient, _ticket
 from test_metadata import ApiClient
 from test_shadow import PushJiraClient
 from test_sync import FakeJiraClient
@@ -58,6 +71,34 @@ def _synced_client(tmp_path: Path, config: WorkbenchConfig | None = None) -> Tes
         projects=(ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),)
     )
     return TestClient(create_app(tmp_path, config or default_config))
+
+
+def _synced_client_with_freshdesk(
+    tmp_path: Path, *, tickets: dict[int, dict] | None = None, sync_jira: bool = True
+) -> TestClient:
+    """A client backed by both a synced Jira project and a synced Freshdesk
+    source in the same jira_dir -- for exercising the Items list/Detail
+    page's source dispatch (see the "Freshdesk as a second source" plan).
+    `sync_jira=False` simulates a Freshdesk-only setup with no Jira
+    manifest.json at all."""
+    from jira_workbench.config import FreshdeskSettings
+    from jira_workbench.freshdesk import sync_freshdesk_source
+
+    if sync_jira:
+        sync_project(
+            SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+            FakeJiraClient(),
+            progress=None,
+        )
+    freshdesk_settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    sync_freshdesk_source(
+        freshdesk_settings, tmp_path, FakeFreshdeskClient(tickets or {1: _ticket(1), 2: _ticket(2)}), progress=None
+    )
+    config = WorkbenchConfig(
+        projects=(ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),) if sync_jira else (),
+        freshdesk_sources=(freshdesk_settings,),
+    )
+    return TestClient(create_app(tmp_path, config))
 
 
 def test_all_items_reflects_a_shadow_write_on_the_very_next_call(tmp_path: Path) -> None:
@@ -445,13 +486,15 @@ def test_items_page_has_the_filter_form_plus_one_per_editable_row(tmp_path: Path
     # needed their own independent POST forms (HTML forbids nesting a
     # <form> in another) -- one filter <form>, one small form per editable
     # field per row (Type/Status/Component/Summary/Priority/Assignee/Fix
-    # versions = 7 widgets x 2 items here), plus the sidebar's own Goto
-    # quick-jump form (present on every page).
+    # versions = 7 widgets x 2 items here), the bulk-edit bar's own one
+    # shared form (every row's own bulk-select checkbox submits into it via
+    # form="...", not by living inside it -- see BULK_EDIT_FORM_ID), plus
+    # the sidebar's own Goto quick-jump form (present on every page).
     client = _synced_client(tmp_path)
 
     response = client.get("/")
 
-    assert response.text.count("<form") == 2 + 7 * 2
+    assert response.text.count("<form") == 2 + 1 + 7 * 2
     assert '<div class="layout">' in response.text
 
 
@@ -606,7 +649,7 @@ def test_items_page_swimlane_selector_present_in_sidebar(tmp_path: Path) -> None
 
     aside = response.text[response.text.index("<aside") : response.text.index("</aside>")]
     assert f'<select name="swimlane" id="sidebar-swimlane" form="{ITEMS_FILTER_FORM_ID}"' in aside
-    for mode in ("None", "Epic", "Version", "Component", "Board"):
+    for mode in ("None", "Epic", "Version", "Component", "Board", "Assignee"):
         assert f">{mode}</option>" in aside
 
 
@@ -623,6 +666,31 @@ def test_items_page_swimlane_groups_rows_with_a_header(tmp_path: Path) -> None:
     # Each item's row must appear after its own lane's header.
     assert api_team_header < sat1_row
     assert unassigned_header < sat2_row
+
+
+def test_items_page_swimlane_groups_rows_by_assignee(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    # FakeJiraClient assigns every synced issue to "Serge Colle", so both
+    # SAT-1 and SAT-2 land in the same lane.
+    response = client.get("/", params={"swimlane": "assignee"})
+
+    assert response.text.count('class="swimlane-header"') == 1
+    assignee_header = response.text.index(">Serge Colle</td>")
+    assert assignee_header < response.text.index("SAT-1")
+    assert assignee_header < response.text.index("SAT-2")
+
+
+def test_items_page_swimlane_groups_unassigned_rows_under_none(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    set_field(tmp_path, "SAT-2", "assignee", "")
+
+    response = client.get("/", params={"swimlane": "assignee"})
+
+    assert response.text.count('class="swimlane-header"') == 2
+    assignee_header = response.text.index(">Serge Colle</td>")
+    unassigned_header = response.text.index(">(none)</td>")
+    assert assignee_header < response.text.index("SAT-1")
+    assert unassigned_header < response.text.index("SAT-2")
 
 
 def test_items_page_swimlane_none_has_no_group_headers(tmp_path: Path) -> None:
@@ -729,7 +797,8 @@ def test_items_page_swimlane_header_is_clickable_to_collapse(tmp_path: Path) -> 
 
     response = client.get("/", params={"swimlane": "component"})
 
-    assert 'class="swimlane-header" onclick="jiraWbToggleSwimlane(this)"' in response.text
+    assert 'class="swimlane-header" data-lane=' in response.text
+    assert 'onclick="jiraWbToggleSwimlane(this)"' in response.text
     assert "function jiraWbToggleSwimlane" in response.text
 
 
@@ -739,6 +808,42 @@ def test_items_page_swimlane_script_absent_when_ungrouped(tmp_path: Path) -> Non
     response = client.get("/")
 
     assert "jiraWbToggleSwimlane" not in response.text
+
+
+def test_items_page_swimlane_header_carries_its_own_lane_label(tmp_path: Path) -> None:
+    # data-lane is the persistence key jiraWbToggleSwimlane's localStorage
+    # write/restore logic reads -- must be the same text as the header's
+    # own visible label so a collapsed lane can be found again after reload.
+    client = _synced_client(tmp_path)
+
+    response = client.get("/", params={"swimlane": "component"})
+
+    assert '<tr class="swimlane-header" data-lane="API Team" onclick="jiraWbToggleSwimlane(this)">' in response.text
+
+
+def test_items_page_items_table_carries_board_and_swimlane_for_collapse_persistence(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.get("/", params={"board": "Modified Items", "swimlane": "none"})
+
+    # Modified Items hard-forces swimlane grouping off (see MODIFIED_BOARD_NAME
+    # handling), so the table's own data-swimlane must reflect that ("none"),
+    # not whatever the query string asked for.
+    assert 'id="items-table" data-board="Modified Items" data-swimlane="none"' in response.text
+
+
+def test_items_page_swimlane_restore_script_resets_state_when_mode_differs(tmp_path: Path) -> None:
+    # Not a browser test (no localStorage here) -- just confirms the reset
+    # branch (stored.mode !== current mode -> re-write as collapsed: [])
+    # and the per-board storage key derivation are both present in the
+    # emitted script, since that's the actual mechanism "reset when the
+    # swimlane changes" and "state is scoped per board" rely on.
+    client = _synced_client(tmp_path)
+
+    response = client.get("/", params={"swimlane": "component"})
+
+    assert "stored.mode !== jiraWbSwimlaneMode()" in response.text
+    assert "'jiraWbSwimlaneCollapse:' + (table ? table.dataset.board : '')" in response.text
 
 
 def test_items_page_new_issue_is_a_plus_icon_below_the_table(tmp_path: Path) -> None:
@@ -940,10 +1045,10 @@ def test_item_detail_page_status_select_reveals_a_resolution_dropdown(tmp_path: 
     response = client.get("/items/SAT-1")
 
     status_form_start = response.text.index('action="/items/SAT-1/status"')
-    status_form = response.text[status_form_start : status_form_start + 800]
+    status_form = response.text[status_form_start : status_form_start + 1800]
     assert "Change status</button>" not in status_form
-    assert "<select" in status_form
-    assert "onchange=" in status_form
+    assert 'class="pill-select"' in status_form
+    assert 'name="status"' in status_form
     assert "prompt(" not in status_form
     assert 'class="resolution-picker"' in status_form
     assert 'name="resolution"' in status_form
@@ -1104,10 +1209,245 @@ def test_item_detail_page_parent_dropdown_shows_emoji_not_type_word(tmp_path: Pa
     response = client.get("/items/SAT-1")
 
     parent_form_start = response.text.index('name="field" value="parent"')
-    parent_form = response.text[parent_form_start : parent_form_start + 400]
-    assert "<select" in parent_form
-    assert 'value="SAT-100" selected' in parent_form
+    parent_form = response.text[parent_form_start : parent_form_start + 600]
+    assert 'class="pill-select"' in parent_form
+    assert 'value="SAT-100"' in parent_form  # the hidden value input carries the real key
     assert "Epic:" not in parent_form
+
+
+def test_parent_pill_options_splits_bare_key_value_from_emoji_label() -> None:
+    values, labels = _parent_pill_options(["Epic: SAT-10 Solution architecture", "Story: SAT-20 Widget"])
+
+    # A leading "" represents "no parent" (see _parent_pill_options'
+    # own docstring) -- rendered as "(none)" by the pill-select template's
+    # own empty-label fallback, same convention every other single-select
+    # pill field already uses.
+    assert values == ["", "SAT-10", "SAT-20"]
+    assert labels["SAT-10"] == "⚡ SAT-10 Solution architecture"
+    assert labels["SAT-20"] == "🔖 SAT-20 Widget"
+    assert "" not in labels
+
+
+def test_item_detail_page_shows_children_before_labels(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "The epic",
+                "issuetype": {"name": "Epic"},
+                "status": {"name": "Open"},
+                "labels": ["urgent"],
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/compA/SAT-2/issue.json",
+        {
+            "key": "SAT-2",
+            "fields": {
+                "summary": "First child",
+                "issuetype": {"name": "Story"},
+                "status": {"name": "In Progress"},
+                "parent": {"key": "SAT-1"},
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/compA/SAT-3/issue.json",
+        {
+            "key": "SAT-3",
+            "fields": {
+                "summary": "Second child",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Done"},
+                "parent": {"key": "SAT-1"},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    assert '<label>Children (2)</label>' in response.text
+    assert '<a href="/items/SAT-2">SAT-2</a> First child <span class="child-status">(In Progress)</span>' in response.text
+    assert '<a href="/items/SAT-3">SAT-3</a> Second child <span class="child-status">(Done)</span>' in response.text
+    # "before Labels" -- the Children block's own position in the markup
+    # must come first, not just be present somewhere on the page.
+    children_index = response.text.index('<ul class="detail-children">')
+    labels_index = response.text.index("<label>Labels")
+    assert children_index < labels_index
+
+
+def test_item_detail_page_omits_children_section_for_a_childless_issue(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.get("/items/SAT-1")
+
+    assert "Children (" not in response.text
+    assert '<ul class="detail-children">' not in response.text
+
+
+def test_item_detail_page_shows_issue_links_as_clickable_grid_rows(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "Has links",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "issuelinks": [
+                    {"type": {"outward": "blocks", "inward": "is blocked by"}, "outwardIssue": {"key": "SAT-900"}},
+                    {"type": {"outward": "blocks", "inward": "is blocked by"}, "inwardIssue": {"key": "SAT-100"}},
+                ],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    assert '<label>Blocks</label><a href="/items/SAT-900">SAT-900</a></div>' in response.text
+    assert '<label>Is blocked by</label><a href="/items/SAT-100">SAT-100</a></div>' in response.text
+
+
+def test_item_detail_page_shows_created_and_updated_dates(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "SAT one",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "created": "2025-08-19T14:57:06.203-0400",
+                "updated": "2025-11-12T09:29:10.037Z",
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    # No reporter/changelog in this fixture -- each combined row falls
+    # back to the date alone rather than a dangling "by ".
+    assert "<label>Created / Reporter</label>2025-08-19 14:57</div>" in response.text
+    assert "<label>Updated / Who</label>2025-11-12 09:29</div>" in response.text
+    # Never resolved -- no "Resolved / Who" row at all, not a blank one.
+    assert "<label>Resolved / Who</label>" not in response.text
+
+
+def test_item_detail_page_created_row_includes_the_reporter_when_known(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "SAT one",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "created": "2025-08-19T14:57:06.203-0400",
+                "reporter": {"displayName": "Ada Lovelace"},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    assert "<label>Created / Reporter</label>2025-08-19 14:57 by Ada Lovelace</div>" in response.text
+    # Reporter no longer has its own separate row.
+    assert "<label>Reporter</label>" not in response.text
+
+
+def test_item_detail_page_updated_and_resolved_rows_include_who_from_the_changelog(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "SAT one",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Done"},
+                "updated": "2026-07-27T14:24:00.000-0400",
+                "resolutiondate": "2025-11-12T09:29:07.495-0500",
+            },
+            "changelog": {
+                "startAt": 0,
+                "maxResults": 100,
+                "total": 2,
+                "histories": [
+                    {
+                        "author": {"displayName": "Grace Hopper"},
+                        "items": [{"field": "resolution", "from": None, "to": "10000", "toString": "Fixed"}],
+                    },
+                    {"author": {"displayName": "Katherine Johnson"}, "items": [{"field": "assignee"}]},
+                ],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    assert "<label>Updated / Who</label>2026-07-27 14:24 by Katherine Johnson</div>" in response.text
+    assert "<label>Resolved / Who</label>2025-11-12 09:29 by Grace Hopper</div>" in response.text
+
+
+def test_item_detail_page_shows_resolved_date_only_when_the_issue_has_one(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "SAT one",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Done"},
+                "resolutiondate": "2025-11-12T09:29:07.495-0500",
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    assert "<label>Resolved / Who</label>2025-11-12 09:29</div>" in response.text
+
+
+def test_item_detail_page_shows_the_resolution_name_only_when_the_issue_has_one(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "SAT one",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Done"},
+                "resolution": {"name": "Won't Do"},
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    assert "<label>Resolution</label>Won&#x27;t Do</div>" in response.text
+
+
+def test_item_detail_page_omits_resolution_row_when_unresolved(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.get("/items/SAT-1")
+
+    assert "<label>Resolution</label>" not in response.text
 
 
 def test_item_detail_page_uses_a_compact_fields_grid(tmp_path: Path) -> None:
@@ -1118,6 +1458,29 @@ def test_item_detail_page_uses_a_compact_fields_grid(tmp_path: Path) -> None:
     assert '<div class="detail-fields">' in response.text
     assert '<div class="detail-field">' in response.text
     assert '<div class="detail-field-full">' in response.text
+
+
+def test_item_detail_page_title_is_plain_key_when_no_parent(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "no parent", "issuetype": {"name": "Task"}, "status": {"name": "Open"}}},
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    assert "<h1>SAT-1</h1>" in response.text
+
+
+def test_item_detail_page_title_is_parent_slash_item_and_parent_is_a_link(tmp_path: Path) -> None:
+    # SAT-1's parent (SAT-100) is embedded on SAT-1's own synced issue --
+    # same fixture the Parent-field tests already rely on.
+    client = _synced_client(tmp_path)
+
+    response = client.get("/items/SAT-1")
+
+    assert '<h1><a href="/items/SAT-100">SAT-100</a>/SAT-1</h1>' in response.text
 
 
 def test_item_detail_page_scopes_options_to_the_items_own_project(tmp_path: Path) -> None:
@@ -1231,6 +1594,240 @@ def test_post_item_status_change_to_non_done_status_clears_stale_resolution(tmp_
     assert response.status_code == 303
     shadow = load_shadow(tmp_path, "SAT-1")
     assert "statusChange" not in shadow
+
+
+def test_post_bulk_fields_sets_priority_on_every_selected_item(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1", "SAT-2"], "bulk_field": "priority", "priority_value": "High"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "flash=Updated+2+item" in response.headers["location"]
+    assert load_shadow(tmp_path, "SAT-1")["fields"]["priority"] == {"name": "High"}
+    assert load_shadow(tmp_path, "SAT-2")["fields"]["priority"] == {"name": "High"}
+
+
+def test_post_bulk_fields_status_transition_to_done_stages_a_resolution(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    _mark_status_observed_as_done(tmp_path, "SAT-1", "Done")
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1"], "bulk_field": "status", "status_value": "Done", "resolution": "Fixed"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    shadow = load_shadow(tmp_path, "SAT-1")
+    assert shadow["fields"]["status"] == "Done"
+    assert shadow["statusChange"] == {"resolution": "Fixed"}
+
+
+def test_post_bulk_fields_assignee_accepts_the_unassigned_sentinel(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1"], "bulk_field": "assignee", "assignee_value": "(unassigned)"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    # encode_edit_value's own "(unassigned)" -> "" convention, same as a
+    # single-row assignee edit.
+    assert load_shadow(tmp_path, "SAT-1")["fields"]["assignee"] == ""
+
+
+def test_post_bulk_fields_component_single_select_project_truncates_extra_values(tmp_path: Path) -> None:
+    # SAT is configured with a custom (single-select) component field --
+    # picking more than one value in the bulk bar's multi-select control
+    # only ever stages the first one for a project that can't hold more
+    # than one, same truncation the Items list's own row widget applies.
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={
+            "keys": ["SAT-1"],
+            "bulk_field": "component",
+            "component_value": ["helm-chart", "training"],
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert load_shadow(tmp_path, "SAT-1")["fields"]["customfield_10071"] == {"value": "helm-chart"}
+
+
+def test_post_bulk_fields_component_native_multi_value_project_keeps_every_value(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "one", "issuetype": {"name": "Task"}, "status": {"name": "Open"}}},
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1"], "bulk_field": "component", "component_value": ["helm-chart", "training"]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert load_shadow(tmp_path, "SAT-1")["fields"]["components"] == [{"name": "helm-chart"}, {"name": "training"}]
+
+
+def test_post_bulk_fields_fixversions_multi_select_project_keeps_every_value(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={
+            "keys": ["SAT-1"],
+            "bulk_field": "fixVersions",
+            "fixversions_value": ["kube 1.3.0", "kube 1.4.0"],
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert load_shadow(tmp_path, "SAT-1")["fields"]["fixVersions"] == [
+        {"name": "kube 1.3.0"},
+        {"name": "kube 1.4.0"},
+    ]
+
+
+def test_post_bulk_fields_fixversions_single_select_project_truncates_extra_values(tmp_path: Path) -> None:
+    config = WorkbenchConfig(
+        projects=(
+            ProjectSettings(
+                key="SAT", default=True, component_field="customfield_10071", fix_version_single_select=True
+            ),
+        )
+    )
+    client = _synced_client(tmp_path, config)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={
+            "keys": ["SAT-1"],
+            "bulk_field": "fixVersions",
+            "fixversions_value": ["kube 1.3.0", "kube 1.4.0"],
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert load_shadow(tmp_path, "SAT-1")["fields"]["fixVersions"] == [{"name": "kube 1.3.0"}]
+
+
+def test_post_bulk_fields_skips_read_only_project_items(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1"], "bulk_field": "priority", "priority_value": "High"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "flash=Updated+0+item" in response.headers["location"]
+    assert "skipped+%28read-only+project%29" in response.headers["location"]
+    # A read-only project is blocked before ever writing a shadow at all --
+    # no shadow.json exists here, same as a single-row edit would leave.
+    assert load_shadow(tmp_path, "SAT-1") is None
+
+
+def test_post_bulk_fields_skips_keys_that_are_not_synced_locally(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1", "SAT-999"], "bulk_field": "priority", "priority_value": "High"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "flash=Updated+1+item" in response.headers["location"]
+    assert "skipped+%28not+synced%29" in response.headers["location"]
+    assert load_shadow(tmp_path, "SAT-1")["fields"]["priority"] == {"name": "High"}
+
+
+def test_post_bulk_fields_rejects_an_unsupported_field(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1"], "bulk_field": "summary"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+
+
+def test_post_bulk_fields_with_no_value_chosen_flashes_an_error_and_stages_nothing(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/bulk-fields",
+        data={"keys": ["SAT-1"], "bulk_field": "priority", "priority_value": ""},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "flash_kind=error" in response.headers["location"]
+    assert load_shadow(tmp_path, "SAT-1") is None
+
+
+def test_post_bulk_revert_deletes_the_shadow_for_every_selected_item(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    set_field(tmp_path, "SAT-1", "summary", "Edited")
+    set_field(tmp_path, "SAT-2", "summary", "Also edited")
+
+    response = client.post(
+        "/items/bulk-revert",
+        data={"keys": ["SAT-1", "SAT-2"]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "flash=Reverted+2+item" in response.headers["location"]
+    assert load_shadow(tmp_path, "SAT-1") is None
+    assert load_shadow(tmp_path, "SAT-2") is None
+
+
+def test_post_bulk_revert_skips_keys_that_are_not_synced_locally(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    set_field(tmp_path, "SAT-1", "summary", "Edited")
+
+    response = client.post(
+        "/items/bulk-revert",
+        data={"keys": ["SAT-1", "SAT-999"]},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "flash=Reverted+1+item" in response.headers["location"]
+    assert "skipped+%28not+synced%29" in response.headers["location"]
+    assert load_shadow(tmp_path, "SAT-1") is None
+
+
+def test_post_bulk_revert_leaves_an_unmodified_items_shadow_absent(tmp_path: Path) -> None:
+    # Reverting an item with no shadow at all is a harmless no-op --
+    # matches the single-item /items/{key}/revert route, and lets a bulk
+    # selection mix modified and unmodified rows without special-casing.
+    client = _synced_client(tmp_path)
+
+    response = client.post("/items/bulk-revert", data={"keys": ["SAT-1"]}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert "flash=Reverted+1+item" in response.headers["location"]
+    assert load_shadow(tmp_path, "SAT-1") is None
 
 
 def test_post_item_comment_adds_a_new_local_comment(tmp_path: Path) -> None:
@@ -2605,6 +3202,35 @@ def test_meta_versions_page_hides_archived_versions_by_default(tmp_path: Path) -
     assert "checked" not in response.text[checkbox_start : checkbox_start + 40]
 
 
+def test_meta_versions_page_hides_a_version_named__archived_even_though_not_flagged(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {
+            "project": "SAT",
+            "versions": [
+                {"id": "1", "name": "sat-current", "released": False, "archived": False},
+                {"id": "2", "name": "_archived", "released": False, "archived": False},
+            ],
+        },
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/meta/versions", params={"project": "SAT"})
+    assert "sat-current" in response.text
+    # "_archived" alone would also match the "show_archived" checkbox's
+    # own name attribute -- the version's own table cell is what matters.
+    assert "<td>_archived</td>" not in response.text
+
+    revealed = client.get("/meta/versions", params={"project": "SAT", "show_archived": "1"})
+    assert "<td>_archived</td>" in revealed.text
+    # The Archived column reflects the computed decision (True), not
+    # Jira's own raw (False) flag, so the admin table doesn't contradict
+    # the exclusion above.
+    row_start = revealed.text.index("<td>_archived</td>")
+    row_end = revealed.text.index("</tr>", row_start)
+    assert "<td>True</td>" in revealed.text[row_start:row_end]
+
+
 def test_meta_versions_page_shows_archived_versions_when_checkbox_is_on(tmp_path: Path) -> None:
     write_json(
         tmp_path / "meta/SAT/versions.json",
@@ -2706,6 +3332,107 @@ def test_meta_page_lists_configured_projects(tmp_path: Path) -> None:
     assert '<a href="/meta/versions?project=PLAT">PLAT</a>' in response.text
 
 
+def test_meta_page_lists_freshdesk_when_a_source_is_configured(tmp_path: Path) -> None:
+    from jira_workbench.config import FreshdeskSettings
+
+    config = WorkbenchConfig(
+        projects=(ProjectSettings(key="SAT", default=True),),
+        freshdesk_sources=(FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key"),),
+    )
+    client = TestClient(create_app(tmp_path, config))
+
+    response = client.get("/meta")
+
+    # Boards, not Versions -- FRESHDESK has no versions/components concept
+    # and no working labels page (see _FRESHDESK_META_SECTIONS), so its
+    # own default section is Boards, the one that's actually meaningful.
+    assert '<a href="/meta/boards?project=FRESHDESK">FRESHDESK</a>' in response.text
+
+
+def test_meta_page_omits_freshdesk_when_no_source_is_configured(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path, WorkbenchConfig(projects=(ProjectSettings(key="SAT", default=True),))))
+
+    response = client.get("/meta")
+
+    assert "FRESHDESK" not in response.text
+
+
+def test_meta_boards_page_offers_the_add_local_board_form_for_freshdesk(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/meta/boards", params={"project": "FRESHDESK"})
+
+    assert response.status_code == 200
+    assert 'value="FRESHDESK"' in response.text
+    assert "Add local board" in response.text
+
+
+def test_meta_boards_page_only_offers_boards_in_the_freshdesk_sections_nav(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/meta/boards", params={"project": "FRESHDESK"})
+
+    sidebar = response.text[response.text.index('<label>FRESHDESK</label>') :]
+    assert '>Boards</a>' in sidebar
+    assert '>Versions</a>' not in sidebar
+    assert '>Components</a>' not in sidebar
+    assert '>Labels</a>' not in sidebar
+
+
+def test_meta_versions_page_omits_freshdesk_from_the_pick_a_project_list(tmp_path: Path) -> None:
+    # The sidebar's own Projects nav still lists every project (including
+    # FRESHDESK, so it stays reachable via Boards) -- only the main
+    # content "pick a project to see its Versions" list should skip a
+    # project that has nothing to show for this specific section.
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/meta/versions")
+
+    main_content = response.text[response.text.index("<main") :]
+    assert '>SAT<' in main_content
+    assert "FRESHDESK" not in main_content
+
+
+def test_meta_versions_page_still_renders_for_freshdesk_via_a_direct_url(tmp_path: Path) -> None:
+    # Not linked to anywhere anymore, but a stale bookmark/typed URL
+    # shouldn't crash -- it just degrades to the same empty state it
+    # always has (see meta_versions_page's own try/except MetadataError).
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/meta/versions", params={"project": "FRESHDESK"})
+
+    assert response.status_code == 200
+
+
+def test_meta_versions_page_project_nav_sends_freshdesk_to_boards_not_versions(tmp_path: Path) -> None:
+    # Switching to FRESHDESK from a Jira project's own Versions page must
+    # not preserve "versions" as the target section -- that would land on
+    # a page hidden from its own nav (see project_link's own fallback).
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/meta/versions", params={"project": "SAT"})
+
+    assert '<a href="/meta/boards?project=FRESHDESK">FRESHDESK</a>' in response.text
+
+
+def test_creating_a_freshdesk_scoped_local_board_shows_only_freshdesk_tickets(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    add_response = client.post(
+        "/meta/boards/add",
+        data={"project": "FRESHDESK", "name": "FD Board", "board_project": "FRESHDESK"},
+        follow_redirects=False,
+    )
+    assert add_response.status_code == 303
+
+    response = client.get("/", params={"active": "0", "board": "FD Board"})
+
+    assert "FD-1" in response.text
+    assert "FD-2" in response.text
+    assert "SAT-1" not in response.text
+    assert "SAT-2" not in response.text
+
+
 def test_meta_versions_page_renders_versions_for_the_selected_project(tmp_path: Path) -> None:
     write_json(
         tmp_path / "meta/SAT/versions.json",
@@ -2733,6 +3460,27 @@ def test_meta_components_page_renders_components_for_the_selected_project(tmp_pa
 
     assert response.status_code == 200
     assert "helm-chart" in response.text
+
+
+def test_meta_tables_alternate_row_shading_so_action_buttons_are_easy_to_target(tmp_path: Path) -> None:
+    # Regression: every row looked identical (just a thin border between
+    # them), which made it easy to misclick an Archive/Delete/etc. action
+    # on the wrong row once a table ran to more than a few entries.
+    write_json(
+        tmp_path / "manifest.json",
+        {
+            "workItems": [
+                {"key": "SAT-1", "project": "SAT", "component": "helm-chart", "status": "To Do"},
+                {"key": "SAT-2", "project": "SAT", "component": "terraform", "status": "To Do"},
+            ],
+        },
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/meta/components", params={"project": "SAT"})
+
+    assert '<table class="meta-table">' in response.text
+    assert ".meta-table tbody tr:nth-child(even)" in response.text
 
 
 def test_meta_components_page_does_not_leak_other_projects_components(tmp_path: Path) -> None:
@@ -3281,6 +4029,75 @@ def test_items_page_modified_board_shows_only_locally_modified_items(tmp_path: P
     assert "SAT-2" not in response.text
 
 
+def test_items_page_modified_board_always_shows_a_done_modified_item(tmp_path: Path) -> None:
+    # Regression: Active-only defaults on when switching to any board --
+    # right for a real board, but the synthetic Modified Items board
+    # exists specifically to review pending local edits, and a very
+    # common edit is marking something Done/Closed. Active/archived
+    # filtering is hard-bypassed for this board (not just defaulted off),
+    # so a modified item always shows regardless of its own status.
+    client = _synced_client(tmp_path)
+    _mark_status_observed_as_done(tmp_path, "SAT-1", "Done")
+    set_field(tmp_path, "SAT-1", "status", "Done")
+
+    response = client.get("/", params={"board": "Modified Items"})
+
+    assert "SAT-1" in response.text
+    # The checkboxes are hidden outright on this board, not merely
+    # unchecked -- they'd have no effect here (see the filter form's own
+    # docstring comment), so leaving them visible would be misleading.
+    assert 'name="active" value="1"' not in response.text
+    assert 'name="show_archived" value="1"' not in response.text
+
+
+def test_items_page_modified_board_shows_a_revert_button_in_the_bulk_edit_bar(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    set_field(tmp_path, "SAT-1", "summary", "Edited")
+
+    response = client.get("/", params={"board": "Modified Items"})
+
+    assert 'formaction="/items/bulk-revert"' in response.text
+    assert "jiraWbBulkRevertConfirm" in response.text
+
+
+def test_items_page_default_board_does_not_show_a_revert_button(tmp_path: Path) -> None:
+    # Revert is specific to the Modified Items board -- a plain selection
+    # elsewhere is a mix of editable rows in general, not "these are all
+    # locally modified", so a one-click "discard the lot" doesn't apply.
+    client = _synced_client(tmp_path)
+    set_field(tmp_path, "SAT-1", "summary", "Edited")
+
+    response = client.get("/")
+
+    assert 'formaction="/items/bulk-revert"' not in response.text
+
+
+def test_items_page_modified_board_always_shows_an_archived_fix_version_item(tmp_path: Path) -> None:
+    # Same bypass, for the archived-item exclusion instead of Active-only
+    # -- a modified item tagged with an archived fix version for reasons
+    # unrelated to the pending edit must still show up for review.
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "tagged archived",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "fixVersions": [{"name": "old-version"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    _write_versions_cache(tmp_path, "SAT", [{"id": "1", "name": "old-version", "released": True, "archived": True}])
+    set_field(tmp_path, "SAT-1", "summary", "Edited summary")
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/", params={"board": "Modified Items"})
+
+    assert "SAT-1" in response.text
+
+
 def test_items_page_modified_board_is_always_a_flat_list(tmp_path: Path) -> None:
     # No Active/Backlog split and no swimlane grouping for this board, even
     # if a swimlane/board_scope happens to still be set from before.
@@ -3315,6 +4132,106 @@ def test_items_page_shows_a_badge_only_on_modified_rows(tmp_path: Path) -> None:
     sat2_start = response.text.index(">SAT-2<")
     assert "modified-badge" in response.text[sat1_start : sat1_start + 200]
     assert "modified-badge" not in response.text[sat2_start : sat2_start + 200]
+
+
+def test_items_page_bulk_select_checkbox_present_for_editable_rows(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.get("/")
+
+    assert f'<input type="checkbox" name="keys" value="SAT-1" form="{BULK_EDIT_FORM_ID}"' in response.text
+    assert f'<input type="checkbox" name="keys" value="SAT-2" form="{BULK_EDIT_FORM_ID}"' in response.text
+    assert '<input type="checkbox" id="bulk-select-all" onclick="jiraWbBulkToggleAll(this)"' in response.text
+
+
+def test_items_page_bulk_select_checkbox_absent_for_read_only_rows(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+
+    response = client.get("/")
+
+    assert 'name="keys"' not in response.text
+    assert 'id="bulk-select-all"' not in response.text
+    # No bulk-edit bar/form at all -- nothing on this page could ever be
+    # bulk-edited, so offering the controls would just be a dead end. The
+    # shared CSS rule (present on every page, gated on nothing) still
+    # mentions the form id in its own comment, so this checks for the
+    # actual <form> tag specifically, not the bare id substring anywhere.
+    assert f'<form id="{BULK_EDIT_FORM_ID}"' not in response.text
+
+
+def test_items_page_bulk_edit_bar_present_with_all_five_fields(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.get("/")
+
+    assert f'<form id="{BULK_EDIT_FORM_ID}" method="post" action="/items/bulk-fields"' in response.text
+    # One field dropdown, not five separate Apply buttons -- one option
+    # per bulk-editable field, each with its own value control (only the
+    # one matching the dropdown's current selection is visible at a time).
+    assert '<select name="bulk_field" id="bulk-field-select"' in response.text
+    for bulk_field, form_field_name in (
+        ("status", "status_value"),
+        ("priority", "priority_value"),
+        ("component", "component_value"),
+        ("assignee", "assignee_value"),
+        ("fixVersions", "fixversions_value"),
+    ):
+        assert f'<option value="{bulk_field}">' in response.text
+        assert f'name="{form_field_name}"' in response.text
+    assert response.text.count('<button type="submit" onclick="return jiraWbBulkConfirm()">Apply</button>') == 1
+    assert "jiraWbBulkToggleAll" in response.text
+    assert "jiraWbBulkFieldChanged" in response.text
+
+
+def test_items_page_bulk_edit_bar_hidden_until_a_row_is_selected(tmp_path: Path) -> None:
+    # Regression: the bar used to always show ("0 selected" and all five
+    # controls) even with nothing checked -- just clutter above the table
+    # on every page load. It's still rendered (so jiraWbBulkUpdateCount has
+    # something to reveal) but starts hidden via CSS until a row's own
+    # checkbox is actually checked.
+    client = _synced_client(tmp_path)
+
+    response = client.get("/")
+
+    assert ".bulk-edit-bar {" in response.text
+    assert "display: none; flex-wrap: wrap;" in response.text
+    assert ".bulk-edit-bar.bulk-edit-bar-visible { display: flex; }" in response.text
+    assert "bulk-edit-bar-visible" in response.text  # the class jiraWbBulkUpdateCount toggles on
+    bar_start = response.text.index(f'<form id="{BULK_EDIT_FORM_ID}"')
+    bar_class_end = response.text.index(">", bar_start)
+    assert "bulk-edit-bar-visible" not in response.text[bar_start:bar_class_end]  # not visible on initial render
+
+
+def test_items_page_bulk_edit_bar_options_include_every_rendered_projects_values(tmp_path: Path) -> None:
+    # Two projects visible at once -- the bulk bar's own option lists are
+    # the union across both, not just whichever project happened to
+    # render first.
+    sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path),
+        FakeJiraClient(),
+        progress=None,
+    )
+    write_json(
+        tmp_path / "components/other-project/PLAT-1/issue.json",
+        {"key": "PLAT-1", "fields": {"summary": "A PLAT epic", "issuetype": {"name": "Epic"}, "status": {"name": "Open"}}},
+    )
+    build_manifest(tmp_path)
+    config = WorkbenchConfig(
+        projects=(
+            ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),
+            ProjectSettings(key="PLAT"),
+        )
+    )
+    client = TestClient(create_app(tmp_path, config))
+
+    response = client.get("/")
+
+    bar_start = response.text.index(f'<form id="{BULK_EDIT_FORM_ID}"')
+    bar_end = response.text.index("</form>", bar_start)
+    bar = response.text[bar_start:bar_end]
+    assert "Open" in bar  # SAT's own observed status
+    assert "Epic" not in bar  # bulk bar has no Type field at all -- Type isn't one of the bulk-editable fields
 
 
 def test_items_page_push_button_shown_only_when_something_is_modified(tmp_path: Path) -> None:
@@ -3990,8 +4907,50 @@ def test_item_detail_page_fix_version_edit_widget_keeps_every_current_value_chec
 
     widget_start = response.text.index('name="field" value="fixVersions"')
     widget = response.text[widget_start : widget_start + 1000]
-    assert 'value="kube 1.3.0" checked' in widget
-    assert 'value="kube 1.4.0" checked' in widget
+    assert set(_icon_select_current_values(widget)) == {"kube 1.3.0", "kube 1.4.0"}
+    assert "kube 1.3.0" in widget and "kube 1.4.0" in widget  # both shown as their own removable pill
+
+
+def test_item_detail_page_fix_version_widget_matches_the_items_list_grouping(tmp_path: Path) -> None:
+    # The Detail page's own fixVersions editor uses the exact same
+    # fix_version_groups() the Items list's own fixVersion widget does --
+    # same Released/Unreleased grouping, same archived exclusion -- rather
+    # than the two pages showing different option sets via two different
+    # mechanisms.
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "SAT one",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "fixVersions": [{"name": "kube 1.2.0"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    _write_versions_cache(
+        tmp_path,
+        "SAT",
+        [
+            {"id": "1", "name": "kube 1.2.0", "released": True, "archived": False},
+            {"id": "2", "name": "kube 1.3.0", "released": False, "archived": False},
+            {"id": "3", "name": "kube-old", "released": True, "archived": True},
+        ],
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/items/SAT-1")
+
+    widget_start = response.text.index('name="field" value="fixVersions"')
+    widget = response.text[widget_start : widget_start + 1000]
+    options_html = _icon_select_template_content(response.text, widget)
+    released_idx = options_html.index("Released")
+    unreleased_idx = options_html.index("Unreleased")
+    assert released_idx < options_html.index("kube 1.2.0") < unreleased_idx
+    assert unreleased_idx < options_html.index("kube 1.3.0")
+    assert "kube-old" not in options_html  # archived, excluded even though released
 
 
 def test_items_page_fix_version_hides_released_and_archived_by_default(tmp_path: Path) -> None:
@@ -4053,6 +5012,38 @@ def test_items_page_fix_version_hides_released_and_archived_by_default(tmp_path:
     assert "sat-archived" not in checklist
 
 
+def test_items_page_fix_version_named__archived_is_hidden_even_though_not_flagged(tmp_path: Path) -> None:
+    # A version literally named "_archived" is treated as archived
+    # everywhere (see is_archived_version) even when Jira's own flag on it
+    # is False -- a local convention for marking something archived
+    # without needing (or being able) to flip the real Jira flag.
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "tagged with the _archived version",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "fixVersions": [{"name": "_archived"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    _write_versions_cache(tmp_path, "SAT", [{"id": "1", "name": "_archived", "released": False, "archived": False}])
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    checklist = _fix_version_checklist(client.get("/", params={"project": "SAT", "show_released": "1"}).text)
+    assert "_archived" not in checklist
+
+    # The item itself is hidden by default too, same as any other item
+    # tagged with a genuinely archived version (see is_archived_item).
+    hidden = client.get("/", params={"project": "SAT"})
+    assert "SAT-1" not in hidden.text
+    revealed = client.get("/", params={"project": "SAT", "show_archived": "1"})
+    assert "SAT-1" in revealed.text
+
+
 def test_items_page_show_released_toggle_reveals_released_but_never_archived(tmp_path: Path) -> None:
     # The checklist only ever lists versions actually assigned to a
     # currently-synced item (it's a filter over what's here, not a full
@@ -4110,6 +5101,193 @@ def test_items_page_show_released_toggle_reveals_released_but_never_archived(tmp
     assert "sat-unreleased" in checklist
     assert "sat-released" in checklist
     assert "sat-archived" not in checklist
+
+
+def test_items_page_hides_archived_items_by_default(tmp_path: Path) -> None:
+    # An item counts as archived, for now, if any of its own fix versions
+    # is itself an archived version (see is_archived_item) -- hidden by
+    # default, same as Done/Closed items are under "Active only".
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "current item",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "fixVersions": [{"name": "sat-unreleased"}],
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/compA/SAT-2/issue.json",
+        {
+            "key": "SAT-2",
+            "fields": {
+                "summary": "archived item",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "fixVersions": [{"name": "sat-archived"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    _write_versions_cache(
+        tmp_path,
+        "SAT",
+        [
+            {"id": "1", "name": "sat-unreleased", "released": False, "archived": False},
+            {"id": "2", "name": "sat-archived", "released": False, "archived": True},
+        ],
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    hidden = client.get("/", params={"project": "SAT"})
+    assert "SAT-1" in hidden.text
+    assert "SAT-2" not in hidden.text
+
+    revealed = client.get("/", params={"project": "SAT", "show_archived": "1"})
+    assert "SAT-1" in revealed.text
+    assert "SAT-2" in revealed.text
+
+
+def test_items_page_show_archived_checkbox_reflects_query_state(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    unchecked = client.get("/").text
+    checked = client.get("/", params={"show_archived": "1"}).text
+
+    assert 'name="show_archived" value="1" ' in unchecked and 'name="show_archived" value="1" checked' not in unchecked
+    assert 'name="show_archived" value="1" checked' in checked
+
+
+def test_items_page_hides_items_with_an_archived_component_by_default(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/compA/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "current",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "components": [{"name": "helm-chart"}],
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/compB/SAT-2/issue.json",
+        {
+            "key": "SAT-2",
+            "fields": {
+                "summary": "archived component item",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "components": [{"name": "terraform"}],
+            },
+        },
+    )
+    build_manifest(tmp_path)
+    set_component_archived(tmp_path, "SAT", "terraform", True)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    hidden = client.get("/", params={"project": "SAT"})
+    assert "SAT-1" in hidden.text
+    assert "SAT-2" not in hidden.text
+
+    revealed = client.get("/", params={"project": "SAT", "show_archived": "1"})
+    assert "SAT-1" in revealed.text
+    assert "SAT-2" in revealed.text
+
+
+def test_items_page_component_dropdown_excludes_archived_but_keeps_it_as_the_current_pill(tmp_path: Path) -> None:
+    _write_sat_issue_with_component(tmp_path, "SAT-1", "helm-chart")
+    _write_sat_issue_with_component(tmp_path, "SAT-2", "training")
+    build_manifest(tmp_path)
+    write_json(
+        tmp_path / "meta/SAT/customfield_10071-options.json",
+        {
+            "project": "SAT",
+            "field": "customfield_10071",
+            "options": [{"id": "1", "value": "helm-chart"}, {"id": "2", "value": "training"}],
+        },
+    )
+    set_component_archived(tmp_path, "SAT", "training", True)
+    client = TestClient(create_app(tmp_path, _custom_field_options_config()))
+
+    # SAT-2's own component is now archived, so it needs show_archived=1
+    # just to appear on the page at all (see the filtering test above).
+    response = client.get("/", params={"show_archived": "1"})
+
+    row_start = response.text.index(">SAT-2<")
+    row_end = response.text.index("</tr>", row_start)
+    row = response.text[row_start:row_end]
+    assert "training" in row  # still shown as SAT-2's own current value
+
+    widget_start = response.text.index('name="field" value="customfield_10071"')
+    widget = response.text[widget_start : widget_start + 1000]
+    options_html = _icon_select_template_content(response.text, widget)
+    assert "training" not in options_html  # but not offered as a fresh pick anymore
+    assert "helm-chart" in options_html
+
+
+def test_meta_components_page_shows_archived_tag_and_toggle_action(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "manifest.json",
+        {
+            "workItems": [
+                {"key": "SAT-1", "project": "SAT", "component": "helm-chart", "status": "To Do"},
+                {"key": "SAT-2", "project": "SAT", "component": "terraform", "status": "To Do"},
+            ],
+        },
+    )
+    set_component_archived(tmp_path, "SAT", "helm-chart", True)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/meta/components", params={"project": "SAT"})
+
+    assert response.status_code == 200
+    # Archived components stay listed on this admin page (unlike the Items
+    # list and the assignment dropdowns) -- just tagged, with a toggle.
+    archived_start = response.text.index("helm-chart")
+    archived_row_end = response.text.index("</tr>", archived_start)
+    archived_row = response.text[archived_start:archived_row_end]
+    assert "Archived" in archived_row
+    assert ">Unarchive<" in archived_row
+    assert 'name="archived" value="0"' in archived_row
+
+    active_start = response.text.index("terraform")
+    active_row_end = response.text.index("</tr>", active_start)
+    active_row = response.text[active_start:active_row_end]
+    assert ">Archive<" in active_row
+    assert 'name="archived" value="1"' in active_row
+
+
+def test_post_meta_component_archive_toggles_local_state_without_a_jira_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    fake = ApiClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    response = client.post(
+        "/meta/components/archive",
+        data={"project": "SAT", "name": "helm-chart", "archived": "1"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert "flash_kind=success" in response.headers["location"]
+    assert load_component_settings(tmp_path) == {"archivedComponents": {"SAT": ["helm-chart"]}}
+    # Purely local -- Jira has no archived concept for components at all.
+    assert fake.calls == []
+
+    client.post(
+        "/meta/components/archive",
+        data={"project": "SAT", "name": "helm-chart", "archived": "0"},
+        follow_redirects=False,
+    )
+
+    assert load_component_settings(tmp_path) == {"archivedComponents": {}}
 
 
 def test_items_page_show_released_toggle_submits_on_change(tmp_path: Path) -> None:
@@ -4468,7 +5646,11 @@ def test_item_detail_page_component_edit_dropdown_includes_options_never_used_by
 
     widget_start = response.text.index('name="field" value="customfield_10071"')
     widget = response.text[widget_start : widget_start + 1000]
-    assert "training" in widget
+    # "training" isn't the current value, so it only lives in the widget's
+    # own inline <template> (see _detail_pill_field_html), not in the
+    # trigger/pill markup that follows the "field" hidden input.
+    options_html = _icon_select_template_content(response.text, widget)
+    assert "training" in options_html
 
 
 def test_new_issue_page_component_dropdown_includes_options_never_used_by_any_issue(
@@ -4536,3 +5718,535 @@ def test_items_page_assignee_edit_dropdown_respects_manual_exclude_list_without_
     widget = response.text[widget_start : widget_start + 1500]
     assert "Serge Colle" in widget
     assert "Al Baker" not in widget
+
+
+def test_items_page_shows_freshdesk_tickets_alongside_jira_items(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/", params={"active": "0"})
+
+    assert "SAT-1" in response.text
+    assert "FD-1" in response.text
+    assert "FD-2" in response.text
+
+
+def test_items_page_freshdesk_rows_have_no_bulk_select_checkbox(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/", params={"active": "0"})
+
+    fd_row_start = response.text.index(">FD-1<")
+    row_html = response.text[max(0, fd_row_start - 400) : fd_row_start]
+    assert 'name="keys" value="FD-1"' not in row_html
+
+
+def test_items_page_freshdesk_rows_are_not_editable_pill_selects(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/", params={"active": "0"})
+
+    assert '/items/FD-1/fields' not in response.text
+    assert '/items/FD-2/fields' not in response.text
+
+
+def test_items_page_total_count_includes_freshdesk_tickets(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/", params={"active": "0"})
+
+    assert "4 of 4 synced items match the current filter." in response.text
+
+
+def test_items_page_project_filter_offers_freshdesk_as_a_project(tmp_path: Path) -> None:
+    # Project/Status/Component/Assignee checkboxes render inside _filter_form,
+    # in the page's header filter panel -- not <aside>, which is a separate
+    # sidebar element (_board_scope_section's own Board/Scope/Swimlane
+    # selectors only).
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/", params={"active": "0"})
+
+    assert 'value="FRESHDESK"' in response.text
+    assert 'value="SAT"' in response.text
+
+
+def test_items_page_selecting_freshdesk_project_isolates_freshdesk_tickets(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/", params={"active": "0", "project": "FRESHDESK"})
+
+    assert "FD-1" in response.text
+    assert "FD-2" in response.text
+    assert "SAT-1" not in response.text
+    assert "SAT-2" not in response.text
+
+
+def test_items_page_status_filter_reflects_freshdesk_statuses_when_scoped(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(
+        tmp_path, tickets={1: _ticket(1, status=2), 2: _ticket(2, status=5)}
+    )
+
+    response = client.get("/", params={"active": "0", "project": "FRESHDESK"})
+
+    assert 'value="Open"' in response.text
+    assert 'value="Closed"' in response.text
+
+
+def test_items_page_works_with_freshdesk_only_and_no_jira_manifest(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path, sync_jira=False)
+
+    response = client.get("/", params={"active": "0"})
+
+    assert "No manifest found" not in response.text
+    assert "FD-1" in response.text
+    assert "FD-2" in response.text
+
+
+def test_item_detail_page_renders_a_freshdesk_ticket(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(
+        tmp_path, tickets={1: _ticket(1, subject="Login broken", tags=["vip"])}
+    )
+
+    response = client.get("/items/FD-1")
+
+    assert response.status_code == 200
+    assert "<h1>FD-1</h1>" in response.text
+    assert "Login broken" in response.text
+    assert "Alice Agent" in response.text
+    assert "Support" in response.text
+    assert "read-only in this workbench" in response.text
+
+
+def test_item_detail_page_freshdesk_ticket_shows_its_requester(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(
+        tmp_path,
+        tickets={1: _ticket(1, requester={"name": "Jane Customer", "email": "jane@example.com"})},
+    )
+
+    response = client.get("/items/FD-1")
+
+    assert "Jane Customer" in response.text
+    assert "jane@example.com" in response.text
+
+
+def test_item_detail_page_freshdesk_ticket_shows_its_conversation(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1)})
+
+    response = client.get("/items/FD-1")
+
+    assert "reply on 1" in response.text
+
+
+def test_item_detail_page_404s_for_a_key_that_matches_neither_source(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    response = client.get("/items/FD-999")
+
+    assert response.status_code == 404
+
+
+def test_item_detail_page_freshdesk_ticket_links_to_a_known_jira_project_tag(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1, tags=["escalated_to_eng", "SAT-1"])})
+
+    response = client.get("/items/FD-1")
+
+    assert "Linked Jira issues" in response.text
+    assert '<a href="/items/SAT-1">SAT-1</a>' in response.text
+
+
+def test_item_detail_page_freshdesk_ticket_omits_linked_section_with_no_match(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1, tags=[])})
+
+    response = client.get("/items/FD-1")
+
+    assert "Linked Jira issues" not in response.text
+
+
+def test_item_detail_page_freshdesk_ticket_ignores_a_tag_from_an_unsynced_project(tmp_path: Path) -> None:
+    # STA isn't a configured/synced Jira project in this fixture -- same
+    # real-world shape as this account's own Craft.io idea ids.
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1, tags=["STA-1036"])})
+
+    response = client.get("/items/FD-1")
+
+    assert "Linked Jira issues" not in response.text
+
+
+def test_item_detail_page_jira_issue_links_to_a_freshdesk_ticket_via_comment_mirror(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1)})
+    (comments_path,) = tmp_path.glob("components/*/SAT-1/comments.json")
+    write_json(
+        comments_path,
+        {"comments": [{"body": "Ticket ID: 1 Note Added by Steve Place in Freshdesk: following up", "author": {}}]},
+    )
+
+    response = client.get("/items/SAT-1")
+
+    assert "Linked Freshdesk tickets" in response.text
+    assert '<a href="/items/FD-1">FD-1</a>' in response.text
+
+
+def test_item_detail_page_jira_issue_does_not_link_to_an_unsynced_freshdesk_ticket(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1)})
+    (comments_path,) = tmp_path.glob("components/*/SAT-1/comments.json")
+    write_json(
+        comments_path,
+        {"comments": [{"body": "Ticket ID: 999 Note Added by Steve Place in Freshdesk: following up", "author": {}}]},
+    )
+
+    response = client.get("/items/SAT-1")
+
+    assert "Linked Freshdesk tickets" not in response.text
+
+
+def test_assistant_page_renders_a_blank_form(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/assistant")
+
+    assert response.status_code == 200
+    assert '<select name="engine">' in response.text
+    assert '<option value="claude"' in response.text
+    assert '<option value="codex"' in response.text
+    assert "<textarea" in response.text
+    assert 'name="conversation"' not in response.text
+
+
+def test_assistant_page_unknown_conversation_falls_back_to_a_blank_form(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/assistant", params={"conversation": "does-not-exist"})
+
+    assert response.status_code == 200
+    assert 'name="conversation"' not in response.text
+
+
+class _SyncThread:
+    """Stands in for threading.Thread -- runs `target` synchronously on
+    .start() instead of spawning a real background thread, so a test can
+    assert on the outcome of post_assistant's background work
+    deterministically instead of racing a real one."""
+
+    def __init__(self, target, daemon=True) -> None:
+        self._target = target
+
+    def start(self) -> None:
+        self._target()
+
+
+def _conversation_id_from_location(location: str) -> str:
+    return location.split("conversation=")[1]
+
+
+def test_post_assistant_renders_the_answer_after_redirect(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer="42 open tickets", error=None, session_id="sess-1", duration_seconds=1.0
+        ),
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    post_response = client.post(
+        "/assistant", data={"engine": "claude", "question": "how many open tickets?"}, follow_redirects=False
+    )
+    assert post_response.status_code == 303
+    conversation_id = _conversation_id_from_location(post_response.headers["location"])
+
+    response = client.get(post_response.headers["location"])
+    assert "how many open tickets?" in response.text
+    assert "42 open tickets" in response.text
+    assert f'value="{conversation_id}"' in response.text
+
+
+def test_post_assistant_follow_up_passes_the_resume_id_and_appends_the_transcript(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    calls = []
+
+    def fake_ask(engine, jira_dir, question, *, resume_id=None, on_step=None):
+        calls.append((engine, question, resume_id))
+        return AssistantResult(engine=engine, answer=f"answer to: {question}", error=None, session_id="sess-1", duration_seconds=1.0)
+
+    monkeypatch.setattr(jira_workbench.server, "assistant_ask_streaming", fake_ask)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    first = client.post("/assistant", data={"engine": "claude", "question": "first question"}, follow_redirects=False)
+    first_conversation = _conversation_id_from_location(first.headers["location"])
+    response = client.post(
+        "/assistant",
+        data={"engine": "claude", "question": "second question", "conversation": first_conversation},
+        follow_redirects=True,
+    )
+
+    # resume_id is the *engine's own* session id ("sess-1"), never the
+    # locally-minted conversation id in the URL.
+    assert calls == [("claude", "first question", None), ("claude", "second question", "sess-1")]
+    assert "first question" in response.text
+    assert "second question" in response.text
+    assert "answer to: first question" in response.text
+    assert "answer to: second question" in response.text
+
+
+def test_post_assistant_switching_engine_starts_a_fresh_conversation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    calls = []
+
+    def fake_ask(engine, jira_dir, question, *, resume_id=None, on_step=None):
+        calls.append((engine, question, resume_id))
+        return AssistantResult(engine=engine, answer="an answer", error=None, session_id=f"sess-{engine}", duration_seconds=1.0)
+
+    monkeypatch.setattr(jira_workbench.server, "assistant_ask_streaming", fake_ask)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    first = client.post("/assistant", data={"engine": "claude", "question": "first question"}, follow_redirects=False)
+    first_conversation = _conversation_id_from_location(first.headers["location"])
+    response = client.post(
+        "/assistant",
+        data={"engine": "codex", "question": "second question", "conversation": first_conversation},
+        follow_redirects=True,
+    )
+
+    # No resume_id -- a different engine on the same conversation id starts fresh.
+    assert calls[1] == ("codex", "second question", None)
+    assert "first question" not in response.text
+    assert "second question" in response.text
+
+
+def test_post_assistant_error_shows_up_once_the_background_work_finishes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer="", error="claude is not installed", session_id=None, duration_seconds=0.0
+        ),
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    post_response = client.post(
+        "/assistant", data={"engine": "claude", "question": "how many open tickets?"}, follow_redirects=False
+    )
+    response = client.get(post_response.headers["location"])
+
+    assert "claude is not installed" in response.text
+
+
+def test_post_assistant_rejects_an_empty_question_without_starting_a_conversation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server, "assistant_ask_streaming", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")))
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.post("/assistant", data={"engine": "claude", "question": "   "}, follow_redirects=False)
+
+    assert "flash=question+must+not+be+empty" in response.headers["location"]
+    assert "conversation=" not in response.headers["location"]
+
+
+def test_post_assistant_rejects_an_unknown_engine(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.post("/assistant", data={"engine": "gpt5", "question": "hi"}, follow_redirects=False)
+
+    assert "flash=unknown+engine" in response.headers["location"]
+
+
+def test_get_assistant_page_shows_running_state_and_poll_script(tmp_path: Path, monkeypatch) -> None:
+    # Uses a *real* background thread here (not _SyncThread) specifically
+    # to exercise the "still running" page/poll-endpoint state -- the fake
+    # engine call blocks on `release` until the test says it's done
+    # looking.
+    release = threading.Event()
+
+    def fake_ask(engine, jira_dir, question, *, resume_id=None, on_step=None):
+        on_step("Reading issue.json")
+        release.wait(timeout=2)
+        return AssistantResult(engine=engine, answer="done answer", error=None, session_id="sess-1", duration_seconds=0.1)
+
+    monkeypatch.setattr(jira_workbench.server, "assistant_ask_streaming", fake_ask)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    post_response = client.post("/assistant", data={"engine": "claude", "question": "q"}, follow_redirects=False)
+    location = post_response.headers["location"]
+    conversation_id = _conversation_id_from_location(location)
+
+    try:
+        response = client.get(location)
+        assert "this can take a minute" in response.text
+        assert '<ul id="assistant-steps">' in response.text
+        assert json.dumps(conversation_id) in response.text
+        assert "<textarea" not in response.text
+
+        poll_response = client.get("/assistant/poll", params={"conversation": conversation_id})
+        assert poll_response.json()["status"] == "running"
+        assert "Reading issue.json" in poll_response.json()["steps"]
+    finally:
+        release.set()
+
+
+def test_get_assistant_poll_for_an_unknown_conversation_reports_done(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/assistant/poll", params={"conversation": "does-not-exist"})
+
+    assert response.json() == {"status": "done", "steps": []}
+
+
+def test_post_assistant_renders_markdown_in_the_answer(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    answer = "Here's what I found:\n\n- **FD-4601** — *a feature request*\n- **VET-7357** — Done\n\n---\n\nAll set."
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer=answer, error=None, session_id="sess-1", duration_seconds=1.0
+        ),
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    post_response = client.post("/assistant", data={"engine": "claude", "question": "q"}, follow_redirects=False)
+    response = client.get(post_response.headers["location"])
+
+    assert "<li><strong>FD-4601</strong>" in response.text
+    assert "<em>a feature request</em>" in response.text
+    assert "<hr" in response.text
+    # The literal markdown syntax shouldn't survive as visible text.
+    assert "**FD-4601**" not in response.text
+
+
+def test_post_assistant_escapes_html_looking_text_in_the_answer_instead_of_rendering_it(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer="Found this: <script>alert(1)</script>", error=None, session_id="sess-1", duration_seconds=1.0
+        ),
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    post_response = client.post("/assistant", data={"engine": "claude", "question": "q"}, follow_redirects=False)
+    response = client.get(post_response.headers["location"])
+
+    assert "<script>alert(1)</script>" not in response.text
+    assert "&lt;script&gt;" in response.text
+
+
+def test_assistant_conversations_survive_a_server_restart(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer="42 open tickets", error=None, session_id="sess-1", duration_seconds=1.0
+        ),
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    post_response = client.post(
+        "/assistant", data={"engine": "claude", "question": "how many open tickets?"}, follow_redirects=False
+    )
+    conversation_id = _conversation_id_from_location(post_response.headers["location"])
+
+    # Simulate a server restart: a brand new app/process reading the same jira_dir.
+    restarted_client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    response = restarted_client.get("/assistant", params={"conversation": conversation_id})
+
+    assert "how many open tickets?" in response.text
+    assert "42 open tickets" in response.text
+    assert f'value="{conversation_id}"' in response.text
+
+    # A follow-up after the restart should still resume using the engine's
+    # own session id, recovered from disk.
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer=f"resumed with {resume_id}", error=None, session_id="sess-2", duration_seconds=1.0
+        ),
+    )
+    follow_up = restarted_client.post(
+        "/assistant",
+        data={"engine": "claude", "question": "and now?", "conversation": conversation_id},
+        follow_redirects=True,
+    )
+    assert "resumed with sess-1" in follow_up.text
+
+
+def test_assistant_conversations_still_running_at_restart_are_not_restored(tmp_path: Path, monkeypatch) -> None:
+    release = threading.Event()
+
+    def fake_ask(engine, jira_dir, question, *, resume_id=None, on_step=None):
+        release.wait(timeout=2)
+        return AssistantResult(engine=engine, answer="done answer", error=None, session_id="sess-1", duration_seconds=0.1)
+
+    monkeypatch.setattr(jira_workbench.server, "assistant_ask_streaming", fake_ask)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    post_response = client.post("/assistant", data={"engine": "claude", "question": "q"}, follow_redirects=False)
+    conversation_id = _conversation_id_from_location(post_response.headers["location"])
+
+    try:
+        # The background thread is still running (blocked on `release`), so
+        # nothing has been persisted for this conversation yet.
+        restarted_client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+        response = restarted_client.get("/assistant", params={"conversation": conversation_id})
+        assert 'name="conversation"' not in response.text
+    finally:
+        release.set()
+
+
+def test_load_assistant_conversations_degrades_gracefully_when_file_is_missing_or_malformed(tmp_path: Path) -> None:
+    assert jira_workbench.server._load_assistant_conversations(tmp_path) == {}
+
+    (tmp_path / "assistant_conversations.json").write_text("not json", encoding="utf-8")
+    assert jira_workbench.server._load_assistant_conversations(tmp_path) == {}
+
+    write_json(tmp_path / "assistant_conversations.json", ["not", "a", "dict"])
+    assert jira_workbench.server._load_assistant_conversations(tmp_path) == {}
+
+    write_json(
+        tmp_path / "assistant_conversations.json",
+        {"good": {"engine": "claude", "turns": [{"question": "q", "answer": "a"}], "engine_session_id": "sess-1"}, "bad": {"engine": "claude"}},
+    )
+    restored = jira_workbench.server._load_assistant_conversations(tmp_path)
+    assert set(restored) == {"good"}
+    assert restored["good"] == {
+        "engine": "claude",
+        "status": "done",
+        "steps": [],
+        "turns": [{"question": "q", "answer": "a"}],
+        "engine_session_id": "sess-1",
+        "error": None,
+    }
+
+
+def test_assistant_conversation_with_an_errored_turn_still_persists_its_prior_history(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer="42 open tickets", error=None, session_id="sess-1", duration_seconds=1.0
+        ),
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    first = client.post("/assistant", data={"engine": "claude", "question": "first question"}, follow_redirects=False)
+    conversation_id = _conversation_id_from_location(first.headers["location"])
+
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer="", error="claude is not installed", session_id=None, duration_seconds=0.0
+        ),
+    )
+    client.post(
+        "/assistant",
+        data={"engine": "claude", "question": "second question", "conversation": conversation_id},
+        follow_redirects=False,
+    )
+
+    restarted_client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    response = restarted_client.get("/assistant", params={"conversation": conversation_id})
+    assert "first question" in response.text
+    assert "42 open tickets" in response.text
+    assert "second question" not in response.text

@@ -7,7 +7,7 @@ from typing import Any
 
 from .shadow import PushResult, push_shadows, set_field
 from .sync import issue_key_sort_key
-from .view import display_name, load_manifest_items
+from .view import display_name, is_archived_version, load_manifest_items
 from .metadata import (
     JiraApiConfig,
     MetadataError,
@@ -359,7 +359,7 @@ def version_filter_text(version: dict[str, object]) -> str:
             version_name(version),
             str(version.get("id") or ""),
             "released" if version.get("released") else "unreleased",
-            "archived" if version.get("archived") else "",
+            "archived" if is_archived_version(version) else "",
         ]
     )
 

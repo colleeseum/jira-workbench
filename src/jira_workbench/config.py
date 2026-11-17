@@ -25,6 +25,13 @@ class ConfigError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class FreshdeskSettings:
+    slug: str
+    domain: str
+    api_key: str
+
+
+@dataclass(frozen=True)
 class ProjectSettings:
     key: str
     default: bool = False
@@ -44,6 +51,7 @@ class WorkbenchConfig:
     jira_email: str | None = None
     jira_api_token: str | None = None
     projects: tuple[ProjectSettings, ...] = ()
+    freshdesk_sources: tuple[FreshdeskSettings, ...] = ()
     sync_history_months: int | None = None
     view_project: tuple[str, ...] | None = None
     view_status: tuple[str, ...] | None = None
@@ -196,6 +204,7 @@ def load_config(path: Path) -> WorkbenchConfig:
         jira_email=optional_string(data, "jira_email", expanded),
         jira_api_token=optional_string(data, "jira_api_token", expanded),
         projects=parse_projects(data.get("projects"), expanded),
+        freshdesk_sources=parse_freshdesk_sources(data.get("sources"), expanded),
         sync_history_months=optional_positive_int(data, "sync_history_months", expanded),
         view_project=optional_string_tuple(view, "project", expanded),
         view_status=optional_string_tuple(view, "status", expanded),
@@ -261,6 +270,77 @@ def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
     if sum(1 for p in projects if p.default) > 1:
         raise ConfigError(f"invalid config file {path}: only one [[projects]] entry may set default = true")
     return tuple(projects)
+
+
+def parse_freshdesk_sources(value: Any, path: Path) -> tuple[FreshdeskSettings, ...]:
+    """`[[sources]]` -- currently the only supported `kind` is "freshdesk";
+    an unrecognized kind raises rather than being silently ignored, since a
+    typo'd kind would otherwise look like a working config with a source
+    that just never syncs anything. `slug` defaults to `kind` (today that
+    means "freshdesk"), which is enough until a second Freshdesk account
+    is ever configured side by side."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"invalid config file {path}: [[sources]] must be an array of tables")
+    sources = []
+    seen_slugs: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ConfigError(f"invalid config file {path}: each [[sources]] entry must be a table")
+        kind = entry.get("kind")
+        if kind != "freshdesk":
+            raise ConfigError(
+                f"invalid config file {path}: sources.kind must be \"freshdesk\" (got {kind!r})"
+            )
+        slug = optional_string(entry, "slug", path) or kind
+        domain = optional_string(entry, "domain", path)
+        if not domain:
+            raise ConfigError(f"invalid config file {path}: sources entry {slug!r} needs a non-empty domain")
+        domain = normalize_freshdesk_domain(domain, slug=slug, path=path)
+        api_key = optional_string(entry, "api_key", path)
+        if not api_key:
+            raise ConfigError(f"invalid config file {path}: sources entry {slug!r} needs a non-empty api_key")
+        if slug in seen_slugs:
+            raise ConfigError(f"invalid config file {path}: duplicate sources slug {slug!r}")
+        seen_slugs.add(slug)
+        sources.append(FreshdeskSettings(slug=slug, domain=domain, api_key=api_key))
+    return tuple(sources)
+
+
+def normalize_freshdesk_domain(domain: str, *, slug: str, path: Path) -> str:
+    """Accepts what someone would naturally paste in -- a bare subdomain
+    ("acme"), a full <name>.freshdesk.com hostname, or either with an
+    accidental http(s):// scheme/trailing path -- and reduces it to the
+    bare subdomain FreshdeskClient builds its base URL from.
+
+    Freshdesk's REST API documents that it "works only via Freshdesk
+    domains and not via custom CNAMEs" -- a support portal fronted by a
+    custom domain (e.g. support.company.com) still requires the account's
+    real <name>.freshdesk.com hostname for API calls, so a value that looks
+    like a custom domain (contains a "." and doesn't end in
+    ".freshdesk.com") is rejected here with a clear explanation instead of
+    silently building an unreachable "<value>.freshdesk.com" URL --
+    without this check, that mistake previously surfaced only as a
+    NameResolutionError deep inside requests, with a URL mangled beyond
+    recognition if the pasted value also included a scheme.
+    """
+    value = domain.strip()
+    for scheme in ("https://", "http://"):
+        if value.lower().startswith(scheme):
+            value = value[len(scheme) :]
+            break
+    value = value.split("/", 1)[0].strip()
+    if value.lower().endswith(".freshdesk.com"):
+        value = value[: -len(".freshdesk.com")]
+    if not value or "." in value:
+        raise ConfigError(
+            f"invalid config file {path}: sources entry {slug!r} has domain {domain!r}, which doesn't look like "
+            "a bare Freshdesk subdomain. Freshdesk's API only works via <subdomain>.freshdesk.com, even if your "
+            "support portal itself uses a custom domain -- set domain to just the subdomain part (e.g. \"acme\" "
+            "for acme.freshdesk.com), not a custom CNAME like \"support.yourcompany.com\"."
+        )
+    return value
 
 
 def optional_string(data: dict[str, Any], key: str, path: Path) -> str | None:

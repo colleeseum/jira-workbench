@@ -460,6 +460,158 @@ def recompute_board_membership(jira_dir: Path, *, source_slug: str = DEFAULT_SOU
         conn.close()
 
 
+def recompute_board_membership_all_sources(jira_dir: Path) -> None:
+    """recompute_board_membership for every real source (Jira, plus any
+    configured Freshdesk source once it's been synced at least once) --
+    used by local-board CRUD (metadata.py's write_board_settings), which
+    can't know in advance which source(s) a board's fieldFilters might
+    match. Reads the sources table directly rather than taking a
+    WorkbenchConfig, keeping db.py itself config-agnostic; a source that's
+    configured but never synced simply has no row here yet and is skipped,
+    same as it would be for any other per-source query."""
+    conn = connect(jira_dir)
+    try:
+        slugs = [row["slug"] for row in conn.execute("SELECT slug FROM sources").fetchall()]
+    finally:
+        conn.close()
+    for slug in slugs:
+        recompute_board_membership(jira_dir, source_slug=slug)
+
+
+def ensure_source(jira_dir: Path, slug: str, kind: str, display_name: str) -> int:
+    """Upserts a `sources` row for `slug`, creating it the first time a
+    source other than the bootstrapped default (Jira) is synced. Safe to
+    call on every sync run -- ON CONFLICT never touches `id` (or
+    `created_at`), so re-running this can't churn the id any items already
+    indexed under this source_id are keyed by."""
+    conn = connect(jira_dir)
+    try:
+        now = utc_now()
+        conn.execute(
+            """
+            INSERT INTO sources (slug, kind, display_name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+                kind = excluded.kind,
+                display_name = excluded.display_name,
+                updated_at = excluded.updated_at
+            """,
+            (slug, kind, display_name, now, now),
+        )
+        conn.commit()
+        return source_id(conn, slug)
+    finally:
+        conn.close()
+
+
+def reindex_freshdesk_items(jira_dir: Path, *, source_slug: str) -> int:
+    """Freshdesk's own reindex_items-equivalent -- structurally the same
+    upsert-then-delete-unseen pattern (same temp-table technique, for the
+    same SQLITE_MAX_VARIABLE_NUMBER reason), but walking
+    freshdesk/tickets/*/ticket.json and computing fields via
+    freshdesk_ticket_fields instead of compute_issue_fields. Kept as a
+    genuinely separate function rather than a generalized/parameterized
+    reindex_items: Jira's version is already entangled with
+    compute_issue_fields/observed_status_category_map/version_id_to_name_map
+    in ways not worth forcing into a shared callback for a first second
+    source -- revisit only if a third source makes the duplication costly.
+    """
+    from .freshdesk import freshdesk_dir, freshdesk_ticket_fields
+
+    base_dir = freshdesk_dir(jira_dir)
+    tickets_dir = base_dir / "tickets"
+    agents_by_id = read_json(base_dir / "agents.json") if (base_dir / "agents.json").exists() else {}
+    groups_by_id = read_json(base_dir / "groups.json") if (base_dir / "groups.json").exists() else {}
+    status_names = read_json(base_dir / "statuses.json") if (base_dir / "statuses.json").exists() else {}
+    if not isinstance(agents_by_id, dict):
+        agents_by_id = {}
+    if not isinstance(groups_by_id, dict):
+        groups_by_id = {}
+    if not isinstance(status_names, dict):
+        status_names = {}
+
+    conn = connect(jira_dir)
+    try:
+        sid = source_id(conn, source_slug)
+        count = 0
+        conn.execute("CREATE TEMP TABLE reindex_seen (external_key TEXT PRIMARY KEY)")
+        try:
+            if tickets_dir.exists():
+                for ticket_path in sorted(tickets_dir.glob("*/ticket.json")):
+                    ticket = read_json(ticket_path)
+                    if not isinstance(ticket, dict):
+                        continue
+                    fields = freshdesk_ticket_fields(
+                        ticket, agents_by_id=agents_by_id, groups_by_id=groups_by_id, status_names=status_names
+                    )
+                    key = fields["key"]
+                    local_path = ticket_path.parent.relative_to(jira_dir).as_posix()
+                    extra = json.dumps({"labels": fields["labels"]})
+                    conn.execute("INSERT INTO reindex_seen VALUES (?)", (key,))
+                    conn.execute(
+                        """
+                        INSERT INTO items (
+                            source_id, external_key, project, component, title, status,
+                            status_category, item_type, priority, assignee, fix_version,
+                            epic_key, epic_summary, updated_at, local_path, extra, synced_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(source_id, external_key) DO UPDATE SET
+                            project = excluded.project,
+                            component = excluded.component,
+                            title = excluded.title,
+                            status = excluded.status,
+                            status_category = excluded.status_category,
+                            item_type = excluded.item_type,
+                            priority = excluded.priority,
+                            assignee = excluded.assignee,
+                            fix_version = excluded.fix_version,
+                            epic_key = excluded.epic_key,
+                            epic_summary = excluded.epic_summary,
+                            updated_at = excluded.updated_at,
+                            local_path = excluded.local_path,
+                            extra = excluded.extra,
+                            synced_at = excluded.synced_at
+                        """,
+                        (
+                            sid,
+                            key,
+                            fields["project"],
+                            fields["component"],
+                            fields["summary"],
+                            fields["status"],
+                            fields["statusCategory"],
+                            fields["type"],
+                            fields["priority"],
+                            fields["assignee"],
+                            fields["fixVersion"],
+                            fields["epic"],
+                            fields["epicSummary"],
+                            fields["updated"],
+                            local_path,
+                            extra,
+                            utc_now(),
+                        ),
+                    )
+                    count += 1
+            conn.execute(
+                """
+                DELETE FROM items
+                WHERE source_id = ?
+                  AND NOT EXISTS (SELECT 1 FROM reindex_seen s WHERE s.external_key = items.external_key)
+                """,
+                (sid,),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("DROP TABLE IF EXISTS reindex_seen")
+    finally:
+        conn.close()
+    return count
+
+
 def set_item_has_shadow(
     jira_dir: Path, external_key: str, has_shadow: bool, *, source_slug: str = DEFAULT_SOURCE_SLUG
 ) -> None:
@@ -702,6 +854,24 @@ def distinct_projects_for_board(jira_dir: Path, board: str, *, source_slug: str 
     return {row["project"] for row in rows if row["project"]}
 
 
+def project_item_keys(jira_dir: Path, project: str, *, source_slug: str = DEFAULT_SOURCE_SLUG) -> set[str]:
+    """Every key currently indexed for `project` -- the "what we already
+    believed we had, before this sync's own writes" snapshot sync.py's
+    deleted-issue detection diffs against Jira's freshly fetched key list.
+    Reflects whatever the last reindex_items() left behind, not a live
+    filesystem scan -- exactly the point, since it's the "before" side of
+    the diff."""
+    conn = connect(jira_dir)
+    try:
+        sid = source_id(conn, source_slug)
+        rows = conn.execute(
+            "SELECT external_key FROM items WHERE source_id = ? AND project = ?", (sid, project)
+        ).fetchall()
+    finally:
+        conn.close()
+    return {row["external_key"] for row in rows}
+
+
 def project_versions(
     jira_dir: Path, project: str, *, source_slug: str = DEFAULT_SOURCE_SLUG
 ) -> tuple[list[dict[str, Any]], str] | None:
@@ -771,9 +941,14 @@ def _upsert_versions(
     stored in `extra` so `load_versions` can reconstruct a byte-identical
     cache entry (any field a caller reads -- releaseDate, description,
     whatever -- round-trips even though only name/released/archived are
-    promoted to real columns). `fetched_at` is passed in rather than
-    computed here so a caller writing both the JSON file and this table in
-    the same refresh can use one identical timestamp for both."""
+    promoted to real columns). This `archived` column is Jira's own raw
+    flag, deliberately not view.is_archived_version's broader "or named
+    _archived" rule -- it's a mirror of Jira's own truth, re-fetched and
+    overwritten safely on every refresh; the local naming convention is
+    applied at read time by whatever calls is_archived_version, not baked
+    into the stored cache. `fetched_at` is passed in rather than computed
+    here so a caller writing both the JSON file and this table in the same
+    refresh can use one identical timestamp for both."""
     rows = [
         (
             sid,

@@ -9,7 +9,15 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, ConfigError, choose, load_config, resolve_jira_dir, secure_config_permissions
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    ConfigError,
+    WorkbenchConfig,
+    choose,
+    load_config,
+    resolve_jira_dir,
+    secure_config_permissions,
+)
 from .metadata import (
     DEFAULT_METADATA_TTL_SECONDS,
     JiraApiConfig,
@@ -63,7 +71,7 @@ from .shadow import (
     unset_field,
 )
 from .sync import SyncConfig, SyncError, sync_project
-from .view import ViewError, detailed_shadow_report_lines, format_components, format_work_item
+from .view import SWIMLANE_MODES, ViewError, detailed_shadow_report_lines, format_components, format_work_item
 
 
 def open_interactive_view(
@@ -126,8 +134,8 @@ def open_interactive_view(
 
 
 _IN_PLACE_PROGRESS_PREFIXES = (
-    "[3/6] Syncing changed issues... ",
-    "[4/6] Backfilling parents excluded by the history cutoff... ",
+    "[3/7] Syncing changed issues... ",
+    "[5/7] Backfilling parents excluded by the history cutoff... ",
 )
 
 
@@ -166,7 +174,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    sync_parser = subparsers.add_parser("sync", help="Sync Jira work items into a local directory")
+    sync_parser = subparsers.add_parser(
+        "sync", help="Sync configured Jira and Freshdesk sources into a local directory"
+    )
+    sync_parser.add_argument(
+        "--source",
+        choices=["all", "jira", "freshdesk"],
+        default="all",
+        help=(
+            "Sources to sync (default: all configured Jira projects and Freshdesk sources). "
+            "Use jira or freshdesk to sync only that source kind. --force applies to both; "
+            "project, history, component, and Jira connection options apply only to Jira."
+        ),
+    )
     sync_parser.add_argument("--project", default=os.environ.get("JIRA_PROJECT"))
     sync_parser.add_argument("--component-field", default=os.environ.get("JIRA_COMPONENT_FIELD"))
     sync_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
@@ -211,8 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
     view_parser.add_argument("--filter", help="Filter the interactive item list by text pattern")
     view_parser.add_argument(
         "--swimlane",
-        choices=["none", "epic", "version", "component"],
-        help="Group the interactive item list by epic, version, or component",
+        choices=list(SWIMLANE_MODES),
+        help="Group the interactive item list by epic, version, component, board, or assignee",
     )
     view_parser.add_argument("--components", action="store_true", help="List synced components and exit")
     view_parser.add_argument(
@@ -423,6 +443,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def sync_configured_freshdesk(config: WorkbenchConfig, jira_dir: Path, *, force: bool = False) -> int:
+    from .freshdesk import FreshdeskClient, FreshdeskError, sync_freshdesk_source
+
+    if not config.freshdesk_sources:
+        print(
+            "error: no [[sources]] entries configured (kind = \"freshdesk\") in config.toml",
+            file=sys.stderr,
+        )
+        return 2
+    exit_code = 0
+    for freshdesk_source in config.freshdesk_sources:
+        progress_label = freshdesk_source.slug if len(config.freshdesk_sources) > 1 else None
+        progress = sync_progress_printer(sys.stderr, project=progress_label)
+        client = FreshdeskClient(freshdesk_source, progress=progress)
+        try:
+            result = sync_freshdesk_source(
+                freshdesk_source, jira_dir, client, force=force, progress=progress
+            )
+        except FreshdeskError as exc:
+            print(f"error: syncing freshdesk source {freshdesk_source.slug}: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+        prefix = "Synced" if len(config.freshdesk_sources) == 1 else f"Synced {freshdesk_source.slug}:"
+        failed_note = f", {len(result.failed_keys)} failed" if result.failed_keys else ""
+        print(f"{prefix} {result.ticket_count} tickets ({result.changed_count} changed{failed_note}).")
+        if result.failed_keys:
+            exit_code = 1
+            print(f"  could not sync: {', '.join(result.failed_keys)}", file=sys.stderr)
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -450,6 +501,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "sync":
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
+
+        if args.source == "freshdesk":
+            return sync_configured_freshdesk(config, jira_dir, force=args.force)
+
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
@@ -464,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
             projects_to_sync = [settings.key for settings in config.resolved_projects()]
 
         if not projects_to_sync:
+            if args.source == "all" and config.freshdesk_sources:
+                return sync_configured_freshdesk(config, jira_dir, force=args.force)
             print(
                 "error: missing required configuration: "
                 "project. Set it in ~/.config/jira-wb/config.toml or pass --project.",
@@ -482,7 +539,8 @@ def main(argv: list[str] | None = None) -> int:
                 api_project, api_client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             except MetadataError as exc:
                 print(f"error: {exc}", file=sys.stderr)
-                return 2
+                exit_code = 2
+                continue
             history_months = (
                 int(args.history_months) if args.history_months is not None else config.effective_history_months(project)
             )
@@ -508,16 +566,26 @@ def main(argv: list[str] | None = None) -> int:
             backfilled_note = (
                 f", {result.backfilled_parent_count} parent(s) backfilled" if result.backfilled_parent_count else ""
             )
+            deleted_note = f", {len(result.deleted_keys)} deleted in Jira removed" if result.deleted_keys else ""
             print(
                 f"{prefix} {result.work_item_count} work items "
                 f"({result.changed_count} changed, {result.skipped_count} unchanged, "
-                f"{result.version_count} versions cached{backfilled_note})."
+                f"{result.version_count} versions cached{backfilled_note}{deleted_note})."
             )
+            if result.shadow_protected_deleted_keys:
+                print(
+                    f"  kept locally (deleted in Jira, but has unpushed changes): "
+                    f"{', '.join(result.shadow_protected_deleted_keys)}",
+                    file=sys.stderr,
+                )
 
         # Keep the read-only/default registry current even when only a
         # single project was actively re-synced (see metadata.py's
         # write_project_registry/is_project_read_only).
         write_project_registry(jira_dir, config.resolved_projects())
+        if args.source == "all" and config.freshdesk_sources:
+            freshdesk_exit_code = sync_configured_freshdesk(config, jira_dir, force=args.force)
+            exit_code = max(exit_code, freshdesk_exit_code)
         return exit_code
 
     if args.command == "serve":

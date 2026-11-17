@@ -203,6 +203,10 @@ def board_settings_path(jira_dir: Path) -> Path:
     return jira_dir / "meta" / "board_settings.json"
 
 
+def component_settings_path(jira_dir: Path) -> Path:
+    return jira_dir / "meta" / "component_settings.json"
+
+
 def manifest_path(jira_dir: Path) -> Path:
     return jira_dir / "manifest.json"
 
@@ -511,7 +515,10 @@ def write_board_settings(jira_dir: Path, settings: dict[str, Any]) -> None:
     # set-filters/delete/toggle-active) -- board membership is stored per
     # item (see db.recompute_board_membership), so any of those needs the
     # same recompute a Jira boards refresh or a full reindex already gets.
-    _db.recompute_board_membership(jira_dir)
+    # All-sources, not just Jira's: a local board's fieldFilters could
+    # plausibly match any configured source (e.g. project=FRESHDESK), and
+    # this call site has no way to know in advance which one(s).
+    _db.recompute_board_membership_all_sources(jira_dir)
 
 
 def _all_board_names(jira_dir: Path, settings: dict[str, Any]) -> set[str]:
@@ -607,6 +614,63 @@ def set_board_active(jira_dir: Path, kind: str, identifier: str, active: bool) -
             disabled.add(identifier)
         settings["disabledBoardIds"] = sorted(disabled)
     write_board_settings(jira_dir, settings)
+
+
+def load_component_settings(jira_dir: Path) -> dict[str, Any]:
+    """Local, user-owned component data -- which components have been
+    marked archived, per project. Jira's own REST API has no archived
+    concept for components at all (unlike Fix Versions, which do) -- this
+    is purely a jira-wb-invented annotation, so like board_settings.json
+    it's never touched by a sync/refresh (refresh_components_api/
+    refresh_component_field_options_api only ever rewrite the Jira-sourced
+    meta/<PROJECT>/{components,customfield_<id>-options}.json caches)."""
+    path = component_settings_path(jira_dir)
+    default: dict[str, Any] = {"archivedComponents": {}}
+    if not path.exists():
+        return default
+    value = read_json(path)
+    if not isinstance(value, dict):
+        return default
+    archived = value.get("archivedComponents")
+    if not isinstance(archived, dict):
+        return default
+    result: dict[str, list[str]] = {}
+    for project, names in archived.items():
+        if isinstance(project, str) and isinstance(names, list):
+            result[project] = [str(name) for name in names if isinstance(name, str)]
+    return {"archivedComponents": result}
+
+
+def write_component_settings(jira_dir: Path, settings: dict[str, Any]) -> None:
+    write_json(component_settings_path(jira_dir), settings)
+
+
+def set_component_archived(jira_dir: Path, project: str, name: str, archived: bool) -> None:
+    """Archive/unarchive one component, by its own display name -- names,
+    not ids, since that's all that survives on an item once its component
+    field is flattened into the manifest's plain `component` string (no id
+    is retained there for either the native or the custom-field shape --
+    see view.archived_component_names for the matching contract this needs
+    to honor)."""
+    clean_name = name.strip()
+    if not clean_name:
+        raise MetadataError("component name must be non-empty")
+    settings = load_component_settings(jira_dir)
+    by_project = settings["archivedComponents"]
+    # Keyed by lowercase for the add/remove itself (matching is always
+    # case-insensitive, see archived_component_names) -- display casing is
+    # otherwise preserved as-is, for every already-archived entry AND for a
+    # repeat archive call under different casing (a no-op, not a rename).
+    by_lower = {existing.strip().lower(): existing for existing in by_project.get(project, [])}
+    if archived:
+        by_lower.setdefault(clean_name.lower(), clean_name)
+    else:
+        by_lower.pop(clean_name.lower(), None)
+    if by_lower:
+        by_project[project] = sorted(by_lower.values(), key=str.lower)
+    else:
+        by_project.pop(project, None)
+    write_component_settings(jira_dir, settings)
 
 
 def load_all_boards_with_settings(jira_dir: Path) -> list[dict[str, Any]]:
@@ -1196,6 +1260,11 @@ def archive_version_api(
     if not isinstance(version_id, str) or not version_id:
         raise MetadataError(f"version {identifier.strip()} does not include an id")
     if version.get("archived"):
+        # Jira's own raw flag specifically, not view.is_archived_version --
+        # this decides whether to call Jira's real archive API, and a
+        # version merely named "_archived" (that convention's whole point
+        # is treating something as archived without it actually being so
+        # in Jira) must still go through the real API call below.
         name = version_name(version) or identifier
         cache = cache_versions(jira_dir, project, versions)
         return VersionActionResult(cache, changed=False, message=f"version {name} is already archived")
@@ -1317,13 +1386,15 @@ def ensure_versions(
 
 
 def format_versions(cache: dict[str, Any]) -> str:
+    from .view import is_archived_version  # deferred: avoid a module-level import cycle with view.py
+
     versions = normalize_versions(cache.get("versions"))
     if not versions:
         return "no versions found\n"
 
     names = [version_name(version) for version in versions]
     released = ["released" if version.get("released") else "unreleased" for version in versions]
-    archived = ["archived" if version.get("archived") else "" for version in versions]
+    archived = ["archived" if is_archived_version(version) else "" for version in versions]
     width = max(len("name"), *(len(name) for name in names))
     rows = [f"{'name':<{width}}  released    archived"]
     for version, name, released_value, archived_value in zip(versions, names, released, archived, strict=True):

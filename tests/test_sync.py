@@ -10,6 +10,7 @@ from jira_workbench.sync import (
     build_index_jql,
     build_manifest,
     component_slug,
+    detect_deleted_issues,
     find_existing_issue,
     issue_key_sort_key,
     issue_project_key,
@@ -17,6 +18,7 @@ from jira_workbench.sync import (
     normalize_issue,
     normalize_work_items,
     read_json,
+    remove_deleted_issues,
     status_category_key,
     sync_project,
     write_json,
@@ -112,6 +114,28 @@ class FakeJiraClientWithoutIndexUpdated(FakeJiraClient):
     ) -> list[dict[str, Any]]:
         self.calls.append(("enhanced_jql_get_list_of_tickets", jql, fields, limit))
         return [{"key": "SAT-1"}, {"key": "SAT-2"}]
+
+
+class FakeJiraClientRecordingExpand(FakeJiraClient):
+    """FakeJiraClient's own recorded calls deliberately omit `expand` (its
+    3-tuple shape, e.g. ("get_issue", "SAT-1", "*all"), is asserted on
+    verbatim by several other tests) -- this subclass captures it
+    separately instead of changing that shared shape."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.expand_seen: list[str | None] = []
+
+    def get_issue(
+        self,
+        issue_id_or_key: str,
+        fields: str | list | tuple | set | None = None,
+        properties: str | None = None,
+        update_history: bool = True,
+        expand: str | None = None,
+    ) -> Any:
+        self.expand_seen.append(expand)
+        return super().get_issue(issue_id_or_key, fields, properties, update_history, expand)
 
 
 def test_normalize_work_items_accepts_common_shapes() -> None:
@@ -304,8 +328,23 @@ def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> No
     assert manifest["workItems"][0]["priority"] == "Medium"
     assert manifest["workItems"][0]["assignee"] == "Serge Colle"
     assert manifest["workItems"][0]["epic"] == "SAT-100"
-    assert "[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in progress
-    assert "[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in progress
+    assert "[3/7] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in progress
+    assert "[3/7] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in progress
+
+
+def test_sync_project_fetches_each_issue_with_its_changelog(tmp_path: Path) -> None:
+    # expand="changelog" -- written verbatim into issue.json (sync.py does
+    # no filtering of the raw API response) so view.py's last_changed_by/
+    # resolved_by have something to read on the Detail page, since Jira's
+    # plain issue fields carry no "updated by"/"resolved by" person.
+    client = FakeJiraClientRecordingExpand()
+
+    sync_project(SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path), client, progress=None)
+
+    # 3 calls, not 2 -- backfill_missing_parents also tries SAT-1's parent
+    # (SAT-100, per FakeJiraClient's own docstring not independently
+    # fetchable), with the same expand.
+    assert client.expand_seen == ["changelog"] * 3
 
 
 class FakeJiraClientWithFetchableEpic(FakeJiraClient):
@@ -597,3 +636,147 @@ def test_build_manifest_orders_work_items_by_issue_number(tmp_path: Path) -> Non
 
     assert [item["key"] for item in manifest["workItems"]] == ["SAT-9", "SAT-10", "SAT-100"]
     assert manifest["components"][0]["workItems"] == ["SAT-9", "SAT-10", "SAT-100"]
+
+
+class FakeJiraClientForDeletionCheck(FakeJiraClient):
+    """Controls both JQL shapes sync.py's deleted-issue detection issues:
+    the plain project-index query (via `index_keys`) and the `key in
+    (...)` disambiguation query (via `still_exists_keys`) used to tell a
+    genuine Jira deletion apart from an issue that merely aged out of this
+    sync's own history_months cutoff."""
+
+    def __init__(self, index_keys: list[str] | None = None, still_exists_keys: set[str] = frozenset()) -> None:
+        super().__init__()
+        self.index_keys = ["SAT-1", "SAT-2"] if index_keys is None else index_keys
+        self.still_exists_keys = still_exists_keys
+
+    def enhanced_jql_get_list_of_tickets(
+        self,
+        jql: str,
+        fields: str | list[str] = "*all",
+        limit: int | None = None,
+        expand: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(("enhanced_jql_get_list_of_tickets", jql, fields, limit))
+        if "key in (" in jql:
+            return [{"key": key} for key in self.still_exists_keys]
+        return [
+            {"key": key, "fields": {"updated": f"2026-07-20T00:00:0{key[-1]}.000+0000"}} for key in self.index_keys
+        ]
+
+
+def test_detect_deleted_issues_flags_a_key_missing_from_both_the_index_and_a_direct_lookup(tmp_path: Path) -> None:
+    client = FakeJiraClientForDeletionCheck()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+
+    client.still_exists_keys = set()
+    deleted, shadow_protected = detect_deleted_issues(tmp_path, "SAT", client, {"SAT-1"})
+
+    assert deleted == ["SAT-2"]
+    assert shadow_protected == []
+
+
+def test_detect_deleted_issues_leaves_a_key_alone_if_jira_still_has_it(tmp_path: Path) -> None:
+    client = FakeJiraClientForDeletionCheck()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+
+    client.still_exists_keys = {"SAT-2"}
+    deleted, shadow_protected = detect_deleted_issues(tmp_path, "SAT", client, {"SAT-1"})
+
+    assert deleted == []
+    assert shadow_protected == []
+
+
+def test_detect_deleted_issues_reports_but_does_not_flag_a_key_with_unpushed_edits(tmp_path: Path) -> None:
+    client = FakeJiraClientForDeletionCheck()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+    write_json(tmp_path / "components/_unassigned/SAT-2/shadow.json", {"key": "SAT-2", "fields": {}})
+
+    client.still_exists_keys = set()
+    deleted, shadow_protected = detect_deleted_issues(tmp_path, "SAT", client, {"SAT-1"})
+
+    assert deleted == []
+    assert shadow_protected == ["SAT-2"]
+
+
+def test_detect_deleted_issues_returns_nothing_when_no_candidates_are_missing(tmp_path: Path) -> None:
+    client = FakeJiraClientForDeletionCheck()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+
+    deleted, shadow_protected = detect_deleted_issues(tmp_path, "SAT", client, {"SAT-1", "SAT-2"})
+
+    assert deleted == []
+    assert shadow_protected == []
+    assert not any("key in (" in call[1] for call in client.calls if call[0] == "enhanced_jql_get_list_of_tickets")
+
+
+def test_remove_deleted_issues_deletes_the_local_directory(tmp_path: Path) -> None:
+    client = FakeJiraClient()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+    directory = tmp_path / "components/_unassigned/SAT-2"
+    assert directory.exists()
+
+    removed = remove_deleted_issues(tmp_path, ["SAT-2"])
+
+    assert removed == ["SAT-2"]
+    assert not directory.exists()
+
+
+def test_remove_deleted_issues_refuses_to_delete_a_directory_with_a_shadow(tmp_path: Path) -> None:
+    client = FakeJiraClient()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+    directory = tmp_path / "components/_unassigned/SAT-2"
+    write_json(directory / "shadow.json", {"key": "SAT-2", "fields": {}})
+
+    removed = remove_deleted_issues(tmp_path, ["SAT-2"])
+
+    assert removed == []
+    assert directory.exists()
+
+
+def test_sync_project_removes_a_locally_synced_issue_deleted_in_jira(tmp_path: Path) -> None:
+    client = FakeJiraClientForDeletionCheck()
+    config = SyncConfig(project="SAT", jira_dir=tmp_path)
+    sync_project(config, client, progress=None)
+    assert (tmp_path / "components/_unassigned/SAT-2/issue.json").exists()
+
+    client.index_keys = ["SAT-1"]
+    client.still_exists_keys = set()
+    progress: list[str] = []
+    result = sync_project(config, client, progress=progress.append)
+
+    assert result.deleted_keys == ("SAT-2",)
+    assert result.shadow_protected_deleted_keys == ()
+    assert not (tmp_path / "components/_unassigned/SAT-2").exists()
+    assert any("Removed 1 item(s) deleted in Jira: SAT-2" in line for line in progress)
+
+
+def test_sync_project_keeps_a_deleted_issue_with_unpushed_edits_and_reports_it(tmp_path: Path) -> None:
+    client = FakeJiraClientForDeletionCheck()
+    config = SyncConfig(project="SAT", jira_dir=tmp_path)
+    sync_project(config, client, progress=None)
+    write_json(tmp_path / "components/_unassigned/SAT-2/shadow.json", {"key": "SAT-2", "fields": {}})
+
+    client.index_keys = ["SAT-1"]
+    client.still_exists_keys = set()
+    progress: list[str] = []
+    result = sync_project(config, client, progress=progress.append)
+
+    assert result.deleted_keys == ()
+    assert result.shadow_protected_deleted_keys == ("SAT-2",)
+    assert (tmp_path / "components/_unassigned/SAT-2/issue.json").exists()
+    assert any("kept locally" in line and "SAT-2" in line for line in progress)
+
+
+def test_sync_project_does_not_delete_an_issue_that_merely_aged_out_of_history_months(tmp_path: Path) -> None:
+    client = FakeJiraClientForDeletionCheck()
+    config = SyncConfig(project="SAT", jira_dir=tmp_path)
+    sync_project(config, client, progress=None)
+
+    client.index_keys = ["SAT-1"]
+    client.still_exists_keys = {"SAT-2"}
+    result = sync_project(config, client, progress=None)
+
+    assert result.deleted_keys == ()
+    assert result.shadow_protected_deleted_keys == ()
+    assert (tmp_path / "components/_unassigned/SAT-2/issue.json").exists()

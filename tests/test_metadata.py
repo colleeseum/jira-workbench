@@ -35,6 +35,7 @@ from jira_workbench.metadata import (
     load_board_settings,
     load_boards,
     load_component_field_options,
+    load_component_settings,
     load_component_summary,
     load_components,
     load_field_names,
@@ -57,8 +58,10 @@ from jira_workbench.metadata import (
     remember_field_names,
     resolve_version_id,
     set_board_active,
+    set_component_archived,
     set_local_board_filters,
     write_board_settings,
+    write_component_settings,
     write_project_registry,
 )
 from jira_workbench.config import ProjectSettings
@@ -331,6 +334,59 @@ def test_write_board_settings_round_trips(tmp_path: Path) -> None:
     write_board_settings(tmp_path, settings)
 
     assert load_board_settings(tmp_path) == settings
+
+
+def test_load_component_settings_permissive_when_missing(tmp_path: Path) -> None:
+    assert load_component_settings(tmp_path) == {"archivedComponents": {}}
+
+
+def test_write_component_settings_round_trips(tmp_path: Path) -> None:
+    settings = {"archivedComponents": {"SAT": ["helm-chart"]}}
+
+    write_component_settings(tmp_path, settings)
+
+    assert load_component_settings(tmp_path) == settings
+
+
+def test_set_component_archived_adds_and_removes(tmp_path: Path) -> None:
+    set_component_archived(tmp_path, "SAT", "helm-chart", True)
+
+    assert load_component_settings(tmp_path) == {"archivedComponents": {"SAT": ["helm-chart"]}}
+
+    set_component_archived(tmp_path, "SAT", "helm-chart", False)
+
+    # Unarchiving the only archived component in a project drops the
+    # project's own now-empty entry entirely, rather than leaving a
+    # dangling empty list around.
+    assert load_component_settings(tmp_path) == {"archivedComponents": {}}
+
+
+def test_set_component_archived_is_case_insensitive_but_keeps_display_casing(tmp_path: Path) -> None:
+    set_component_archived(tmp_path, "SAT", "Helm-Chart", True)
+    set_component_archived(tmp_path, "SAT", "helm-chart", True)  # re-archiving under different casing is a no-op
+
+    assert load_component_settings(tmp_path) == {"archivedComponents": {"SAT": ["Helm-Chart"]}}
+
+    set_component_archived(tmp_path, "SAT", "HELM-CHART", False)
+
+    assert load_component_settings(tmp_path) == {"archivedComponents": {}}
+
+
+def test_set_component_archived_preserves_other_components_and_projects(tmp_path: Path) -> None:
+    set_component_archived(tmp_path, "SAT", "helm-chart", True)
+    set_component_archived(tmp_path, "SAT", "Training", True)
+    set_component_archived(tmp_path, "PLAT", "cache", True)
+
+    set_component_archived(tmp_path, "SAT", "helm-chart", False)
+
+    assert load_component_settings(tmp_path) == {
+        "archivedComponents": {"SAT": ["Training"], "PLAT": ["cache"]}
+    }
+
+
+def test_set_component_archived_rejects_empty_name(tmp_path: Path) -> None:
+    with pytest.raises(MetadataError):
+        set_component_archived(tmp_path, "SAT", "  ", True)
 
 
 def test_add_local_board_then_load_all_boards_with_settings_tags_it_local(tmp_path: Path) -> None:

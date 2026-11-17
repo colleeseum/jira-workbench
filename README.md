@@ -119,6 +119,23 @@ host = "127.0.0.1"
 port = 8765
 ```
 
+`jira-wb sync` syncs all configured Jira projects and Freshdesk sources.
+Use `jira-wb sync --source jira` or `jira-wb sync --source freshdesk` to sync
+only one source kind. `--force` applies to both; `--project` and other
+Jira options only affect Jira sync. A Freshdesk-only configuration needs no
+Jira project or credentials.
+
+To include Freshdesk, add a source to `config.toml`:
+
+```toml
+[[sources]]
+kind = "freshdesk"
+domain = "acme" # The subdomain in acme.freshdesk.com.
+api_key = "..."
+```
+
+Freshdesk sync is read-only and stores tickets under `jira_dir/freshdesk/`.
+
 ### Multiple projects
 
 `project = "SAT"` above is shorthand for a single, default, read-write project.
