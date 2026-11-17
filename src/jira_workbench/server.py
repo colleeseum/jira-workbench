@@ -1761,16 +1761,6 @@ def render_items_page(
         extra = sorted(value for value in observed if value.strip().lower() not in known_lower)
         return [*official, *extra]
 
-    def assignee_template_options_for(project: str) -> list[str]:
-        key = ("assigneeTemplate", project)
-        if key not in options_cache:
-            observed = {
-                str(scoped_item.get("assignee") or "") or "(unassigned)"
-                for scoped_item in project_scoped_items_for(project)
-            }
-            options_cache[key] = _extended_with_observed(assignee_options_for(project), observed)
-        return options_cache[key]
-
     def fix_version_groups_for(project: str) -> list[tuple[str, list[str]]]:
         if project not in version_groups_cache:
             observed = {
@@ -1996,9 +1986,15 @@ def render_items_page(
                 # it always renders initials-only (_avatar_span with no
                 # photo_url); the pill below (per-row, always rendered)
                 # still shows the real photo for the actual current one.
+                # Roster only (project Access members minus
+                # exclude_assignees) -- NOT unioned with every name observed
+                # on synced issues, which re-added ex-members to every row's
+                # menu. A row whose current assignee is off the roster still
+                # shows that person in its own pill; they just aren't
+                # offered as a choice.
                 ensure_pill_template(
                     f"assignee::{project}",
-                    assignee_template_options_for(project),
+                    assignee_options_for(project),
                     icon_renderer=lambda value: _avatar_span(value, ""),
                 ),
                 single=True,
@@ -2113,7 +2109,7 @@ def render_items_page(
             bulk_priority.update(priority_options_for(bulk_project))
             bulk_component.update(component_template_options_for(bulk_project))
             bulk_assignee.update(
-                value for value in assignee_template_options_for(bulk_project) if value != "(unassigned)"
+                value for value in assignee_options_for(bulk_project) if value != "(unassigned)"
             )
             for group_label, group_values in fix_version_groups_for(bulk_project):
                 (bulk_released if group_label == "Released" else bulk_unreleased).update(group_values)

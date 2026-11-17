@@ -5641,6 +5641,23 @@ def test_items_page_assignee_edit_dropdown_only_offers_active_members(tmp_path: 
     assert "Al Baker" in sat1_widget  # still shown as SAT-1's own current value
 
 
+def test_items_page_shared_assignee_menu_template_excludes_ex_members(tmp_path: Path) -> None:
+    # Every row's assignee menu is cloned lazily from one shared <template>
+    # per project -- that template must hold the roster only, not every
+    # name observed on synced issues (Al Baker is still SAT-1's assignee,
+    # but no longer on the project's Access roster).
+    _write_two_assignee_issues(tmp_path)
+    write_json(tmp_path / "meta/SAT/assignees.json", {"project": "SAT", "assignees": [{"displayName": "Serge Colle"}]})
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    response = client.get("/")
+
+    templates = re.findall(r'<template id="tpl-[^"]*">.*?</template>', response.text, re.S)
+    assignee_templates = [t for t in templates if "Serge Colle" in t]
+    assert assignee_templates
+    assert all("Al Baker" not in t for t in assignee_templates)
+
+
 def test_items_page_assignee_edit_dropdown_falls_back_to_local_observation_without_a_refreshed_cache(
     tmp_path: Path,
 ) -> None:
@@ -6517,3 +6534,16 @@ def test_post_meta_label_rename_only_touches_the_selected_project(
     assert pushed_keys == {"SAT-1"}
     assert load_shadow(tmp_path, "OPS-1") is None
     assert read_json(tmp_path / "components/ops/OPS-1/issue.json")["fields"]["labels"] == ["urgent"]
+
+
+def test_items_page_bulk_edit_assignee_options_exclude_ex_members(tmp_path: Path) -> None:
+    _write_two_assignee_issues(tmp_path)
+    write_json(tmp_path / "meta/SAT/assignees.json", {"project": "SAT", "assignees": [{"displayName": "Serge Colle"}]})
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    text = client.get("/").text
+
+    start = text.index('<select name="assignee_value">')
+    bulk_select = text[start : text.index("</select>", start)]
+    assert "Serge Colle" in bulk_select
+    assert "Al Baker" not in bulk_select
