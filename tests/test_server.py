@@ -5,6 +5,7 @@ import json
 import re
 import threading
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote_plus
 
 import pytest
@@ -6547,6 +6548,46 @@ def test_items_page_bulk_edit_assignee_options_exclude_ex_members(tmp_path: Path
     bulk_select = text[start : text.index("</select>", start)]
     assert "Serge Colle" in bulk_select
     assert "Al Baker" not in bulk_select
+
+
+class _FakeBackgroundSync:
+    def __init__(self) -> None:
+        self.touches = 0
+
+    def touch(self) -> None:
+        self.touches += 1
+
+    def status(self) -> dict[str, Any]:
+        return {"enabled": True, "state": "idle", "changesTotal": 0}
+
+
+def test_sync_status_reports_disabled_without_watch(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    assert client.get("/api/sync/status").json() == {"enabled": False}
+    assert 'id="sync-status"' not in client.get("/").text
+
+
+def test_watch_mode_shows_status_chip_and_only_real_requests_count_as_activity(tmp_path: Path) -> None:
+    sync_project(
+        SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path), FakeJiraClient(), progress=None
+    )
+    background = _FakeBackgroundSync()
+    client = TestClient(
+        create_app(
+            tmp_path,
+            WorkbenchConfig(projects=(ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),)),
+            background_sync=background,
+        )
+    )
+
+    assert client.get("/api/sync/status").json()["enabled"] is True
+    assert background.touches == 0  # the chip's own poll keeps nothing awake
+
+    response = client.get("/")
+    assert background.touches == 1
+    assert 'id="sync-status"' in response.text
+    assert "/api/sync/status" in response.text
 
 
 def test_items_page_assignee_filter_assigned_matches_anyone(tmp_path: Path) -> None:

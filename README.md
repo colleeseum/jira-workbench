@@ -256,6 +256,39 @@ Then open:
 http://127.0.0.1:8765
 ```
 
+To keep the cache fresh while the server runs, add `--watch` (or set
+`watch = true` under `[serve]`):
+
+```bash
+jira-wb serve --watch
+```
+
+It refreshes in two tiers, keeping load on Jira minimal:
+
+- **Quick check, every 5 minutes**: a single "updated in the last N minutes"
+  query across all configured projects. When nothing changed, that one
+  request is the whole cost. Changed issues are fetched like a normal sync
+  (local shadow edits are preserved) and only their entries are re-indexed.
+- **Full refresh, every hour**: the same work as `jira-wb sync` — this also
+  picks up deleted issues, metadata (versions, assignees, components), and
+  board changes that don't touch an issue's `updated` time.
+
+The background refresh pauses after 15 minutes without UI activity and
+resumes on the next page load (the status indicator's own polling doesn't
+count). It backs off on errors (honoring Jira's `Retry-After` on rate
+limits), and never overlaps a manual `jira-wb sync` — whichever starts
+second waits or skips. The sidebar shows when it last synced, with a
+reload link once items have changed; pages never reload on their own.
+Freshdesk sources are not refreshed in the background.
+
+```toml
+[serve]
+watch = true
+refresh_interval = 300        # seconds between quick checks
+full_refresh_interval = 3600  # seconds between full refreshes
+idle_pause = 900              # pause after this long without UI activity
+```
+
 Refresh and inspect cached Jira project metadata:
 
 ```bash

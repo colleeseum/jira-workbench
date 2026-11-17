@@ -722,3 +722,27 @@ def test_load_config_with_no_sources_array_has_no_freshdesk_sources(tmp_path: Pa
     config = load_config(path)
 
     assert config.freshdesk_sources == ()
+
+
+def test_load_config_reads_serve_watch_settings(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[serve]\nwatch = true\nrefresh_interval = 120\nfull_refresh_interval = 1800\nidle_pause = 600\n"
+    )
+
+    config = load_config(path)
+
+    assert (
+        config.serve_watch,
+        config.serve_refresh_interval,
+        config.serve_full_refresh_interval,
+        config.serve_idle_pause,
+    ) == (True, 120, 1800, 600)
+
+
+def test_load_config_rejects_non_positive_refresh_interval(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[serve]\nrefresh_interval = 0\n")
+
+    with pytest.raises(ConfigError, match="refresh_interval must be a positive integer"):
+        load_config(path)

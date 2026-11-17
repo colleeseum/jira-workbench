@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -522,6 +523,40 @@ def backfill_missing_parents(
     return backfilled
 
 
+def write_synced_issue(
+    components_dir: Path,
+    client: JiraSyncClient,
+    key: str,
+    issue: dict[str, Any],
+    component_field: str,
+    existing: Path | None,
+) -> None:
+    """Writes one freshly fetched issue into its component directory,
+    moving it if its component changed and carrying over any local shadow
+    edit -- shared by the full sync and the background quick sync."""
+    component = component_slug(issue, component_field)
+    dest = components_dir / component / key
+    old_dest = existing.parent if existing is not None else None
+    shadow = None
+    if old_dest is not None:
+        shadow_path = old_dest / "shadow.json"
+        if shadow_path.exists():
+            shadow = read_json(shadow_path)
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    write_json(dest / "issue.json", issue)
+    write_json(dest / "comments.json", fetch_issue_comments(client, key))
+    write_json(dest / "attachments.json", issue_attachments(issue))
+    write_json(dest / "sync.json", {"key": key, "component": component, "syncedAt": utc_now()})
+    if shadow is not None:
+        write_json(dest / "shadow.json", shadow)
+
+    if old_dest is not None and old_dest != dest and old_dest.exists():
+        shutil.rmtree(old_dest)
+
+
 def sync_project(
     config: SyncConfig,
     client: JiraSyncClient,
@@ -608,27 +643,7 @@ def sync_project(
                 skipped += 1
                 continue
 
-        component = component_slug(issue, config.component_field)
-        dest = components_dir / component / key
-        old_dest = existing.parent if existing is not None else None
-        shadow = None
-        if old_dest is not None:
-            shadow_path = old_dest / "shadow.json"
-            if shadow_path.exists():
-                shadow = read_json(shadow_path)
-
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.mkdir(parents=True)
-        write_json(dest / "issue.json", issue)
-        write_json(dest / "comments.json", fetch_issue_comments(client, key))
-        write_json(dest / "attachments.json", issue_attachments(issue))
-        write_json(dest / "sync.json", {"key": key, "component": component, "syncedAt": utc_now()})
-        if shadow is not None:
-            write_json(dest / "shadow.json", shadow)
-
-        if old_dest is not None and old_dest != dest and old_dest.exists():
-            shutil.rmtree(old_dest)
+        write_synced_issue(components_dir, client, key, issue, config.component_field, existing)
         changed += 1
 
     if progress:
@@ -716,3 +731,156 @@ def _refresh_boards(
             progress(f"board refresh skipped: {exc}")
         return None
     return len(cache.get("boards", []))
+
+
+# ---------------------------------------------------------------------------
+# Background "quick" sync (jira-wb serve --watch) and the cross-process lock
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class QuickSyncProject:
+    project: str
+    component_field: str = "components"
+    history_months: int | None = None
+
+
+@dataclass(frozen=True)
+class QuickSyncResult:
+    changed_keys: tuple[str, ...] = ()
+    board_projects: tuple[str, ...] = ()
+
+
+def build_changed_since_jql(projects: list[QuickSyncProject], since_minutes: int) -> str:
+    """One query across every project: what changed in the last N minutes,
+    each project still restricted by its own history cutoff (the same
+    clause build_index_jql uses), so a quick sync never pulls in an issue a
+    full sync would deliberately leave out."""
+    clauses = []
+    for entry in projects:
+        clause = f"project={entry.project}"
+        if entry.history_months is not None:
+            days = entry.history_months * 30
+            clause += f" AND (statusCategory != Done OR statuscategorychangedate >= -{days}d)"
+        clauses.append(f"({clause})")
+    scope = " OR ".join(clauses)
+    return f"({scope}) AND updated >= -{max(1, int(since_minutes))}m ORDER BY key"
+
+
+def quick_sync(
+    jira_dir: Path,
+    projects: list[QuickSyncProject],
+    client: JiraSyncClient,
+    *,
+    since_minutes: int,
+    progress: Progress | None = None,
+) -> QuickSyncResult:
+    """The cheap 5-minute tick: one JQL request for issues updated since the
+    last check. When nothing changed (the common case) that single request
+    is the whole cost -- no full index, no metadata, no rescan of every
+    issue.json. Changed issues are fetched and written exactly like a full
+    sync (shadow edits preserved), then only their rows are re-indexed and
+    only their projects' boards refreshed.
+
+    Deliberately NOT covered here, left to the periodic full sync: issues
+    deleted in Jira, metadata (versions/assignees/components), and anything
+    that changes without bumping an issue's `updated` timestamp."""
+    if not projects:
+        return QuickSyncResult()
+    by_project = {entry.project: entry for entry in projects}
+    payload = client.enhanced_jql_get_list_of_tickets(
+        build_changed_since_jql(projects, since_minutes), fields=["issuetype", "key", "updated"]
+    )
+    components_dir = jira_dir / "components"
+    components_dir.mkdir(parents=True, exist_ok=True)
+    changed: list[str] = []
+    for work_item in normalize_work_items(payload):
+        key = work_item.get("key")
+        if not isinstance(key, str) or not ISSUE_KEY_PATTERN.fullmatch(key):
+            continue
+        entry = by_project.get(key.rsplit("-", 1)[0])
+        if entry is None:
+            continue
+        existing = find_existing_issue(components_dir, key)
+        index_updated = updated_at(work_item)
+        # The query window overlaps the previous one on purpose (Jira's
+        # relative dates are minute-granular) -- skip what's already current.
+        if existing is not None and index_updated is not None:
+            existing_issue = read_json(existing)
+            if isinstance(existing_issue, dict) and updated_at(existing_issue) == index_updated:
+                continue
+        issue = normalize_issue(client.get_issue(key, fields="*all", expand="changelog"), key)
+        write_synced_issue(components_dir, client, key, issue, entry.component_field, existing)
+        changed.append(key)
+        if progress:
+            progress(f"quick sync: updated {key}")
+
+    if not changed:
+        return QuickSyncResult()
+
+    from . import db as _db
+
+    changed_projects = sorted({key.rsplit("-", 1)[0] for key in changed})
+    for project in changed_projects:
+        keys = [key for key in changed if key.rsplit("-", 1)[0] == project]
+        update_manifest_items(jira_dir, keys)
+        _db.reindex_items(jira_dir, by_project[project].component_field, keys=keys)
+    board_projects = []
+    for project in changed_projects:
+        if _refresh_boards(jira_dir, project, by_project[project].component_field, client, progress) is not None:
+            board_projects.append(project)
+    return QuickSyncResult(changed_keys=tuple(changed), board_projects=tuple(board_projects))
+
+
+def update_manifest_items(jira_dir: Path, keys: list[str]) -> None:
+    """Patches just `keys`' entries in manifest.json instead of rebuilding it
+    from a scan of every issue.json (build_manifest). Falls back to a full
+    build when there's no manifest yet."""
+    manifest_path = jira_dir / "manifest.json"
+    manifest = read_json(manifest_path) if manifest_path.exists() else None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("workItems"), list):
+        build_manifest(jira_dir)
+        return
+    components_dir = jira_dir / "components"
+    wanted = set(keys)
+    items = [item for item in manifest["workItems"] if not (isinstance(item, dict) and item.get("key") in wanted)]
+    for key in keys:
+        existing = find_existing_issue(components_dir, key)
+        if existing is not None:
+            items.append(issue_summary(existing.parent.parent.name, key, existing, jira_dir))
+    # Same order build_manifest produces (issue_path_sort_key: by key).
+    items.sort(key=lambda item: issue_key_sort_key(str(item.get("key") or "")))
+    components = []
+    for component in sorted({item["component"] for item in items if item.get("component")}):
+        work_items = [item["key"] for item in items if item["component"] == component]
+        components.append({"component": component, "count": len(work_items), "workItems": work_items})
+    write_json(
+        manifest_path,
+        {"generatedAt": utc_now(), "workItemCount": len(items), "components": components, "workItems": items},
+    )
+
+
+class SyncLockBusy(Exception):
+    """Another process (or the background syncer) already holds the lock."""
+
+
+@contextmanager
+def sync_lock(jira_dir: Path, *, blocking: bool = True) -> Iterator[None]:
+    """Cross-process lock around anything that writes synced issues, so a
+    manual `jira-wb sync` and `serve --watch`'s background thread never
+    write the same directory at once. Non-blocking mode raises
+    SyncLockBusy instead of waiting (the background syncer just skips a
+    tick)."""
+    import fcntl
+
+    jira_dir.mkdir(parents=True, exist_ok=True)
+    with open(jira_dir / ".sync.lock", "a+") as handle:
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle, flags)
+        except BlockingIOError as exc:
+            raise SyncLockBusy(str(jira_dir)) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)

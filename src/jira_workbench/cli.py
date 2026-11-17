@@ -5,6 +5,8 @@ import json
 import os
 import re
 import sys
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -70,7 +72,8 @@ from .shadow import (
     shadow_status,
     unset_field,
 )
-from .sync import SyncConfig, SyncError, sync_project
+from .watch import BackgroundSync
+from .sync import QuickSyncProject, SyncConfig, SyncError, SyncLockBusy, quick_sync, sync_lock, sync_project
 from .view import SWIMLANE_MODES, ViewError, detailed_shadow_report_lines, format_components, format_work_item
 
 
@@ -232,6 +235,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
     serve_parser.add_argument("--host")
     serve_parser.add_argument("--port", type=int)
+    serve_parser.add_argument(
+        "--watch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Refresh from Jira in the background while serving (default: [serve].watch, else off)",
+    )
+    serve_parser.add_argument(
+        "--refresh-interval",
+        type=int,
+        help="Seconds between background quick checks (default: [serve].refresh_interval, else 300)",
+    )
 
     view_parser = subparsers.add_parser("view", help="View locally synced Jira work items")
     view_parser.add_argument("key", nargs="?")
@@ -488,6 +502,197 @@ def sync_configured_freshdesk(config: WorkbenchConfig, jira_dir: Path, *, force:
     return exit_code
 
 
+def build_background_sync(
+    config: WorkbenchConfig, jira_dir: Path, *, refresh_interval: int | None = None
+) -> BackgroundSync | None:
+    """serve --watch's syncer for every configured Jira project (Freshdesk
+    sources are not refreshed in the background). None when the config
+    can't reach Jira."""
+    if config.jira_url is None or config.jira_email is None or config.jira_api_token is None:
+        return None
+    project_keys = [settings.key for settings in config.resolved_projects()]
+    if not project_keys:
+        return None
+
+    def component_field_for(key: str) -> str:
+        return str(config.effective_component_field(key) or "components")
+
+    clients: dict[str, tuple[str, object]] = {}
+
+    def client_for(key: str) -> tuple[str, object]:
+        if key not in clients:
+            clients[key] = api_client_from_config(key, config.jira_url, config.jira_email, config.jira_api_token)
+        return clients[key]
+
+    def quick(since_minutes: int) -> int:
+        projects = []
+        for key in project_keys:
+            api_project, _ = client_for(key)
+            projects.append(
+                QuickSyncProject(api_project, component_field_for(key), config.effective_history_months(key))
+            )
+        _, client = client_for(project_keys[0])
+        return len(quick_sync(jira_dir, projects, client, since_minutes=since_minutes).changed_keys)
+
+    def full() -> int:
+        changed = 0
+        errors = []
+        for key in project_keys:
+            try:
+                api_project, client = client_for(key)
+                result = sync_project(
+                    SyncConfig(
+                        project=api_project,
+                        component_field=component_field_for(key),
+                        jira_dir=jira_dir,
+                        history_months=config.effective_history_months(key),
+                    ),
+                    client,
+                    progress=None,
+                )
+            except Exception as exc:  # noqa: BLE001 -- other projects still sync; reported below
+                errors.append(f"{key}: {exc}")
+                continue
+            changed += result.changed_count + len(result.deleted_keys)
+        write_project_registry(jira_dir, config.resolved_projects())
+        # Only a total failure counts as a failed tick (-> backoff); one
+        # project that always fails (e.g. lost permission) must not stall
+        # the others' refresh.
+        if errors and len(errors) == len(project_keys):
+            raise RuntimeError("; ".join(errors))
+        for error in errors:
+            print(f"background sync: {error}", file=sys.stderr)
+        return changed
+
+    return BackgroundSync(
+        jira_dir,
+        quick=quick,
+        full=full,
+        interval=refresh_interval or config.serve_refresh_interval or 300,
+        full_interval=config.serve_full_refresh_interval or 3600,
+        idle_after=config.serve_idle_pause or 900,
+    )
+
+
+def run_sync_command(args: argparse.Namespace, config: WorkbenchConfig) -> int:
+    """`jira-wb sync`, run under sync_lock so it never overlaps serve --watch's
+    background refresh (or another sync) writing the same directory."""
+    with cli_sync_lock(resolve_jira_dir(args.jira_dir, config.jira_dir)):
+        return _run_sync_command_locked(args, config)
+
+
+@contextmanager
+def cli_sync_lock(jira_dir: Path) -> Iterator[None]:
+    """sync_lock, but tells the user why it's waiting when it has to."""
+    stack = ExitStack()
+    try:
+        stack.enter_context(sync_lock(jira_dir, blocking=False))
+    except SyncLockBusy:
+        print("waiting for another sync (e.g. serve --watch) to finish...", file=sys.stderr)
+        stack.enter_context(sync_lock(jira_dir))
+    with stack:
+        yield
+
+
+def _run_sync_command_locked(args: argparse.Namespace, config: WorkbenchConfig) -> int:
+    jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
+
+    if args.source == "freshdesk":
+        return sync_configured_freshdesk(config, jira_dir, force=args.force)
+
+    jira_url = choose(args.jira_url, config.jira_url)
+    jira_email = choose(args.jira_email, config.jira_email)
+    jira_api_token = choose(args.jira_api_token, config.jira_api_token)
+
+    # An explicit --project always means "just sync this one," matching
+    # the pre-multi-project CLI. Otherwise sync every project declared
+    # in config (a single flat `project = "..."` resolves to one via
+    # resolved_projects()'s own backward-compat fallback).
+    if args.project:
+        projects_to_sync = [str(args.project)]
+    else:
+        projects_to_sync = [settings.key for settings in config.resolved_projects()]
+
+    if not projects_to_sync:
+        if args.source == "all" and config.freshdesk_sources:
+            return sync_configured_freshdesk(config, jira_dir, force=args.force)
+        print(
+            "error: missing required configuration: "
+            "project. Set it in ~/.config/jira-wb/config.toml or pass --project.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.history_months is not None and int(args.history_months) <= 0:
+        print("error: --history-months must be a positive integer", file=sys.stderr)
+        return 2
+
+    exit_code = 0
+    for project in projects_to_sync:
+        component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
+        try:
+            api_project, api_client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+        except MetadataError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            exit_code = 2
+            continue
+        history_months = (
+            int(args.history_months) if args.history_months is not None else config.effective_history_months(project)
+        )
+        try:
+            result = sync_project(
+                SyncConfig(
+                    project=api_project,
+                    component_field=str(component_field),
+                    jira_dir=jira_dir,
+                    force=args.force,
+                    history_months=history_months,
+                ),
+                api_client,
+                progress=sync_progress_printer(
+                    sys.stderr, project=project if len(projects_to_sync) > 1 else None
+                ),
+            )
+        except SyncError as exc:
+            print(f"error: syncing {project}: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+        prefix = "Synced" if len(projects_to_sync) == 1 else f"Synced {project}:"
+        backfilled_note = (
+            f", {result.backfilled_parent_count} parent(s) backfilled" if result.backfilled_parent_count else ""
+        )
+        deleted_note = f", {len(result.deleted_keys)} deleted in Jira removed" if result.deleted_keys else ""
+        meta_note = "".join(
+            f", {count} {label}"
+            for count, label in (
+                (result.assignee_count, "assignees"),
+                (result.component_count, "components"),
+                (result.board_count, "boards"),
+            )
+            if count is not None
+        )
+        print(
+            f"{prefix} {result.work_item_count} work items "
+            f"({result.changed_count} changed, {result.skipped_count} unchanged, "
+            f"{result.version_count} versions cached{meta_note}{backfilled_note}{deleted_note})."
+        )
+        if result.shadow_protected_deleted_keys:
+            print(
+                f"  kept locally (deleted in Jira, but has unpushed changes): "
+                f"{', '.join(result.shadow_protected_deleted_keys)}",
+                file=sys.stderr,
+            )
+
+    # Keep the read-only/default registry current even when only a
+    # single project was actively re-synced (see metadata.py's
+    # write_project_registry/is_project_read_only).
+    write_project_registry(jira_dir, config.resolved_projects())
+    if args.source == "all" and config.freshdesk_sources:
+        freshdesk_exit_code = sync_configured_freshdesk(config, jira_dir, force=args.force)
+        exit_code = max(exit_code, freshdesk_exit_code)
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -514,102 +719,7 @@ def main(argv: list[str] | None = None) -> int:
     seed_project_registry(resolve_jira_dir(getattr(args, "jira_dir", None), config.jira_dir), config.resolved_projects())
 
     if args.command == "sync":
-        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
-
-        if args.source == "freshdesk":
-            return sync_configured_freshdesk(config, jira_dir, force=args.force)
-
-        jira_url = choose(args.jira_url, config.jira_url)
-        jira_email = choose(args.jira_email, config.jira_email)
-        jira_api_token = choose(args.jira_api_token, config.jira_api_token)
-
-        # An explicit --project always means "just sync this one," matching
-        # the pre-multi-project CLI. Otherwise sync every project declared
-        # in config (a single flat `project = "..."` resolves to one via
-        # resolved_projects()'s own backward-compat fallback).
-        if args.project:
-            projects_to_sync = [str(args.project)]
-        else:
-            projects_to_sync = [settings.key for settings in config.resolved_projects()]
-
-        if not projects_to_sync:
-            if args.source == "all" and config.freshdesk_sources:
-                return sync_configured_freshdesk(config, jira_dir, force=args.force)
-            print(
-                "error: missing required configuration: "
-                "project. Set it in ~/.config/jira-wb/config.toml or pass --project.",
-                file=sys.stderr,
-            )
-            return 2
-
-        if args.history_months is not None and int(args.history_months) <= 0:
-            print("error: --history-months must be a positive integer", file=sys.stderr)
-            return 2
-
-        exit_code = 0
-        for project in projects_to_sync:
-            component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
-            try:
-                api_project, api_client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-            except MetadataError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                exit_code = 2
-                continue
-            history_months = (
-                int(args.history_months) if args.history_months is not None else config.effective_history_months(project)
-            )
-            try:
-                result = sync_project(
-                    SyncConfig(
-                        project=api_project,
-                        component_field=str(component_field),
-                        jira_dir=jira_dir,
-                        force=args.force,
-                        history_months=history_months,
-                    ),
-                    api_client,
-                    progress=sync_progress_printer(
-                        sys.stderr, project=project if len(projects_to_sync) > 1 else None
-                    ),
-                )
-            except SyncError as exc:
-                print(f"error: syncing {project}: {exc}", file=sys.stderr)
-                exit_code = 1
-                continue
-            prefix = "Synced" if len(projects_to_sync) == 1 else f"Synced {project}:"
-            backfilled_note = (
-                f", {result.backfilled_parent_count} parent(s) backfilled" if result.backfilled_parent_count else ""
-            )
-            deleted_note = f", {len(result.deleted_keys)} deleted in Jira removed" if result.deleted_keys else ""
-            meta_note = "".join(
-                f", {count} {label}"
-                for count, label in (
-                    (result.assignee_count, "assignees"),
-                    (result.component_count, "components"),
-                    (result.board_count, "boards"),
-                )
-                if count is not None
-            )
-            print(
-                f"{prefix} {result.work_item_count} work items "
-                f"({result.changed_count} changed, {result.skipped_count} unchanged, "
-                f"{result.version_count} versions cached{meta_note}{backfilled_note}{deleted_note})."
-            )
-            if result.shadow_protected_deleted_keys:
-                print(
-                    f"  kept locally (deleted in Jira, but has unpushed changes): "
-                    f"{', '.join(result.shadow_protected_deleted_keys)}",
-                    file=sys.stderr,
-                )
-
-        # Keep the read-only/default registry current even when only a
-        # single project was actively re-synced (see metadata.py's
-        # write_project_registry/is_project_read_only).
-        write_project_registry(jira_dir, config.resolved_projects())
-        if args.source == "all" and config.freshdesk_sources:
-            freshdesk_exit_code = sync_configured_freshdesk(config, jira_dir, force=args.force)
-            exit_code = max(exit_code, freshdesk_exit_code)
-        return exit_code
+        return run_sync_command(args, config)
 
     if args.command == "serve":
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
@@ -623,7 +733,22 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        serve(jira_dir, str(host), int(port), config, expanded_config_path)
+        background_sync = None
+        if choose(args.watch, config.serve_watch):
+            background_sync = build_background_sync(config, jira_dir, refresh_interval=args.refresh_interval)
+            if background_sync is None:
+                print(
+                    "warning: --watch needs jira_url, jira_email, jira_api_token and at least one project "
+                    "in config.toml -- serving without background refresh",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Background refresh: quick check every {int(background_sync.interval)}s, "
+                    f"full refresh every {int(background_sync.full_interval)}s, "
+                    f"paused after {int(background_sync.idle_after)}s without UI activity"
+                )
+        serve(jira_dir, str(host), int(port), config, expanded_config_path, background_sync=background_sync)
         return 0
 
     if args.command == "view":

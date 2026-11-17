@@ -2054,7 +2054,138 @@ def test_meta_ctrl_c_exits_without_traceback(tmp_path: Path, monkeypatch, capsys
 
 
 
-# --- jira-wb sync: summary ------------------------------------------------------
+def _capture_serve(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    def fake_serve(jira_dir: Path, host: str, port: int, config: object, config_path: object, *, background_sync: object = None) -> None:
+        captured["background_sync"] = background_sync
+
+    monkeypatch.setattr(jira_workbench.cli, "serve", fake_serve)
+    return captured
+
+
+def test_serve_watch_builds_a_background_syncer_from_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        'jira_url = "https://example.atlassian.net"\njira_email = "me@example.com"\njira_api_token = "t"\n'
+        'project = "SAT"\n\n[serve]\nhost = "127.0.0.1"\nport = 8765\nfull_refresh_interval = 1800\n'
+    )
+    captured = _capture_serve(monkeypatch)
+
+    code = main(["--config", str(config_path), "serve", "--jira-dir", str(tmp_path / "jira"), "--watch", "--refresh-interval", "120"])
+
+    assert code == 0
+    syncer = captured["background_sync"]
+    assert syncer is not None
+    assert (syncer.interval, syncer.full_interval, syncer.idle_after) == (120, 1800, 900)
+
+
+def test_serve_without_watch_has_no_background_syncer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[serve]\nhost = "127.0.0.1"\nport = 8765\nwatch = true\n')
+    captured = _capture_serve(monkeypatch)
+
+    # watch = true in config but no Jira credentials -> warns, serves anyway.
+    assert main(["--config", str(config_path), "serve", "--jira-dir", str(tmp_path / "jira")]) == 0
+    assert captured["background_sync"] is None
+    assert main(["--config", str(config_path), "serve", "--jira-dir", str(tmp_path / "jira"), "--no-watch"]) == 0
+    assert captured["background_sync"] is None
+
+
+# --- serve --watch wiring (build_background_sync) ------------------------------
+
+_WATCH_CONFIG = (
+    'jira_url = "https://example.atlassian.net"\njira_email = "me@example.com"\njira_api_token = "t"\n\n'
+    '[[projects]]\nkey = "SAT"\ndefault = true\ncomponent_field = "customfield_10071"\nhistory_months = 6\n\n'
+    '[[projects]]\nkey = "PLAT"\n'
+)
+
+
+def _watch_syncer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sync_project_fn: object) -> object:
+    from jira_workbench.cli import build_background_sync
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(_WATCH_CONFIG)
+    registry_writes: list[object] = []
+    monkeypatch.setattr(jira_workbench.cli, "api_client_from_config", lambda key, *creds: (key, f"client-{key}"))
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", sync_project_fn)
+    monkeypatch.setattr(jira_workbench.cli, "write_project_registry", lambda *args: registry_writes.append(args))
+    syncer = build_background_sync(load_config(config_path), tmp_path / "jira")
+    assert syncer is not None
+    syncer.registry_writes = registry_writes  # type: ignore[attr-defined]
+    return syncer
+
+
+def test_background_quick_check_queries_every_project_with_its_own_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jira_workbench.sync import QuickSyncResult
+
+    seen: dict[str, object] = {}
+
+    def fake_quick_sync(jira_dir: Path, projects: list, client: object, *, since_minutes: int) -> QuickSyncResult:
+        seen.update(projects=projects, client=client, since=since_minutes)
+        return QuickSyncResult(changed_keys=("SAT-1", "PLAT-2"))
+
+    monkeypatch.setattr(jira_workbench.cli, "quick_sync", fake_quick_sync)
+    syncer = _watch_syncer(tmp_path, monkeypatch, sync_project_fn=None)
+
+    assert syncer._quick(7) == 2
+    assert seen["since"] == 7
+    assert seen["client"] == "client-SAT"
+    assert [(p.project, p.component_field, p.history_months) for p in seen["projects"]] == [
+        ("SAT", "customfield_10071", 6),
+        ("PLAT", "components", None),
+    ]
+
+
+def test_background_full_refresh_syncs_every_project_and_counts_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jira_workbench.sync import SyncResult
+
+    synced: list[str] = []
+
+    def fake_sync_project(config: object, client: object, progress: object = None) -> SyncResult:
+        synced.append(config.project)
+        return SyncResult(work_item_count=5, changed_count=2, skipped_count=3, deleted_keys=("X-1",))
+
+    syncer = _watch_syncer(tmp_path, monkeypatch, fake_sync_project)
+
+    assert syncer._full() == 6  # (2 changed + 1 deleted) per project
+    assert synced == ["SAT", "PLAT"]
+    assert len(syncer.registry_writes) == 1
+
+
+def test_background_full_refresh_tolerates_one_failing_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from jira_workbench.sync import SyncResult
+
+    def fake_sync_project(config: object, client: object, progress: object = None) -> SyncResult:
+        if config.project == "PLAT":
+            raise RuntimeError("no permission")
+        return SyncResult(work_item_count=1, changed_count=1, skipped_count=0)
+
+    syncer = _watch_syncer(tmp_path, monkeypatch, fake_sync_project)
+
+    assert syncer._full() == 1
+    assert "background sync: PLAT: no permission" in capsys.readouterr().err
+
+
+def test_background_full_refresh_fails_when_every_project_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_sync_project(config: object, client: object, progress: object = None) -> object:
+        raise RuntimeError(f"{config.project} down")
+
+    syncer = _watch_syncer(tmp_path, monkeypatch, fake_sync_project)
+
+    with pytest.raises(RuntimeError, match="SAT: SAT down; PLAT: PLAT down"):
+        syncer._full()
+
+
+# --- jira-wb sync: lock and summary --------------------------------------------
 
 
 def _sync_config(tmp_path: Path) -> Path:
@@ -2064,6 +2195,43 @@ def _sync_config(tmp_path: Path) -> Path:
         'jira_email = "user@example.com"\njira_api_token = "token"\n'
     )
     return config_path
+
+
+def test_sync_waits_for_a_running_background_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import threading
+
+    from jira_workbench.sync import SyncResult, sync_lock
+
+    jira_dir = tmp_path / "jira"
+    holder_has_lock = threading.Event()
+    release = threading.Event()
+    order: list[str] = []
+
+    def hold_lock() -> None:
+        with sync_lock(jira_dir):
+            holder_has_lock.set()
+            release.wait(5)
+            order.append("background done")
+
+    def fake_sync_project(config: object, client: object, progress: object = None) -> SyncResult:
+        order.append("cli sync")
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert holder_has_lock.wait(5)
+    threading.Timer(0.3, release.set).start()
+
+    code = main(["--config", str(_sync_config(tmp_path)), "sync", "--jira-dir", str(jira_dir)])
+    holder.join(5)
+
+    assert code == 0
+    assert order == ["background done", "cli sync"]
+    assert "waiting for another sync" in capsys.readouterr().err
 
 
 def test_sync_summary_reports_metadata_counts(
