@@ -572,3 +572,34 @@ def test_sync_freshdesk_source_cursor_is_taken_before_listing_tickets(tmp_path: 
 
     cursor = read_json(freshdesk_dir(tmp_path) / "last_sync.json")["syncedAt"]
     assert events.index(f"clock {cursor}") < events.index("list_tickets")
+
+
+def test_sync_freshdesk_source_retries_failed_conversations_on_the_next_run(tmp_path: Path) -> None:
+    # Regression (#52 review): a failed conversation fetch still advanced the
+    # cursor, so the ticket's conversations stayed missing unless it changed again.
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    sync_freshdesk_source(
+        settings, tmp_path, FakeFreshdeskClient({1: _ticket(1), 2: _ticket(2)}, failing_ticket_ids={2}), progress=None
+    )
+    assert read_json(freshdesk_dir(tmp_path) / "last_sync.json")["conversationRetryIds"] == [2]
+
+    # Next run: ticket 2 is no longer in the incremental listing, and Freshdesk serves it now.
+    second = FakeFreshdeskClient({1: _ticket(1), 2: _ticket(2)}, index_keys=[1])
+    result = sync_freshdesk_source(settings, tmp_path, second, progress=None)
+
+    assert ("list_conversations", 2) in second.calls
+    assert read_json(tmp_path / "freshdesk/tickets/2/conversations.json") == [{"body_text": "reply on 2"}]
+    assert read_json(freshdesk_dir(tmp_path) / "last_sync.json")["conversationRetryIds"] == []
+    assert result.failed_keys == ()
+
+
+def test_sync_freshdesk_source_keeps_retrying_conversations_that_fail_again(tmp_path: Path) -> None:
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    client = FakeFreshdeskClient({1: _ticket(1), 2: _ticket(2)}, failing_ticket_ids={2})
+    sync_freshdesk_source(settings, tmp_path, client, progress=None)
+
+    still_failing = FakeFreshdeskClient({1: _ticket(1), 2: _ticket(2)}, index_keys=[1], failing_ticket_ids={2})
+    result = sync_freshdesk_source(settings, tmp_path, still_failing, progress=None)
+
+    assert result.failed_keys == ("FD-2",)
+    assert read_json(freshdesk_dir(tmp_path) / "last_sync.json")["conversationRetryIds"] == [2]

@@ -328,10 +328,13 @@ def sync_freshdesk_source(
 
     last_sync_path = base_dir / "last_sync.json"
     updated_since = None
-    if not force and last_sync_path.exists():
+    retry_ids: list[int] = []
+    if last_sync_path.exists():
         last_sync = read_json(last_sync_path)
-        if isinstance(last_sync, dict) and isinstance(last_sync.get("syncedAt"), str):
-            updated_since = last_sync["syncedAt"]
+        if isinstance(last_sync, dict):
+            if not force and isinstance(last_sync.get("syncedAt"), str):
+                updated_since = last_sync["syncedAt"]
+            retry_ids = [i for i in last_sync.get("conversationRetryIds") or [] if isinstance(i, int)]
 
     if progress:
         progress("[2/4] Listing tickets...")
@@ -345,12 +348,15 @@ def sync_freshdesk_source(
         progress("[3/4] Syncing tickets...")
     changed = 0
     failed: list[str] = []
+    failed_ids: list[int] = []
+    listed_ids: set[int] = set()
     total = len(tickets)
     for index, ticket in enumerate(tickets, start=1):
         ticket_id = ticket.get("id")
         if not isinstance(ticket_id, int):
             continue
         key = ticket_key(ticket_id)
+        listed_ids.add(ticket_id)
         if progress:
             progress(f"[3/4] Syncing tickets... {index}/{total} {key}")
         dest = tickets_dir / str(ticket_id)
@@ -368,11 +374,31 @@ def sync_freshdesk_source(
             conversations = client.list_conversations(ticket_id)
         except FreshdeskError as exc:
             failed.append(key)
+            failed_ids.append(ticket_id)
             conversations = []
             if progress:
                 progress(f"[3/4] could not fetch conversations for {key}: {exc}")
         write_json(dest / "ticket.json", ticket)
         write_json(dest / "conversations.json", conversations)
+        changed += 1
+
+    # Conversations that failed on an earlier run are retried even when the
+    # ticket isn't in this (incremental) listing -- the cursor still advances
+    # past them, so without this they would stay missing until the ticket
+    # happened to change again.
+    for ticket_id in retry_ids:
+        if ticket_id in listed_ids or not (tickets_dir / str(ticket_id) / "ticket.json").exists():
+            continue
+        key = ticket_key(ticket_id)
+        try:
+            conversations = client.list_conversations(ticket_id)
+        except FreshdeskError as exc:
+            failed.append(key)
+            failed_ids.append(ticket_id)
+            if progress:
+                progress(f"[3/4] could not fetch conversations for {key} (retry): {exc}")
+            continue
+        write_json(tickets_dir / str(ticket_id) / "conversations.json", conversations)
         changed += 1
 
     if progress:
@@ -388,5 +414,5 @@ def sync_freshdesk_source(
     # computes (see recompute_board_membership's own docstring).
     _db.recompute_board_membership(jira_dir, source_slug=settings.slug)
 
-    write_json(last_sync_path, {"syncedAt": next_cursor})
+    write_json(last_sync_path, {"syncedAt": next_cursor, "conversationRetryIds": sorted(set(failed_ids))})
     return FreshdeskSyncResult(ticket_count=count, changed_count=changed, failed_keys=tuple(failed))
