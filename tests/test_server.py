@@ -5837,6 +5837,36 @@ def test_item_detail_page_freshdesk_ticket_shows_its_conversation(tmp_path: Path
     assert "reply on 1" in response.text
 
 
+_HOSTILE_HTML = '<img src=x onerror="alert(1)"><script>alert(2)</script><p>Hello <b>agent</b></p>'
+
+
+def test_item_detail_page_freshdesk_html_is_rendered_as_escaped_text(tmp_path: Path) -> None:
+    # Regression (#52 review): ticket descriptions and conversation bodies are
+    # written by external requesters; raw HTML here was a stored-XSS path on
+    # the same origin as the Jira-writing routes.
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1, description=_HOSTILE_HTML)})
+    write_json(tmp_path / "freshdesk/tickets/1/conversations.json", [{"body": _HOSTILE_HTML}])
+
+    response = client.get("/items/FD-1")
+
+    assert response.status_code == 200
+    assert "onerror" not in response.text
+    assert "<script>alert" not in response.text
+    assert "alert(2)" not in response.text  # script content dropped, not shown as text
+    assert response.text.count("Hello agent") == 2  # description + conversation, as text
+
+
+def test_item_detail_page_freshdesk_prefers_and_escapes_the_plain_text_field(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(
+        tmp_path, tickets={1: _ticket(1, description=_HOSTILE_HTML, description_text="Plain <b>text</b>")}
+    )
+
+    response = client.get("/items/FD-1")
+
+    assert "Plain &lt;b&gt;text&lt;/b&gt;" in response.text
+    assert "onerror" not in response.text
+
+
 def test_item_detail_page_404s_for_a_key_that_matches_neither_source(tmp_path: Path) -> None:
     client = _synced_client_with_freshdesk(tmp_path)
 

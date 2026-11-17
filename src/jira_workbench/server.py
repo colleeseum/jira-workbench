@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -3830,6 +3831,51 @@ def render_item_detail_page(
 _FRESHDESK_PRIORITY_NAMES = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
 
 
+class _HtmlTextExtractor(HTMLParser):
+    """Text content of an HTML fragment, with script/style content dropped
+    and block elements turned into line breaks."""
+
+    _SKIP = {"script", "style"}
+    _BLOCK = {"br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP:
+            self._skip_depth += 1
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self.parts.append(data)
+
+
+def _freshdesk_text_html(html_value: Any, text_value: Any) -> str:
+    """Freshdesk ticket descriptions and conversation bodies are written by
+    requesters outside the organization, so their HTML is untrusted: this
+    page shares an origin with the routes that write to Jira, and rendering
+    it raw is a stored-XSS path. Render it as escaped plain text instead --
+    Freshdesk's own `*_text` field when present, else the HTML reduced to
+    its text -- keeping line breaks but no markup."""
+    text = str(text_value) if text_value else ""
+    if not text and html_value:
+        extractor = _HtmlTextExtractor()
+        extractor.feed(str(html_value))
+        extractor.close()
+        text = re.sub(r"\n{3,}", "\n\n", "".join(extractor.parts)).strip()
+    return f'<div style="white-space: pre-wrap;">{html.escape(text)}</div>'
+
+
 def render_freshdesk_detail_page(
     jira_dir: Path,
     config: WorkbenchConfig,
@@ -3894,11 +3940,11 @@ def render_freshdesk_detail_page(
         ]
     )
 
-    description_html = ticket.get("description") or html.escape(str(ticket.get("description_text") or ""))
+    description_html = _freshdesk_text_html(ticket.get("description"), ticket.get("description_text"))
 
     conversation_rows = "".join(
         f'<li><p><strong>{html.escape(str(conversation.get("updated_at") or conversation.get("created_at") or ""))}'
-        f"</strong></p><div>{conversation.get('body') or html.escape(str(conversation.get('body_text') or ''))}</div></li>"
+        f"</strong></p>{_freshdesk_text_html(conversation.get('body'), conversation.get('body_text'))}</li>"
         for conversation in detail["conversations"]
         if isinstance(conversation, dict)
     )
