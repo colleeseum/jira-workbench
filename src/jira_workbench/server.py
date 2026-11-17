@@ -6042,6 +6042,8 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         board_entry = _find_board_entry(jira_dir, project, board)
         if board_entry is None:
             return {"ok": False, "error": f"board {board!r} not found for project {project}"}
+        if is_project_read_only(jira_dir, project):
+            return {"ok": False, "error": f"project {project} is read-only"}
         board_id = board_entry.get("id")
         current_scope = "backlog" if key in (board_entry.get("backlogKeys") or []) else "active"
 

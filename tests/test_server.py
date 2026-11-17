@@ -5,6 +5,7 @@ import json
 import re
 import threading
 from pathlib import Path
+from urllib.parse import unquote_plus
 
 import pytest
 from fastapi.testclient import TestClient
@@ -6280,3 +6281,53 @@ def test_assistant_conversation_with_an_errored_turn_still_persists_its_prior_hi
     assert "first question" in response.text
     assert "42 open tickets" in response.text
     assert "second question" not in response.text
+
+
+# Regression (#52 review): the web metadata routes and board moves wrote to
+# Jira for projects configured read_only, bypassing the checks the CLI and
+# TUI apply.
+_READ_ONLY_METADATA_POSTS = [
+    ("/meta/versions/add", {"project": "SAT", "name": "x"}),
+    ("/meta/versions/rename", {"project": "SAT", "identifier": "10000", "new_name": "y"}),
+    ("/meta/versions/release", {"project": "SAT", "identifier": "10000"}),
+    ("/meta/versions/archive", {"project": "SAT", "identifier": "10000"}),
+    ("/meta/versions/delete", {"project": "SAT", "identifier": "10000"}),
+    ("/meta/components/add", {"project": "SAT", "name": "new-component"}),
+    ("/meta/components/add-option", {"project": "SAT", "name": "new-option"}),
+]
+
+
+@pytest.mark.parametrize(("path", "data"), _READ_ONLY_METADATA_POSTS)
+def test_web_metadata_mutations_refuse_read_only_projects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, data: dict[str, str]
+) -> None:
+    client = TestClient(create_app(tmp_path, _pushable_config()))
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+    fake = ApiClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    response = client.post(path, data=data, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert "flash_kind=error" in response.headers["location"]
+    assert "read-only" in unquote_plus(response.headers["location"])
+    assert fake.calls == []
+
+
+def test_post_item_board_position_refuses_read_only_projects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _synced_client(tmp_path, _pushable_config())
+    _write_position_board_cache(tmp_path, backlog_keys=["SAT-1"], board_keys=["SAT-2"])
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+    fake = BoardPositionJiraClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    response = client.post(
+        "/items/SAT-1/board-position",
+        data={"project": "SAT", "board": "SAT board", "target_scope": "active", "before_key": "SAT-2"},
+    )
+
+    assert response.json() == {"ok": False, "error": "project SAT is read-only"}
+    assert fake.move_calls == [] and fake.rank_calls == []
+    assert read_json(tmp_path / "meta/SAT/boards.json")["boards"][0]["backlogKeys"] == ["SAT-1"]

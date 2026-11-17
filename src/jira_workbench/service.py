@@ -151,6 +151,14 @@ def meta_component_field_options_output(
     return format_component_field_option_cache(cache)
 
 
+def _raise_if_read_only(jira_dir: Path, project: object | None) -> None:
+    """Every Jira-mutating metadata workflow refuses a read-only project,
+    whichever front end calls it (the CLI also checks before calling; the
+    web routes relied on this layer and previously had no check at all)."""
+    if project is not None and is_project_read_only(jira_dir, str(project)):
+        raise MetadataError(f"cannot modify metadata: project {project} is read-only")
+
+
 def add_meta_version(
     jira_dir: Path,
     name: str,
@@ -159,6 +167,7 @@ def add_meta_version(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> str:
+    _raise_if_read_only(jira_dir, project)
     api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
     cache = add_version_api(jira_dir, api_project, name, client)
     return f"created version {name}\nrefreshed {len(cache.get('versions', []))} versions\n"
@@ -172,6 +181,7 @@ def add_meta_component(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> str:
+    _raise_if_read_only(jira_dir, project)
     api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
     cache = add_component_api(jira_dir, api_project, name, client)
     return f"created component {name}\nrefreshed {len(cache.get('components', []))} components\n"
@@ -189,6 +199,7 @@ def add_meta_component_field_option(
 ) -> str:
     if component_field is None:
         raise MetadataError("component_field is required to add custom component field options")
+    _raise_if_read_only(jira_dir, project)
     api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
     cache = add_component_field_option_api(
         jira_dir,
@@ -210,6 +221,7 @@ def rename_meta_version(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> str:
+    _raise_if_read_only(jira_dir, project)
     api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
     cache = rename_version_api(jira_dir, api_project, identifier, new_name, client)
     return f"renamed version {identifier} to {new_name}\nrefreshed {len(cache.get('versions', []))} versions\n"
@@ -224,6 +236,7 @@ def release_meta_version(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> str:
+    _raise_if_read_only(jira_dir, project)
     api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
     cache = release_version_api(jira_dir, api_project, identifier, client, release_date=release_date)
     return f"{getattr(cache, 'message', f'released version {identifier}')}\nrefreshed {len(cache.get('versions', []))} versions\n"
@@ -237,6 +250,7 @@ def archive_meta_version(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> str:
+    _raise_if_read_only(jira_dir, project)
     api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
     cache = archive_version_api(jira_dir, api_project, identifier, client)
     return f"{getattr(cache, 'message', f'archived version {identifier}')}\nrefreshed {len(cache.get('versions', []))} versions\n"
@@ -251,6 +265,7 @@ def delete_meta_version(
     jira_email: object | None,
     jira_api_token: object | None,
 ) -> str:
+    _raise_if_read_only(jira_dir, project)
     api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
     cache = delete_version_api(
         jira_dir,
