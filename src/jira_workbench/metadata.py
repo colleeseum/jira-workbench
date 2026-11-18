@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -997,11 +998,21 @@ def fetch_rank_field_id(client: Any) -> str | None:
     return None
 
 
+def rank_custom_field_number(rank_field_id: str) -> int:
+    """issue/rank's rankCustomFieldId is the field's number (10019), not its id
+    ("customfield_10019"): Jira Cloud rejects the id string with 400 "Invalid request
+    payload" (confirmed live). fetch_rank_field_id returns the id, so convert here."""
+    match = re.fullmatch(r"customfield_(\d+)", rank_field_id.strip())
+    if not match:
+        raise MetadataError(f"unexpected Rank field id {rank_field_id!r}; expected customfield_<number>")
+    return int(match.group(1))
+
+
 def rank_issue_before(client: Any, key: str, before_key: str, rank_field_id: str) -> None:
     """PUT rest/agile/1.0/issue/rank -- places `key` immediately before
     `before_key` in Jira's own rank order, the same operation dragging a
     card to a new position in Jira's backlog view performs."""
-    client.update_rank([key], before_key, rank_field_id)
+    client.update_rank([key], before_key, rank_custom_field_number(rank_field_id))
 
 
 def rank_issue_after(client: Any, key: str, after_key: str, rank_field_id: str) -> None:
@@ -1010,7 +1021,7 @@ def rank_issue_after(client: Any, key: str, after_key: str, rank_field_id: str) 
     The library's update_rank only supports rankBeforeIssue."""
     client.put(
         client.get_agile_resource_url("issue/rank"),
-        data={"issues": [key], "rankAfterIssue": after_key, "rankCustomFieldId": rank_field_id},
+        data={"issues": [key], "rankAfterIssue": after_key, "rankCustomFieldId": rank_custom_field_number(rank_field_id)},
     )
 
 

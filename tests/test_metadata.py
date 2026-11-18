@@ -24,6 +24,7 @@ from jira_workbench.metadata import (
     fetch_project_access_members,
     fetch_project_actors_internal,
     fetch_rank_field_id,
+    rank_custom_field_number,
     field_clause_names,
     format_boards,
     format_component_field_option_cache,
@@ -973,12 +974,19 @@ def test_fetch_rank_field_id_returns_none_when_no_rank_field_exists() -> None:
     assert fetch_rank_field_id(NoRankClient()) is None
 
 
+def test_rank_custom_field_number_rejects_an_unexpected_field_id() -> None:
+    # Jira Cloud's issue/rank rejects the "customfield_N" id with 400; only the number is valid.
+    assert rank_custom_field_number("customfield_10019") == 10019
+    with pytest.raises(MetadataError, match="unexpected Rank field id"):
+        rank_custom_field_number("rank")
+
+
 def test_rank_issue_before_calls_update_rank() -> None:
     client = AgileWriteClient()
 
     rank_issue_before(client, "SAT-142", "SAT-100", "customfield_10019")
 
-    assert client.calls == [("update_rank", (("SAT-142",), "SAT-100", "customfield_10019"))]
+    assert client.calls == [("update_rank", (("SAT-142",), "SAT-100", 10019))]
 
 
 def test_rank_issue_after_puts_a_rank_after_operation() -> None:
@@ -992,7 +1000,7 @@ def test_rank_issue_after_puts_a_rank_after_operation() -> None:
             "put",
             (
                 "rest/agile/1.0/issue/rank",
-                {"issues": ["SAT-142"], "rankAfterIssue": "SAT-100", "rankCustomFieldId": "customfield_10019"},
+                {"issues": ["SAT-142"], "rankAfterIssue": "SAT-100", "rankCustomFieldId": 10019},
             ),
         )
     ]

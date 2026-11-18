@@ -2426,7 +2426,7 @@ def test_post_item_board_position_ranks_after_when_dropped_below_a_row(
         (
             "put",
             "rest/agile/1.0/issue/rank",
-            {"issues": ["SAT-1"], "rankAfterIssue": "SAT-3", "rankCustomFieldId": "customfield_10019"},
+            {"issues": ["SAT-1"], "rankAfterIssue": "SAT-3", "rankCustomFieldId": 10019},
         )
     ]
     board = read_json(tmp_path / "meta/SAT/boards.json")["boards"][0]
@@ -2464,7 +2464,7 @@ def test_post_item_board_position_moves_scope_and_ranks(tmp_path: Path, monkeypa
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert fake.move_calls == [("board", "rest/agile/1.0/board/32/issue", {"issues": ["SAT-1"]})]
-    assert fake.rank_calls == [(("SAT-1",), "SAT-2", "customfield_10019")]
+    assert fake.rank_calls == [(("SAT-1",), "SAT-2", 10019)]
 
     cache = read_json(tmp_path / "meta/SAT/boards.json")
     board = cache["boards"][0]
@@ -2488,7 +2488,7 @@ def test_post_item_board_position_rank_only_when_scope_unchanged(tmp_path: Path,
     # Already "active" (present in boardKeys, absent from backlogKeys) --
     # no move call, only a rank call.
     assert fake.move_calls == []
-    assert fake.rank_calls == [(("SAT-1",), "SAT-2", "customfield_10019")]
+    assert fake.rank_calls == [(("SAT-1",), "SAT-2", 10019)]
 
 
 def test_post_item_board_position_returns_error_json_when_board_not_found(
