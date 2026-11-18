@@ -2051,3 +2051,37 @@ def test_meta_ctrl_c_exits_without_traceback(tmp_path: Path, monkeypatch, capsys
     captured = capsys.readouterr()
     assert code == 130
     assert "Traceback" not in captured.err
+
+
+
+# --- jira-wb sync: summary ------------------------------------------------------
+
+
+def _sync_config(tmp_path: Path) -> Path:
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        'project = "SAT"\njira_url = "https://example.atlassian.net"\n'
+        'jira_email = "user@example.com"\njira_api_token = "token"\n'
+    )
+    return config_path
+
+
+def test_sync_summary_reports_metadata_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from jira_workbench.sync import SyncResult
+
+    def fake_sync_project(config: object, client: object, progress: object = None) -> SyncResult:
+        return SyncResult(
+            work_item_count=4, changed_count=1, skipped_count=3, version_count=2,
+            assignee_count=9, component_count=None, board_count=3,
+        )
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+
+    assert main(["--config", str(_sync_config(tmp_path)), "sync", "--jira-dir", str(tmp_path / "jira")]) == 0
+
+    out = capsys.readouterr().out
+    assert "2 versions cached, 9 assignees, 3 boards)" in out
+    assert "components" not in out  # skipped refresh -> no count shown

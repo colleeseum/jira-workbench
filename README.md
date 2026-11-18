@@ -120,6 +120,11 @@ port = 8765
 ```
 
 `jira-wb sync` syncs all configured Jira projects and Freshdesk sources.
+Each Jira project sync also refreshes that project's metadata caches —
+versions, assignees (project Access members), components, and boards —
+so `jira-wb meta refresh` is only needed to refresh metadata without
+syncing issues. A metadata refresh failure is reported but never aborts
+the issue sync.
 Use `jira-wb sync --source jira` or `jira-wb sync --source freshdesk` to sync
 only one source kind. `--force` applies to both; `--project` and other
 Jira options only affect Jira sync. A Freshdesk-only configuration needs no

@@ -581,10 +581,19 @@ def main(argv: list[str] | None = None) -> int:
                 f", {result.backfilled_parent_count} parent(s) backfilled" if result.backfilled_parent_count else ""
             )
             deleted_note = f", {len(result.deleted_keys)} deleted in Jira removed" if result.deleted_keys else ""
+            meta_note = "".join(
+                f", {count} {label}"
+                for count, label in (
+                    (result.assignee_count, "assignees"),
+                    (result.component_count, "components"),
+                    (result.board_count, "boards"),
+                )
+                if count is not None
+            )
             print(
                 f"{prefix} {result.work_item_count} work items "
                 f"({result.changed_count} changed, {result.skipped_count} unchanged, "
-                f"{result.version_count} versions cached{backfilled_note}{deleted_note})."
+                f"{result.version_count} versions cached{meta_note}{backfilled_note}{deleted_note})."
             )
             if result.shadow_protected_deleted_keys:
                 print(
