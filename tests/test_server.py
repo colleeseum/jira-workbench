@@ -6547,3 +6547,32 @@ def test_items_page_bulk_edit_assignee_options_exclude_ex_members(tmp_path: Path
     bulk_select = text[start : text.index("</select>", start)]
     assert "Serge Colle" in bulk_select
     assert "Al Baker" not in bulk_select
+
+
+def test_items_page_assignee_filter_assigned_matches_anyone(tmp_path: Path) -> None:
+    _write_two_assignee_issues(tmp_path)
+    write_json(
+        tmp_path / "components/helm-chart/SAT-3/issue.json",
+        {"key": "SAT-3", "fields": {"summary": "Three", "issuetype": {"name": "Task"}}},
+    )
+    build_manifest(tmp_path)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    checklist = _field_checklist(client.get("/").text, "Assignee")
+    assert 'value="(assigned)"' in checklist
+    assert checklist.index("(assigned)") < checklist.index("Al Baker")
+    assigned_row = checklist[checklist.index('value="(assigned)"') :]
+    assert '<span class="count">2</span>' in assigned_row[: assigned_row.index("</label>")]
+
+    response = client.get("/", params={"assignee": "(assigned)"})
+    assert ">SAT-1<" in response.text
+    assert ">SAT-2<" in response.text
+    assert ">SAT-3<" not in response.text
+
+
+def test_matches_field_assigned_sentinel_only_applies_to_assignee() -> None:
+    from jira_workbench.view import matches_field
+
+    assert matches_field({"assignee": "Al Baker"}, "assignee", ["(assigned)"])
+    assert not matches_field({"assignee": ""}, "assignee", ["(assigned)"])
+    assert not matches_field({"status": "Open"}, "status", ["(assigned)"])
