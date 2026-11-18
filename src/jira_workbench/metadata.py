@@ -679,14 +679,17 @@ def load_all_boards_with_settings(jira_dir: Path) -> list[dict[str, Any]]:
     purely local on/off switch -- independent of whether the board's own
     filter is supported, see its unsupportedReason). This is the one list
     both the Meta > Boards screen and the Filters picker consume."""
+    return with_board_settings(jira_dir, load_all_boards(jira_dir))
+
+
+def with_board_settings(jira_dir: Path, jira_boards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`jira_boards` tagged kind="jira" with their local active switch, followed by every
+    locally-defined board (kind="local"). Local boards are not tied to one project."""
     settings = load_board_settings(jira_dir)
     disabled_ids = set(settings["disabledBoardIds"])
-    jira_boards = [
-        {**board, "kind": "jira", "active": str(board.get("id")) not in disabled_ids}
-        for board in load_all_boards(jira_dir)
-    ]
+    tagged = [{**board, "kind": "jira", "active": str(board.get("id")) not in disabled_ids} for board in jira_boards]
     local_boards = [{**board, "kind": "local"} for board in settings["localBoards"]]
-    return [*jira_boards, *local_boards]
+    return [*tagged, *local_boards]
 
 
 def refresh_versions_api(

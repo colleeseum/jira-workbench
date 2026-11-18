@@ -50,6 +50,7 @@ from .metadata import (
     set_board_active,
     set_component_archived,
     version_name,
+    with_board_settings,
 )
 from .service import (
     LabelBulkEditResult,
@@ -6415,9 +6416,11 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         if not project:
             return render_meta_projects_page(projects, section="boards")
         try:
-            boards = meta_boards_data(jira_dir, config, project)
+            jira_boards = meta_boards_data(jira_dir, config, project)
         except MetadataError:
-            boards = []
+            jira_boards = []
+        # Local boards live in board_settings.json, not the project's Jira boards cache.
+        boards = with_board_settings(jira_dir, jira_boards)
         filtered = _filter_by_name(boards, q)
         table = _boards_rows_with_actions(filtered, project) if filtered else ""
         empty_message = "No boards match that filter." if q else "No boards loaded for this project."

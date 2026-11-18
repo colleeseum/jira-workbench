@@ -3582,6 +3582,52 @@ def test_meta_boards_page_renders_boards_for_the_selected_project(tmp_path: Path
     assert "SAT board" in response.text
 
 
+def test_meta_boards_page_lists_local_boards_with_their_controls(tmp_path: Path) -> None:
+    # Local boards live in board_settings.json, not the project's Jira boards cache; without them the
+    # page's delete and enable/disable controls for local boards were unreachable.
+    write_json(
+        tmp_path / "meta/SAT/boards.json",
+        {"project": "SAT", "boards": [{"id": "1", "name": "SAT board", "supported": True}]},
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    client.post("/meta/boards/add", data={"project": "SAT", "name": "My Filter"}, follow_redirects=False)
+
+    response = client.get("/meta/boards", params={"project": "SAT"})
+
+    assert "SAT board" in response.text
+    assert "My Filter" in response.text
+    assert 'action="/meta/boards/delete"' in response.text
+    assert '<input type="hidden" name="identifier" value="My Filter">' in response.text
+
+
+def test_meta_boards_page_lists_local_boards_without_a_jira_boards_cache(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    client.post("/meta/boards/add", data={"project": "SAT", "name": "My Filter"}, follow_redirects=False)
+
+    response = client.get("/meta/boards", params={"project": "SAT"})
+
+    assert "My Filter" in response.text
+    assert 'action="/meta/boards/delete"' in response.text
+
+
+def test_meta_boards_page_shows_a_disabled_jira_board_as_inactive(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/boards.json",
+        {"project": "SAT", "boards": [{"id": "32", "name": "SAT board", "supported": True}]},
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+    client.post(
+        "/meta/boards/toggle-active",
+        data={"project": "SAT", "kind": "jira", "identifier": "32", "active": "0"},
+        follow_redirects=False,
+    )
+
+    response = client.get("/meta/boards", params={"project": "SAT"})
+
+    assert '<input type="hidden" name="active" value="1">' in response.text
+    assert ">Enable</button>" in response.text
+
+
 def test_meta_section_pages_without_a_project_show_the_project_picker(tmp_path: Path) -> None:
     config = WorkbenchConfig(projects=(ProjectSettings(key="SAT", default=True),))
     client = TestClient(create_app(tmp_path, config))
