@@ -923,25 +923,29 @@ def field_clause_names(client: ProjectMetadataClient, field_id: str) -> list[str
     return [field_id]
 
 
-def fetch_backlog_keys(client: ProjectMetadataClient, board_id: object) -> list[str]:
+def _fetch_agile_issue_keys(client: Any, path: str) -> list[str]:
+    """Collects issue keys from a paginated Agile issue listing, in Jira's order. Jira may return
+    fewer issues than maxResults asks for and may omit `total`, so each request starts after the
+    issues actually received, and the listing ends on an empty page, `isLast`, or reaching `total`."""
     keys: list[str] = []
     start = 0
     while True:
-        page = client.get(
-            f"rest/agile/1.0/board/{board_id}/backlog",
-            params={"startAt": start, "maxResults": 100, "fields": "key"},
-        )
+        page = client.get(path, params={"startAt": start, "maxResults": 100, "fields": "key"})
         if not isinstance(page, dict):
             break
         issues = page.get("issues")
-        if not isinstance(issues, list):
+        if not isinstance(issues, list) or not issues:
             break
         keys.extend(issue["key"] for issue in issues if isinstance(issue, dict) and isinstance(issue.get("key"), str))
+        start += len(issues)
         total = page.get("total")
-        if not isinstance(total, int) or start + 100 >= total:
+        if page.get("isLast") is True or (isinstance(total, int) and start >= total):
             break
-        start += 100
     return keys
+
+
+def fetch_backlog_keys(client: ProjectMetadataClient, board_id: object) -> list[str]:
+    return _fetch_agile_issue_keys(client, f"rest/agile/1.0/board/{board_id}/backlog")
 
 
 def fetch_board_keys(client: Any, board_id: object) -> list[str]:
@@ -951,24 +955,7 @@ def fetch_board_keys(client: Any, board_id: object) -> list[str]:
     display order the same way fetch_backlog_keys's return value already is
     for "backlog" (see with_local_index_fields, view.py), even though
     nothing used that ordering property until now."""
-    keys: list[str] = []
-    start = 0
-    while True:
-        page = client.get(
-            f"rest/agile/1.0/board/{board_id}/issue",
-            params={"startAt": start, "maxResults": 100, "fields": "key"},
-        )
-        if not isinstance(page, dict):
-            break
-        issues = page.get("issues")
-        if not isinstance(issues, list):
-            break
-        keys.extend(issue["key"] for issue in issues if isinstance(issue, dict) and isinstance(issue.get("key"), str))
-        total = page.get("total")
-        if not isinstance(total, int) or start + 100 >= total:
-            break
-        start += 100
-    return keys
+    return _fetch_agile_issue_keys(client, f"rest/agile/1.0/board/{board_id}/issue")
 
 
 def move_issue_to_backlog(client: Any, key: str) -> None:

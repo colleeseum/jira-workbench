@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -18,6 +19,7 @@ from jira_workbench.metadata import (
     delete_local_board,
     delete_version_api,
     ensure_versions,
+    fetch_backlog_keys,
     fetch_board_keys,
     fetch_project_access_members,
     fetch_project_actors_internal,
@@ -729,6 +731,34 @@ def test_refresh_boards_api_writes_cache_with_compiled_predicates_and_backlog(tm
     # the Agile backlog endpoint works for them same as any other board type.
     assert ps_tools["backlogKeys"] == ["SAT-881", "SAT-882"]
     assert ps_tools["boardKeys"] == ["SAT-902"]
+
+
+class CappedAgileClient:
+    """Returns at most `cap` issues per page whatever maxResults asks for, as Jira may."""
+
+    def __init__(self, total: int, cap: int, *, report_total: bool = True) -> None:
+        self.keys = [f"SAT-{n}" for n in range(total)]
+        self.cap = cap
+        self.report_total = report_total
+        self.starts: list[int] = []
+
+    def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        start = params["startAt"]
+        self.starts.append(start)
+        chunk = self.keys[start : start + min(self.cap, params["maxResults"])]
+        page: dict[str, Any] = {"startAt": start, "maxResults": self.cap, "issues": [{"key": k} for k in chunk]}
+        if self.report_total:
+            page["total"] = len(self.keys)
+        return page
+
+
+@pytest.mark.parametrize("fetch", [fetch_backlog_keys, fetch_board_keys])
+@pytest.mark.parametrize("report_total", [True, False])
+def test_board_key_fetchers_advance_by_the_returned_page_size(fetch: Any, report_total: bool) -> None:
+    client = CappedAgileClient(total=120, cap=50, report_total=report_total)
+
+    assert fetch(client, 7) == client.keys
+    assert client.starts[:3] == [0, 50, 100]
 
 
 def test_fetch_board_keys_paginates_like_fetch_backlog_keys() -> None:
