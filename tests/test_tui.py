@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -63,11 +64,20 @@ class SimplePushClient:
         self.update_calls.append((key, fields))
 
 
-class SlowSimplePushClient(SimplePushClient):
-    """Adds a small delay so tests can observe the push-in-progress state."""
+class GatedSimplePushClient(SimplePushClient):
+    """Blocks every Jira read until the test calls release(), so a test can act while a push is
+    deterministically still in progress instead of racing a fixed delay."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.gate = threading.Event()
+
+    def release(self) -> None:
+        self.gate.set()
 
     def get_issue(self, issue_id_or_key: str, fields: Any = None, **kwargs: Any) -> Any:
-        time.sleep(0.05)
+        if not self.gate.wait(timeout=10):
+            raise RuntimeError("test never released the push")
         return super().get_issue(issue_id_or_key, fields=fields, **kwargs)
 
 
@@ -3163,11 +3173,7 @@ async def test_push_all_pushes_shadow_and_clears_it(tmp_path: Path) -> None:
         await pilot.pause()
 
         assert isinstance(app.screen, PushAllProgressScreen)
-        for _ in range(50):
-            if app.screen.__class__ is PushAllProgressScreen and app.screen._done:
-                break
-            await asyncio.sleep(0.02)
-            await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, PushAllProgressScreen) and app.screen._done)
 
         await pilot.press("enter")
         await pilot.pause()
@@ -3263,7 +3269,7 @@ async def test_diff_screen_wraps_long_description_to_fit_without_horizontal_scro
 async def test_push_all_close_button_guards_until_done_then_closes(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     set_field(jira_dir, "SAT-1", "summary", "New local summary")
-    client = SlowSimplePushClient(updated="2026-07-20T00:00:01.000+0000")
+    client = GatedSimplePushClient(updated="2026-07-20T00:00:01.000+0000")
     app = JiraWorkbenchApp(
         jira_dir,
         component_field="customfield_10071",
@@ -3282,17 +3288,17 @@ async def test_push_all_close_button_guards_until_done_then_closes(tmp_path: Pat
 
         assert isinstance(app.screen, PushAllProgressScreen)
         screen = app.screen
-        if not screen._done:
-            # Clicking Close before the push completes must not dismiss the dialog.
-            await pilot.click("#close-button")
-            await pilot.pause()
-            assert app.screen is screen
+        # The push is blocked on the client, so it is still in progress: Close must not dismiss.
+        assert not screen._done
+        await pilot.click("#close-button")
+        await pilot.pause()
+        assert app.screen is screen
 
-        for _ in range(50):
-            if screen._done:
-                break
-            await asyncio.sleep(0.02)
-            await pilot.pause()
+        client.release()
+        await _wait_until(pilot, lambda: screen._done)
+        # Textual's Button ignores clicks for active_effect_duration (0.2s) after a press.
+        close_button = screen.query_one("#close-button")
+        await _wait_until(pilot, lambda: not close_button.has_class("-active"))
 
         await pilot.click("#close-button")
         await pilot.pause()
@@ -4664,7 +4670,9 @@ async def test_labels_screen_delete_removes_from_all_issues_and_pushes(tmp_path:
         await pilot.press("y")  # confirm
         await pilot.pause()
 
-        # Push progress screen opens automatically; close it once done.
+        # Push progress screen opens automatically; close it once done. Enter is ignored until the
+        # push finishes, so wait for that rather than assume one pause is enough.
+        await _wait_until(pilot, lambda: isinstance(app.screen, PushAllProgressScreen) and app.screen._done)
         await pilot.press("enter")
         await pilot.pause()
 
