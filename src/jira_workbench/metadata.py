@@ -958,11 +958,14 @@ def fetch_board_keys(client: Any, board_id: object) -> list[str]:
     return _fetch_agile_issue_keys(client, f"rest/agile/1.0/board/{board_id}/issue")
 
 
-def move_issue_to_backlog(client: Any, key: str) -> None:
-    """POST rest/agile/1.0/backlog/issue -- removes `key` from whatever
-    sprint/board placement it has, same as dragging a card down into Jira's
-    own Backlog section."""
-    client.move_issues_to_backlog([key])
+def move_issue_to_backlog(client: Any, board_id: object, key: str) -> None:
+    """POST rest/agile/1.0/backlog/{boardId}/issue -- moves `key` into this board's backlog, the
+    same as dragging a card into the board's own Backlog section. Deliberately not the library's
+    move_issues_to_backlog: that is Jira's global POST backlog/issue, which removes the issue from
+    every future and active sprint rather than only the selected board's."""
+    if board_id is None:
+        raise MetadataError(f"cannot move {key} to a backlog: the board has no Jira board id")
+    client.post(client.get_agile_resource_url(f"backlog/{board_id}/issue"), json={"issues": [key]})
 
 
 def move_issue_to_board(client: Any, board_id: object, key: str) -> None:

@@ -5745,7 +5745,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 board_id = board_entry.get("id")
                 try:
                     if target_scope == "backlog":
-                        move_issue_to_backlog(client, key)
+                        move_issue_to_backlog(client, board_id, key)
                     elif board_id is not None:
                         move_issue_to_board(client, board_id, key)
                     refresh_boards_api(jira_dir, project, client, component_field)
@@ -6051,7 +6051,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             _, client = api_client_from_config(project, config.jira_url, config.jira_email, config.jira_api_token)
             if target_scope != current_scope:
                 if target_scope == "backlog":
-                    move_issue_to_backlog(client, key)
+                    move_issue_to_backlog(client, board_id, key)
                 else:
                     move_issue_to_board(client, board_id, key)
             if before_key:

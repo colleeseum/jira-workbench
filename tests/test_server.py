@@ -2232,11 +2232,6 @@ class AgileCreateJiraClient(CreateIssueJiraClient):
             return {"total": 0, "issues": []}
         raise AssertionError(f"unexpected get() path in test: {path}")
 
-    def move_issues_to_backlog(self, issue_keys: list) -> None:
-        self.move_calls.append(("backlog", tuple(issue_keys)))
-        if self.fail_move:
-            raise RuntimeError("simulated move failure")
-
     def get_agile_resource_url(self, resource: str) -> str:
         return f"rest/agile/1.0/{resource}"
 
@@ -2273,7 +2268,8 @@ def test_post_new_issue_moves_a_scoped_create_into_the_backlog(tmp_path: Path, m
     )
 
     assert response.status_code == 303
-    assert create_client.move_calls == [("backlog", ("SAT-999",))]
+    # Board-scoped backlog move; Jira's global backlog operation would also strip sprints elsewhere.
+    assert create_client.move_calls == [("board", "rest/agile/1.0/backlog/32/issue", {"issues": ["SAT-999"]})]
     assert "flash_kind=error" not in response.headers["location"]
 
 
@@ -2357,9 +2353,6 @@ class BoardPositionJiraClient(PushJiraClient):
         self.rank_calls: list[tuple[object, ...]] = []
         self.rank_field = rank_field
 
-    def move_issues_to_backlog(self, issue_keys: list) -> None:
-        self.move_calls.append(("backlog", tuple(issue_keys)))
-
     def get_agile_resource_url(self, resource: str) -> str:
         return f"rest/agile/1.0/{resource}"
 
@@ -2388,6 +2381,25 @@ def _write_position_board_cache(tmp_path: Path, *, backlog_keys=None, board_keys
             ],
         },
     )
+
+
+def test_post_item_board_position_moves_to_the_selected_boards_backlog_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Jira's global POST backlog/issue removes the issue from every future and active sprint;
+    # dropping it into one board's backlog must use that board's backlog/{boardId}/issue.
+    client = _synced_client(tmp_path, _pushable_config())
+    _write_position_board_cache(tmp_path, board_keys=["SAT-1"])
+    fake = BoardPositionJiraClient(rank_field=False)
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    response = client.post(
+        "/items/SAT-1/board-position",
+        data={"project": "SAT", "board": "SAT board", "target_scope": "backlog"},
+    )
+
+    assert response.json() == {"ok": True}
+    assert fake.move_calls == [("board", "rest/agile/1.0/backlog/32/issue", {"issues": ["SAT-1"]})]
 
 
 def test_post_item_board_position_moves_scope_and_ranks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

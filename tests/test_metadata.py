@@ -912,9 +912,6 @@ class AgileWriteClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
 
-    def move_issues_to_backlog(self, issue_keys: list) -> None:
-        self.calls.append(("move_issues_to_backlog", tuple(issue_keys)))
-
     def get_agile_resource_url(self, resource: str) -> str:
         return f"rest/agile/1.0/{resource}"
 
@@ -931,12 +928,23 @@ class AgileWriteClient:
         ]
 
 
-def test_move_issue_to_backlog_calls_the_library_convenience_method() -> None:
+def test_move_issue_to_backlog_posts_to_the_board_scoped_backlog_endpoint() -> None:
+    # Not the library's move_issues_to_backlog: that is Jira's global backlog operation, which
+    # removes the issue from every future and active sprint, not just the selected board's.
     client = AgileWriteClient()
 
-    move_issue_to_backlog(client, "SAT-142")
+    move_issue_to_backlog(client, 32, "SAT-142")
 
-    assert client.calls == [("move_issues_to_backlog", ("SAT-142",))]
+    assert client.calls == [("post", ("rest/agile/1.0/backlog/32/issue", {"issues": ["SAT-142"]}))]
+
+
+def test_move_issue_to_backlog_requires_a_jira_board_id() -> None:
+    client = AgileWriteClient()
+
+    with pytest.raises(MetadataError):
+        move_issue_to_backlog(client, None, "SAT-142")
+
+    assert client.calls == []
 
 
 def test_move_issue_to_board_posts_to_the_board_issue_endpoint() -> None:
