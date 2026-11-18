@@ -235,6 +235,31 @@ def test_push_applies_comment_edits_and_deletes(tmp_path: Path) -> None:
     assert load_shadow(jira_dir, "SAT-1") is None
 
 
+class ChangelogJiraClient(PushJiraClient):
+    """Like Jira, returns the changelog only when it is requested with expand=changelog."""
+
+    def get_issue(self, issue_id_or_key: str, fields: str | list | tuple | set | None = None, **kwargs: Any) -> Any:
+        issue = super().get_issue(issue_id_or_key, fields=fields)
+        if fields == "*all" and kwargs.get("expand") == "changelog":
+            issue = {**issue, "changelog": {"histories": [{"id": "1", "author": {"displayName": "Ada"}}]}}
+        return issue
+
+
+def test_post_push_refresh_keeps_the_changelog(tmp_path: Path) -> None:
+    # Last changed by / Resolved by are read from the cached changelog; a post-push refresh that
+    # dropped it blanked them until the next full sync.
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    commit_shadow(jira_dir, "SAT-1")
+    client = ChangelogJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    issue_path = next((jira_dir / "components").glob("*/SAT-1/issue.json"))
+    assert read_json(issue_path)["changelog"]["histories"][0]["author"]["displayName"] == "Ada"
+
+
 def test_push_blocks_when_remote_change_conflicts_with_a_shadow_edited_field(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     set_field(jira_dir, "SAT-1", "description", "Local description")

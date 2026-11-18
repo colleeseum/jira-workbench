@@ -1235,7 +1235,7 @@ def test_issue_create_creates_and_refreshes_local_issue(tmp_path: Path, capsys, 
             self.created_fields = fields
             return {"key": "SAT-900"}
 
-        def get_issue(self, issue_id_or_key: str, fields: object = None) -> dict[str, object]:
+        def get_issue(self, issue_id_or_key: str, fields: object = None, expand: object = None) -> dict[str, object]:
             return {
                 "key": issue_id_or_key,
                 "fields": {

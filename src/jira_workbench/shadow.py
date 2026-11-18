@@ -698,7 +698,7 @@ def refresh_local_issue_after_push(
     component_field: str,
 ) -> None:
     try:
-        issue = jira_client.get_issue(key, fields="*all")
+        issue = jira_client.get_issue(key, fields="*all", expand="changelog")
     except Exception as exc:
         raise ShadowError(f"{key}: Jira push succeeded but local refresh failed: {exc}") from exc
     if not isinstance(issue, dict):
