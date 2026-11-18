@@ -44,6 +44,7 @@ from .metadata import (
     move_issue_to_board,
     normalize_components,
     normalize_versions,
+    rank_issue_after,
     rank_issue_before,
     refresh_boards_api,
     set_board_active,
@@ -1143,6 +1144,7 @@ def _patch_board_order(
     *,
     target_scope: str,
     before_key: str | None,
+    after_key: str | None = None,
 ) -> None:
     """Keeps the locally cached meta/<project>/boards.json honest right
     after a live drag-drop/scope-move write to Jira succeeds, instead of
@@ -1162,6 +1164,8 @@ def _patch_board_order(
         target_list = backlog_keys if target_scope == "backlog" else board_keys
         if before_key and before_key in target_list:
             target_list.insert(target_list.index(before_key), key)
+        elif after_key and after_key in target_list:
+            target_list.insert(target_list.index(after_key) + 1, key)
         else:
             target_list.append(key)
         board["backlogKeys"] = backlog_keys
@@ -2759,6 +2763,7 @@ function jiraWbDrop(event) {
   var targetScope = targetRow.dataset.scope;
   if (!targetScope) return;
   var beforeKey = '';
+  var afterKey = '';
   if (targetRow.dataset.key) {
     if (draggedKey === targetRow.dataset.key) return;
     var rect = targetRow.getBoundingClientRect();
@@ -2768,6 +2773,8 @@ function jiraWbDrop(event) {
     } else {
       var next = targetRow.nextElementSibling;
       beforeKey = (next && next.dataset.key) || '';
+      // Below a section's last row there is nothing to rank before, so rank after this row.
+      if (!beforeKey) afterKey = targetRow.dataset.key;
     }
   } else {
     // Dropped directly on a section header -- insert as that section's
@@ -2781,7 +2788,7 @@ function jiraWbDrop(event) {
   fetch('/items/' + draggedKey + '/board-position', {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: new URLSearchParams({project: project, board: board, target_scope: targetScope, before_key: beforeKey})
+    body: new URLSearchParams({project: project, board: board, target_scope: targetScope, before_key: beforeKey, after_key: afterKey})
   }).then(function (r) { return r.json(); }).then(function (data) {
     if (!data.ok) alert('Could not move ' + draggedKey + ': ' + (data.error || 'unknown error'));
     window.location.reload();
@@ -6031,6 +6038,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         board: str = Form(...),
         target_scope: str = Form(...),
         before_key: str = Form(""),
+        after_key: str = Form(""),
     ) -> dict[str, Any]:
         # Returns JSON, not a redirect -- this is the drag-and-drop handler's
         # own fetch() target (see BOARD_SECTIONS_SCRIPT), the first
@@ -6054,11 +6062,21 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                     move_issue_to_backlog(client, board_id, key)
                 else:
                     move_issue_to_board(client, board_id, key)
-            if before_key:
+            if before_key or after_key:
                 rank_field_id = cached_rank_field_id(client)
-                if rank_field_id:
+                if rank_field_id and before_key:
                     rank_issue_before(client, key, before_key, rank_field_id)
-            _patch_board_order(jira_dir, project, board, key, target_scope=target_scope, before_key=before_key or None)
+                elif rank_field_id:
+                    rank_issue_after(client, key, after_key, rank_field_id)
+            _patch_board_order(
+                jira_dir,
+                project,
+                board,
+                key,
+                target_scope=target_scope,
+                before_key=before_key or None,
+                after_key=after_key or None,
+            )
         except Exception as exc:  # noqa: BLE001 -- surfaced to the caller as JSON, not raised
             return {"ok": False, "error": str(exc)}
         return {"ok": True}

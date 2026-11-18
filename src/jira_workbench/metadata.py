@@ -1001,6 +1001,16 @@ def rank_issue_before(client: Any, key: str, before_key: str, rank_field_id: str
     client.update_rank([key], before_key, rank_field_id)
 
 
+def rank_issue_after(client: Any, key: str, after_key: str, rank_field_id: str) -> None:
+    """PUT rest/agile/1.0/issue/rank with rankAfterIssue -- places `key` immediately after
+    `after_key`, for a drop below a section's last row, where there is no issue to rank before.
+    The library's update_rank only supports rankBeforeIssue."""
+    client.put(
+        client.get_agile_resource_url("issue/rank"),
+        data={"issues": [key], "rankAfterIssue": after_key, "rankCustomFieldId": rank_field_id},
+    )
+
+
 def refresh_boards_api(
     jira_dir: Path,
     project: str,

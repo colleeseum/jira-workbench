@@ -48,6 +48,7 @@ from jira_workbench.metadata import (
     normalize_boards,
     normalize_components,
     normalize_versions,
+    rank_issue_after,
     rank_issue_before,
     refresh_assignees_api,
     refresh_boards_api,
@@ -918,6 +919,9 @@ class AgileWriteClient:
     def post(self, path: str, json: dict | None = None) -> None:
         self.calls.append(("post", (path, json)))
 
+    def put(self, path: str, data: dict | None = None) -> None:
+        self.calls.append(("put", (path, data)))
+
     def update_rank(self, issues_to_rank: list, rank_before: str, customfield_number: str) -> None:
         self.calls.append(("update_rank", (tuple(issues_to_rank), rank_before, customfield_number)))
 
@@ -975,6 +979,23 @@ def test_rank_issue_before_calls_update_rank() -> None:
     rank_issue_before(client, "SAT-142", "SAT-100", "customfield_10019")
 
     assert client.calls == [("update_rank", (("SAT-142",), "SAT-100", "customfield_10019"))]
+
+
+def test_rank_issue_after_puts_a_rank_after_operation() -> None:
+    # The library's update_rank only ranks before an issue.
+    client = AgileWriteClient()
+
+    rank_issue_after(client, "SAT-142", "SAT-100", "customfield_10019")
+
+    assert client.calls == [
+        (
+            "put",
+            (
+                "rest/agile/1.0/issue/rank",
+                {"issues": ["SAT-142"], "rankAfterIssue": "SAT-100", "rankCustomFieldId": "customfield_10019"},
+            ),
+        )
+    ]
 
 
 def test_refresh_boards_api_implicitly_scopes_a_project_less_filter_to_its_own_project(tmp_path: Path) -> None:

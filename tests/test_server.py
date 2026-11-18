@@ -2362,6 +2362,9 @@ class BoardPositionJiraClient(PushJiraClient):
     def update_rank(self, issues_to_rank: list, rank_before: str, customfield_number: str) -> None:
         self.rank_calls.append((tuple(issues_to_rank), rank_before, customfield_number))
 
+    def put(self, path: str, data: dict | None = None) -> None:
+        self.rank_calls.append(("put", path, data))
+
     def get_all_fields(self) -> list[dict[str, str]]:
         return [{"id": "customfield_10019", "name": "Rank"}] if self.rank_field else []
 
@@ -2400,6 +2403,51 @@ def test_post_item_board_position_moves_to_the_selected_boards_backlog_only(
 
     assert response.json() == {"ok": True}
     assert fake.move_calls == [("board", "rest/agile/1.0/backlog/32/issue", {"issues": ["SAT-1"]})]
+
+
+def test_post_item_board_position_ranks_after_when_dropped_below_a_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Dropping below the last row of a section has no row to rank before. The drop must still reach
+    # Jira as a rank-after; reordering only the local cache snapped back on the next board refresh.
+    client = _synced_client(tmp_path, _pushable_config())
+    _write_position_board_cache(tmp_path, board_keys=["SAT-2", "SAT-1", "SAT-3"])
+    fake = BoardPositionJiraClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    response = client.post(
+        "/items/SAT-1/board-position",
+        data={"project": "SAT", "board": "SAT board", "target_scope": "active", "after_key": "SAT-3"},
+    )
+
+    assert response.json() == {"ok": True}
+    assert fake.move_calls == []
+    assert fake.rank_calls == [
+        (
+            "put",
+            "rest/agile/1.0/issue/rank",
+            {"issues": ["SAT-1"], "rankAfterIssue": "SAT-3", "rankCustomFieldId": "customfield_10019"},
+        )
+    ]
+    board = read_json(tmp_path / "meta/SAT/boards.json")["boards"][0]
+    assert board["boardKeys"] == ["SAT-2", "SAT-3", "SAT-1"]
+
+
+def test_post_item_board_position_after_key_inserts_after_that_row_locally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _synced_client(tmp_path, _pushable_config())
+    _write_position_board_cache(tmp_path, board_keys=["SAT-1", "SAT-2", "SAT-3"])
+    fake = BoardPositionJiraClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    client.post(
+        "/items/SAT-1/board-position",
+        data={"project": "SAT", "board": "SAT board", "target_scope": "active", "after_key": "SAT-2"},
+    )
+
+    board = read_json(tmp_path / "meta/SAT/boards.json")["boards"][0]
+    assert board["boardKeys"] == ["SAT-2", "SAT-1", "SAT-3"]
 
 
 def test_post_item_board_position_moves_scope_and_ranks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4363,6 +4411,8 @@ def test_items_page_sections_mode_rows_are_draggable(tmp_path: Path) -> None:
     assert 'data-key="SAT-2"' in response.text
     assert "function jiraWbDrop" in response.text
     assert "function jiraWbToggleSection" in response.text
+    # A drop below a section's last row is sent as a rank-after (after_key), not an empty target.
+    assert "after_key: afterKey" in response.text
 
 
 def test_items_page_sections_mode_suppressed_by_explicit_scope(tmp_path: Path) -> None:
