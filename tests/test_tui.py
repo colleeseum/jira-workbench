@@ -151,6 +151,7 @@ async def test_enter_opens_detail_screen_with_fields(tmp_path: Path) -> None:
     async with app.run_test() as pilot:
         await pilot.press("enter")
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
         assert app.screen.key == "SAT-1"
         table = app.screen.query_one(DataTable)
         field_keys = [table.get_row_at(i) for i in range(table.row_count)]
@@ -280,6 +281,17 @@ async def _wait_for_workers(app: JiraWorkbenchApp, node: Any = None) -> None:
         await asyncio.wait_for(app.workers.wait_for_complete(workers), timeout=10)
 
 
+async def _wait_until(pilot: Any, predicate: Any, timeout: float = 10.0) -> None:
+    """Polls until `predicate()` holds, for work that ends by opening a
+    screen (whose worker then stays blocked on it, so it cannot be awaited)."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for the TUI to settle")
+        await asyncio.sleep(0.01)
+        await pilot.pause()
+
+
 def _app_with_client(jira_dir: Path, client: Any) -> JiraWorkbenchApp:
     app = JiraWorkbenchApp(
         jira_dir,
@@ -303,6 +315,7 @@ async def test_detail_screen_shows_development_panel_for_linked_pr_and_branch(tm
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
 
         dev_widget = app.screen.query_one("#detail-dev", Static)
         content = str(dev_widget.visual)
@@ -322,6 +335,7 @@ async def test_detail_screen_hides_development_panel_when_nothing_linked(tmp_pat
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
         dev_widget = app.screen.query_one("#detail-dev", Static)
         assert dev_widget.display is False
 
@@ -351,6 +365,7 @@ async def test_detail_screen_survives_dev_status_fetch_failure(tmp_path: Path) -
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
         dev_widget = app.screen.query_one("#detail-dev", Static)
         assert dev_widget.display is False
 
@@ -371,6 +386,7 @@ async def test_detail_screen_blocks_field_edits_but_allows_comments_for_a_read_o
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
         table = app.screen.query_one(DataTable)
         table.move_cursor(row=table.get_row_index("priority"))
         await pilot.press("enter")
@@ -412,6 +428,7 @@ async def test_detail_screen_remembers_custom_field_names_from_edit_meta(tmp_pat
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
 
     # Persisted locally so an offline CLI `shadow report` run afterward can
     # show the friendly name too, without ever making this API call itself.
@@ -438,6 +455,7 @@ async def test_detail_screen_remembers_field_names_from_the_whole_instance_not_j
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
 
     assert client.get_all_fields_calls == 1
     assert load_field_names(jira_dir)["customfield_20000"] == "Escalation Owner"
@@ -454,6 +472,7 @@ async def test_detail_screen_caches_dev_status_and_edit_fields_across_reopens(tm
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
         assert client.summary_calls == 1
         assert client.editmeta_calls == 1
         assert client.get_all_fields_calls == 1
@@ -465,6 +484,7 @@ async def test_detail_screen_caches_dev_status_and_edit_fields_across_reopens(tm
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
 
         # Reopening the same issue in the same session reuses the cached
         # dev-status/edit-meta/all-fields results instead of fetching them
@@ -576,6 +596,7 @@ async def test_detail_screen_shows_due_date_and_custom_labels_field_once_edit_me
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
 
         table = app.screen.query_one(DataTable)
         assert str(table.get_cell("duedate", "value")) == "(none)"
@@ -833,6 +854,8 @@ async def test_detail_screen_rejects_invalid_due_date_format(tmp_path: Path) -> 
         await pilot.pause()
 
         assert isinstance(app.screen, DetailScreen)
+
+        await _wait_for_workers(app)
         shadow = load_shadow(jira_dir, "SAT-1")
         assert shadow is None
 
@@ -867,6 +890,8 @@ async def test_detail_screen_edits_custom_labels_type_field_via_picker(tmp_path:
         await pilot.pause()
 
         assert isinstance(app.screen, DetailScreen)
+
+        await _wait_for_workers(app)
         shadow = load_shadow(jira_dir, "SAT-1")
         assert shadow is not None
         assert sorted(shadow["fields"]["customfield_10082"]) == ["acme", "globex"]
@@ -906,6 +931,8 @@ async def test_labels_picker_saves_a_typed_new_label_even_without_pressing_enter
         await pilot.pause()
 
         assert isinstance(app.screen, DetailScreen)
+
+        await _wait_for_workers(app)
         shadow = load_shadow(jira_dir, "SAT-1")
         assert shadow is not None
         assert sorted(shadow["fields"]["customfield_10082"]) == ["acme", "urgent"]
@@ -922,6 +949,7 @@ async def test_detail_screen_degrades_gracefully_when_edit_meta_fetch_fails(tmp_
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
 
         table = app.screen.query_one(DataTable)
         # Neither dynamic field shows up when the live fetch fails...
@@ -1138,8 +1166,10 @@ async def test_detail_screen_refresh_from_jira_pulls_fresh_data_and_keeps_shadow
     async with app.run_test() as pilot:
         await pilot.press("enter")
         assert isinstance(app.screen, DetailScreen)
+        await _wait_for_workers(app)
         await pilot.press("R")
         await pilot.pause()
+        await _wait_for_workers(app)
 
         table = app.screen.query_one(DataTable)
         assert str(table.get_cell("summary", "value")) == "Renamed upstream in Jira"
@@ -1841,6 +1871,7 @@ async def test_new_issue_screen_caches_createmeta_and_current_user_across_reopen
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         assert isinstance(app.screen, IssueCreateScreen)
         assert client.createmeta_calls == 1
         assert client.myself_calls == 1
@@ -1851,6 +1882,7 @@ async def test_new_issue_screen_caches_createmeta_and_current_user_across_reopen
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         assert isinstance(app.screen, IssueCreateScreen)
 
         # Same project, same session -- reuses the cached createmeta/current
@@ -1896,6 +1928,7 @@ async def test_new_issue_screen_type_summary_description_have_no_default(tmp_pat
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -1923,6 +1956,7 @@ async def test_new_issue_screen_prefills_other_fields_from_epic_under_cursor(tmp
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -1959,6 +1993,7 @@ async def test_new_issue_screen_status_row_is_fixed_and_not_editable(tmp_path: P
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -1992,6 +2027,7 @@ async def test_new_issue_labels_picker_preselects_current_labels(tmp_path: Path)
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
         create_screen.selected_type = "Task"
@@ -2030,6 +2066,7 @@ async def test_new_issue_labels_picker_toggle_updates_value(tmp_path: Path) -> N
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
         create_screen.selected_type = "Task"
@@ -2074,6 +2111,7 @@ async def test_new_issue_labels_picker_adds_a_new_label_explicitly(tmp_path: Pat
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
         create_screen.selected_type = "Task"
@@ -2124,6 +2162,7 @@ async def test_new_issue_labels_picker_cancel_keeps_previous_value(tmp_path: Pat
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
         create_screen.selected_type = "Task"
@@ -2163,6 +2202,7 @@ async def test_new_issue_screen_full_flow_creates_and_refreshes_locally(tmp_path
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -2235,6 +2275,7 @@ async def test_index_clone_action_prefills_form_and_creates_under_source_project
 
         await pilot.press("C")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -2304,6 +2345,7 @@ async def test_detail_clone_action_opens_prefilled_form_and_new_detail_for_creat
 
         await pilot.press("C")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -2375,6 +2417,7 @@ async def test_new_issue_screen_version_picker_is_scoped_to_project_and_componen
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -2461,6 +2504,7 @@ async def test_new_issue_screen_component_picker_uses_configured_custom_field_no
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -2529,6 +2573,7 @@ async def test_new_issue_screen_version_picker_toggle_reveals_released_but_not_a
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -2568,6 +2613,7 @@ async def test_new_issue_screen_choosing_type_shows_its_fields_then_changing_it_
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -2616,6 +2662,7 @@ async def test_new_issue_requires_type_before_create(tmp_path: Path) -> None:
         table.move_cursor(row=table.get_row_index("SAT-5"))
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
         create_screen.values["summary"] = "Something"
@@ -2648,6 +2695,7 @@ async def test_new_issue_requires_summary_before_create(tmp_path: Path) -> None:
         table.move_cursor(row=table.get_row_index("SAT-5"))
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
         create_screen.selected_type = "Task"
@@ -2680,6 +2728,7 @@ async def test_new_issue_requires_description_before_create(tmp_path: Path) -> N
         table.move_cursor(row=table.get_row_index("SAT-5"))
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
         create_screen.selected_type = "Task"
@@ -2741,6 +2790,7 @@ async def test_new_issue_on_virtual_none_epic_lane_has_no_prefill(tmp_path: Path
 
         await pilot.press("c")
         await pilot.pause()
+        await _wait_until(pilot, lambda: isinstance(app.screen, IssueCreateScreen))
 
         create_screen = app.screen
         assert isinstance(create_screen, IssueCreateScreen)
@@ -4690,6 +4740,9 @@ async def test_labels_screen_delete_skips_issues_in_a_read_only_project(tmp_path
         await pilot.pause()
         await pilot.press("y")  # confirm
         await pilot.pause()
+        await _wait_until(
+            pilot, lambda: isinstance(app.screen, PushAllProgressScreen) and app.screen._done
+        )
 
         await pilot.press("enter")  # close push progress screen
         await pilot.pause()
@@ -4732,6 +4785,9 @@ async def test_labels_screen_rename_renames_on_all_issues_and_pushes(tmp_path: P
         await pilot.pause()
         await pilot.press("y")  # confirm
         await pilot.pause()
+        await _wait_until(
+            pilot, lambda: isinstance(app.screen, PushAllProgressScreen) and app.screen._done
+        )
         await pilot.press("enter")  # close push progress
         await pilot.pause()
 
