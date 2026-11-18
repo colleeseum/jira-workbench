@@ -464,6 +464,20 @@ def user_payload(jira_dir: Path, value: Any) -> Any:
     text = str(value).strip()
     if not text or text == "(unassigned)":
         return None
+    # The refreshed project-member caches first (meta/<PROJECT>/assignees.json,
+    # what the assignee dropdown offers): someone newly added to a project
+    # isn't assignee/reporter on any synced issue yet, so the issue scan
+    # below can't resolve them -- and an unresolved display name sent as an
+    # accountId is rejected by Jira ("Specify a valid value for assignee").
+    for path in sorted((jira_dir / "meta").glob("*/assignees.json")):
+        cache = read_json(path)
+        users = cache.get("assignees") if isinstance(cache, dict) else None
+        for user in users if isinstance(users, list) else []:
+            if not isinstance(user, dict):
+                continue
+            account_id = str(user.get("accountId") or "")
+            if account_id and text in {account_id, str(user.get("displayName") or "")}:
+                return {"accountId": account_id}
     for path in (jira_dir / "components").glob("*/*/issue.json"):
         issue = read_json(path)
         fields = issue.get("fields") if isinstance(issue, dict) else {}
