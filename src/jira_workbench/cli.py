@@ -1254,7 +1254,7 @@ def run_shadow(args: argparse.Namespace, jira_dir: Path, config: object) -> int:
             jira_client=jira_client,
             dry_run=args.dry_run,
             progress=lambda message: print(message, file=sys.stderr),
-            component_field=str(config.effective_component_field(config.default_project_key()) or "components"),
+            component_field_for=config.component_field_for_issue,
         )
         print(
             f"push summary: pushed={result.pushed} skipped={result.skipped} "

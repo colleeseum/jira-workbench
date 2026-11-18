@@ -849,7 +849,11 @@ def push_shadows(
     dry_run: bool = False,
     progress: Progress | None = print,
     component_field: str = "components",
+    component_field_for: Callable[[str], str] | None = None,
 ) -> PushResult:
+    """Pushes the staged shadows for `keys` (all shadows when empty). `component_field_for`
+    resolves each issue's own project's component field, for pushes spanning several projects;
+    without it every issue uses `component_field`."""
     selected, dependencies = order_push_keys(jira_dir, keys or all_shadow_keys(jira_dir))
     selected_set = set(selected)
     pushed = skipped = blocked = failed = 0
@@ -883,7 +887,7 @@ def push_shadows(
                 jira_client,
                 dry_run=dry_run,
                 progress=progress,
-                component_field=component_field,
+                component_field=component_field_for(key) if component_field_for else component_field,
             )
         except ShadowError as exc:
             failed += 1

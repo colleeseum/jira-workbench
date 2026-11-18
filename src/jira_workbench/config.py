@@ -136,6 +136,12 @@ class WorkbenchConfig:
             return None
         return self.component_field
 
+    def component_field_for_issue(self, issue_key: str) -> str:
+        """The component field of the project an issue key belongs to (a Jira issue key is always
+        `<PROJECT>-<number>`), defaulting to Jira's native `components` field."""
+        project_key = issue_key.rsplit("-", 1)[0] if "-" in issue_key else None
+        return self.effective_component_field(project_key) or "components"
+
     def effective_history_months(self, project_key: str | None) -> int | None:
         """How many months of statusCategory=Done history to sync for this
         project -- None means unbounded (sync everything, today's default).

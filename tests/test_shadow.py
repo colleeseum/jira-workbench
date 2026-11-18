@@ -235,6 +235,32 @@ def test_push_applies_comment_edits_and_deletes(tmp_path: Path) -> None:
     assert load_shadow(jira_dir, "SAT-1") is None
 
 
+def test_push_shadows_resolves_the_component_field_per_issue(tmp_path: Path) -> None:
+    # SAT keeps its component in customfield_10071, PLAT in the native components field. One
+    # push covering both must refresh each issue with its own project's field.
+    for key in ("SAT-1", "PLAT-1"):
+        write_json(
+            tmp_path / f"components/old/{key}/issue.json",
+            {"key": key, "fields": {"updated": "2026-07-20T00:00:00.000+0000", "summary": "Old"}},
+        )
+        set_field(tmp_path, key, "summary", "New")
+        commit_shadow(tmp_path, key)
+    client = PushJiraClient("2026-07-20T00:00:00.000+0000")
+    fields = {"SAT": "customfield_10071", "PLAT": "components"}
+
+    result = push_shadows(
+        tmp_path,
+        ["SAT-1", "PLAT-1"],
+        client,
+        progress=None,
+        component_field_for=lambda key: fields[key.split("-")[0]],
+    )
+
+    assert result.pushed == 2
+    assert (tmp_path / "components/helm-chart/SAT-1/issue.json").exists()
+    assert (tmp_path / "components/api-team/PLAT-1/issue.json").exists()
+
+
 class ChangelogJiraClient(PushJiraClient):
     """Like Jira, returns the changelog only when it is requested with expand=changelog."""
 

@@ -1291,6 +1291,45 @@ def test_issue_create_creates_and_refreshes_local_issue(tmp_path: Path, capsys, 
     assert (jira_dir / "components/resource-as-code/SAT-900/issue.json").exists()
 
 
+def test_shadow_push_resolves_the_component_field_per_issue_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default project's field must not be applied to every pushed issue.
+    captured: dict[str, object] = {}
+
+    def fake_push_shadows(jira_dir: Path, keys: list[str], **kwargs: object) -> object:
+        captured.update(kwargs)
+        return type("Result", (), {"pushed": 0, "skipped": 0, "blocked": 0, "failed": 0, "errors": []})()
+
+    monkeypatch.setattr(jira_workbench.cli, "push_shadows", fake_push_shadows)
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{tmp_path / "jira"}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+        + "\n"
+    )
+
+    assert main(["--config", str(config_path), "shadow", "push"]) == 0
+
+    resolve = captured["component_field_for"]
+    assert callable(resolve)
+    assert resolve("SAT-1") == "customfield_10071"
+    assert resolve("PLAT-7") == "components"
+
+
 def test_versions_filter_is_read_from_config(tmp_path: Path) -> None:
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text("[versions]\nfilter = \"helm-chart-sa 3\\\\.[45]\"\n")
