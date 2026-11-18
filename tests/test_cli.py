@@ -947,6 +947,35 @@ def test_view_all_flag_overrides_configured_active_default(tmp_path: Path, monke
     assert calls[0][1]["active"] is False
 
 
+def test_view_passes_each_projects_own_component_field_to_the_tui(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    jira_dir = tmp_path / "jira"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+        + "\n"
+    )
+    calls = []
+    monkeypatch.setattr(
+        jira_workbench.cli, "open_interactive_view", lambda *args, **kwargs: calls.append(kwargs)
+    )
+
+    code = main(["--config", str(config_path), "view"])
+
+    assert code == 0
+    assert calls[0]["component_field"] == "customfield_10071"
+    assert calls[0]["component_fields"] == {"SAT": "customfield_10071", "PLAT": None}
+
+
 def test_view_flags_override_config_defaults(tmp_path: Path, monkeypatch) -> None:
     config_path = tmp_path / "jira-wb.conf"
     jira_dir = tmp_path / "jira"

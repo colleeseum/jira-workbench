@@ -74,6 +74,18 @@ from .sync import SyncConfig, SyncError, sync_project
 from .view import SWIMLANE_MODES, ViewError, detailed_shadow_report_lines, format_components, format_work_item
 
 
+def tui_component_fields(
+    config: WorkbenchConfig, default_project: str | None, override: object | None = None
+) -> dict[str, str | None]:
+    """Each configured project's own component field, for the TUI to resolve
+    per issue rather than applying the default project's field everywhere.
+    An explicit --component-field applies to the default project only."""
+    fields = {project.key: config.effective_component_field(project.key) for project in config.resolved_projects()}
+    if override and default_project:
+        fields[default_project] = str(override)
+    return fields
+
+
 def open_interactive_view(
     jira_dir: Path,
     *,
@@ -101,6 +113,7 @@ def open_interactive_view(
     config_path: Path | None = None,
     nerd_font: bool = False,
     dev_status_field: str | None = None,
+    component_fields: dict[str, str | None] | None = None,
 ) -> None:
     from .tui.app import run_view as run_textual_view
 
@@ -130,6 +143,7 @@ def open_interactive_view(
         config_path=config_path,
         nerd_font=nerd_font,
         dev_status_field=dev_status_field,
+        component_fields=component_fields,
     )
 
 
@@ -612,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
         # though sync already resolved a real default project just fine.
         default_project = config.default_project_key()
         component_field = choose(args.component_field, config.effective_component_field(default_project)) or "components"
+        component_fields = tui_component_fields(config, default_project, args.component_field)
         view_project = config.view_project
         view_status = config.view_status
         view_component = choose(args.component, config.view_component)
@@ -669,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
                         config_path=config_path,
                         nerd_font=view_nerd_font,
                         dev_status_field=str(config.view_dev_status_field) if config.view_dev_status_field else None,
+                        component_fields=component_fields,
                     )
             else:
                 if args.diff or args.original:
@@ -698,6 +714,7 @@ def main(argv: list[str] | None = None) -> int:
                     config_path=config_path,
                     nerd_font=view_nerd_font,
                     dev_status_field=str(config.view_dev_status_field) if config.view_dev_status_field else None,
+                    component_fields=component_fields,
                 )
         except ViewError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -766,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
         component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
+        component_fields = tui_component_fields(config, project, args.component_field)
         versions_filter = config.versions_filter
         try:
             try:
@@ -779,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
                     versions_filter,
                     component_field,
                     config_path,
+                    component_fields=component_fields,
                 )
             except KeyboardInterrupt:
                 print()
@@ -885,6 +904,8 @@ def run_meta(
     versions_filter: object | None = None,
     component_field: object | None = None,
     config_path: Path | None = None,
+    *,
+    component_fields: dict[str, str | None] | None = None,
 ) -> int:
     if args.meta_command is None:
         from .tui.app import run_meta_app
@@ -898,6 +919,7 @@ def run_meta(
             versions_filter=str(versions_filter) if versions_filter else None,
             component_field=str(component_field) if component_field else None,
             config_path=config_path,
+            component_fields=component_fields,
         )
 
     if project is not None:

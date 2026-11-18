@@ -268,6 +268,18 @@ def _set_issue_fields(jira_dir: Path, key: str, fields: dict[str, Any]) -> None:
     build_manifest(jira_dir, "customfield_10071")
 
 
+async def _wait_for_workers(app: JiraWorkbenchApp, node: Any = None) -> None:
+    """Waits for the workers a screen started (e.g. an action's background
+    refresh or push thread) instead of a single pilot.pause(), which only
+    yields to the event loop once and loses the race on a slow runner. Only
+    `node`'s workers are awaited: an outer worker blocked on push_screen_wait
+    would otherwise never finish."""
+    owner = app.screen if node is None else node
+    workers = [worker for worker in app.workers if worker.node is owner]
+    if workers:  # an empty list would make wait_for_complete wait for every worker
+        await asyncio.wait_for(app.workers.wait_for_complete(workers), timeout=10)
+
+
 def _app_with_client(jira_dir: Path, client: Any) -> JiraWorkbenchApp:
     app = JiraWorkbenchApp(
         jira_dir,
@@ -4954,3 +4966,185 @@ async def test_versions_screen_delete_combines_confirm_and_move_target(
         assert isinstance(app.screen, VersionsScreen)
         assert all(version["id"] != "10000" for version in client.versions)
 
+
+
+# --- Per-project component fields (review finding on #53) ---------------
+# SAT keeps its component in customfield_10071, PLAT in Jira's own
+# `components`. The TUI must resolve the field from each issue's project:
+# applying the default project's field everywhere displays, stages, and
+# pushes the wrong field for the other project.
+
+TWO_PROJECT_COMPONENT_FIELDS = {"SAT": "customfield_10071", "PLAT": "components"}
+
+
+def _add_plat_issue(jira_dir: Path) -> None:
+    issue_dir = jira_dir / "components/storage/PLAT-1"
+    issue_dir.mkdir(parents=True)
+    write_json(
+        issue_dir / "issue.json",
+        {
+            "key": "PLAT-1",
+            "id": "9001",
+            "fields": {
+                "project": {"key": "PLAT"},
+                "summary": "Platform item",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "components": [{"name": "storage"}],
+                "updated": "2026-07-20T00:00:00.000+0000",
+            },
+        },
+    )
+    build_manifest(jira_dir, "customfield_10071")
+
+
+def _two_project_app(jira_dir: Path, client: Any = None) -> JiraWorkbenchApp:
+    app = JiraWorkbenchApp(
+        jira_dir,
+        component_field="customfield_10071",
+        component_fields=TWO_PROJECT_COMPONENT_FIELDS,
+        jira_url="https://example.atlassian.net",
+        jira_email="user@example.com",
+        jira_api_token="token",
+    )
+    if client is not None:
+        app.get_api_client = lambda: client  # type: ignore[method-assign]
+    return app
+
+
+@pytest.mark.asyncio
+async def test_detail_screen_edits_a_non_default_projects_component_with_its_own_field(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    _add_plat_issue(jira_dir)
+    app = _two_project_app(jira_dir)
+
+    async with app.run_test() as pilot:
+        app.push_screen(DetailScreen(key="PLAT-1", items=[]))
+        await pilot.pause()
+        table = app.screen.query_one(DataTable)
+        row_keys = [row.key.value for row in table.ordered_rows]
+        assert "components" in row_keys
+        assert "customfield_10071" not in row_keys
+
+        table.move_cursor(row=table.get_row_index("components"))
+        await pilot.press("enter")
+        await pilot.pause()
+        detail = app.screen.app.screen_stack[-2]
+        app.screen.dismiss("storage, backup")
+        await pilot.pause()
+        await _wait_for_workers(app, detail)
+        await pilot.pause()
+
+    shadow = load_shadow(jira_dir, "PLAT-1")
+    assert shadow is not None
+    assert shadow["fields"]["components"] == [{"name": "storage"}, {"name": "backup"}]
+    assert "customfield_10071" not in shadow["fields"]
+
+
+@pytest.mark.asyncio
+async def test_push_all_pushes_each_project_with_its_own_component_field(tmp_path: Path, monkeypatch) -> None:
+    from jira_workbench.shadow import PushResult
+    from jira_workbench.tui.screens import push_all
+
+    jira_dir = synced_jira_dir(tmp_path)
+    _add_plat_issue(jira_dir)
+    set_field(jira_dir, "SAT-1", "summary", "SAT edit")
+    set_field(jira_dir, "PLAT-1", "summary", "PLAT edit")
+    calls: list[dict[str, str]] = []
+
+    def fake_push_shadows(jira_dir: Path, keys: list[str], client: Any, **kwargs: Any) -> PushResult:
+        resolve = kwargs["component_field_for"]
+        calls.append({key: resolve(key) for key in keys})
+        return PushResult(pushed=len(keys), skipped=0, blocked=0)
+
+    monkeypatch.setattr(push_all, "push_shadows", fake_push_shadows)
+    app = _two_project_app(jira_dir, SimplePushClient(updated="2026-07-20T00:00:01.000+0000"))
+
+    async with app.run_test() as pilot:
+        await pilot.press("P")
+        await pilot.pause()
+        assert isinstance(app.screen, PushReviewScreen)
+        await pilot.press("p")
+        await pilot.pause()
+        assert isinstance(app.screen, PushAllProgressScreen)
+        await _wait_for_workers(app)
+        await pilot.pause()
+        assert app.screen._result is not None
+        assert app.screen._result.pushed == 2
+
+    # One call, so cross-project push dependencies keep their ordering.
+    assert calls == [{"PLAT-1": "components", "SAT-1": "customfield_10071"}]
+
+
+class PlatRefreshClient:
+    def get_issue(self, issue_id_or_key: str, fields: Any = None, **kwargs: Any) -> Any:
+        return {
+            "key": issue_id_or_key,
+            "id": "9001",
+            "fields": {
+                "project": {"key": "PLAT"},
+                "summary": "Renamed upstream",
+                "issuetype": {"name": "Task"},
+                "status": {"name": "Open"},
+                "components": [{"name": "storage"}],
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_detail_refresh_keeps_a_non_default_project_issue_in_its_component_folder(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    _add_plat_issue(jira_dir)
+    set_field(jira_dir, "PLAT-1", "description", "Local edit")
+    app = _two_project_app(jira_dir, PlatRefreshClient())
+
+    async with app.run_test() as pilot:
+        app.push_screen(DetailScreen(key="PLAT-1", items=[]))
+        await pilot.pause()
+        await pilot.press("R")
+        await _wait_for_workers(app)
+        await pilot.pause()
+
+    assert sorted(path.parent.parent.name for path in jira_dir.glob("components/*/PLAT-1/issue.json")) == ["storage"]
+    shadow = load_shadow(jira_dir, "PLAT-1")
+    assert shadow is not None
+    assert shadow["fields"]["description"] == "Local edit"
+
+
+@pytest.mark.asyncio
+async def test_clone_from_index_opens_create_screen_with_the_source_projects_component_field(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from textual.screen import Screen
+
+    from jira_workbench.tui.screens import issue_create
+
+    jira_dir = synced_jira_dir(tmp_path)
+    _add_plat_issue(jira_dir)
+    opened: list[dict[str, Any]] = []
+
+    class RecordingCreateScreen(Screen[str | None]):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__()
+            opened.append(kwargs)
+
+        def on_mount(self) -> None:
+            self.dismiss(None)
+
+    async def fake_context(app: Any, project: str) -> Any:
+        return object(), {}, None, None
+
+    monkeypatch.setattr(issue_create, "IssueCreateScreen", RecordingCreateScreen)
+    monkeypatch.setattr(issue_create, "resolve_create_context", fake_context)
+    app = _two_project_app(jira_dir)
+
+    async with app.run_test() as pilot:
+        index = app.screen
+        assert isinstance(index, IndexScreen)
+        index._select_key("PLAT-1")
+        index.action_clone_issue()
+        await pilot.pause()
+        await _wait_for_workers(app, index)
+        await pilot.pause()
+
+    assert [(entry["project"], entry["component_field"]) for entry in opened] == [("PLAT", "components")]

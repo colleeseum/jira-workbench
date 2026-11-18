@@ -558,7 +558,12 @@ class IndexScreen(Screen[None]):
         from .push_review import PushReviewScreen
 
         confirmed = await self.app.push_screen_wait(
-            PushReviewScreen(self.app.jira_dir, keys, component_field=self.app.component_field)
+            PushReviewScreen(
+                self.app.jira_dir,
+                keys,
+                component_field=self.app.component_field,
+                component_field_for=self.app.component_field_for,
+            )
         )
         if not confirmed:
             return
@@ -571,7 +576,13 @@ class IndexScreen(Screen[None]):
         from .push_all import PushAllProgressScreen
 
         result = await self.app.push_screen_wait(
-            PushAllProgressScreen(self.app.jira_dir, keys, client, self.app.component_field or "components")
+            PushAllProgressScreen(
+                self.app.jira_dir,
+                keys,
+                client,
+                self.app.component_field or "components",
+                component_field_for=self.app.component_field_for,
+            )
         )
         for key in keys:
             self.app.mark_changed(key)
@@ -638,7 +649,7 @@ class IndexScreen(Screen[None]):
             IssueCreateScreen(
                 jira_dir=self.app.jira_dir,
                 project=str(project),
-                component_field=self.app.component_field or "components",
+                component_field=self.app.component_field_for(str(project)) or "components",
                 type_fields=type_fields,
                 client=client,
                 epic_item=epic_item,
@@ -690,12 +701,12 @@ class IndexScreen(Screen[None]):
             return
         client, type_fields, default_reporter, default_reporter_account_id = context
 
-        prefill = clone_prefill(self.app.jira_dir, effective, self.app.component_field)
+        prefill = clone_prefill(self.app.jira_dir, effective, self.app.component_field_for(key))
         new_key = await self.app.push_screen_wait(
             IssueCreateScreen(
                 jira_dir=self.app.jira_dir,
                 project=str(project),
-                component_field=self.app.component_field or "components",
+                component_field=self.app.component_field_for(str(project)) or "components",
                 type_fields=type_fields,
                 client=client,
                 epic_item=None,

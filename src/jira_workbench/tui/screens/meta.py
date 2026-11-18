@@ -379,9 +379,9 @@ class VersionsScreen(Screen[None]):
             # just means these local copies stay stale until the next full
             # sync, not that the rename itself failed.
             return
-        component_field = self.app.component_field or "components"
         refreshed = 0
         for key in keys:
+            component_field = self.app.component_field_for(key) or "components"
             try:
                 await asyncio.to_thread(refresh_local_issue_after_push, self.app.jira_dir, key, client, component_field)
             except ShadowError:
@@ -1150,7 +1150,13 @@ class LabelsScreen(Screen[None]):
         from .push_all import PushAllProgressScreen
 
         result = await self.app.push_screen_wait(
-            PushAllProgressScreen(self.app.jira_dir, keys, client, self.app.component_field or "components")
+            PushAllProgressScreen(
+                self.app.jira_dir,
+                keys,
+                client,
+                self.app.component_field or "components",
+                component_field_for=self.app.component_field_for,
+            )
         )
         if result is not None:
             self.notify(
