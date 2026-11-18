@@ -239,6 +239,11 @@ def evaluate_predicate(
             for clause in predicate["clauses"]
         )
     if op == "not":
+        # The parser emits "not" only for != and NOT IN, which in Jira never match an empty field.
+        # Applied here rather than in the parser so predicates already cached in boards.json get it.
+        field = _negated_field(predicate["clause"])
+        if field is not None and not _field_has_value(field, component=component, labels=labels, project=project):
+            return False
         return not evaluate_predicate(predicate["clause"], component=component, labels=labels, project=project)
     if op == "eq":
         field = predicate["field"]
@@ -251,3 +256,24 @@ def evaluate_predicate(
             return bool(project) and project.lower() == value
         raise ValueError(f"unknown predicate field: {field!r}")
     raise ValueError(f"unknown predicate node: {predicate!r}")
+
+
+def _negated_field(clause: dict[str, Any]) -> str | None:
+    """The single field a negated `eq` leaf, or OR of `eq` leaves (NOT IN), compares."""
+    if clause.get("op") == "eq":
+        return clause.get("field")
+    if clause.get("op") == "or":
+        fields = {_negated_field(child) for child in clause.get("clauses", [])}
+        if len(fields) == 1:
+            return fields.pop()
+    return None
+
+
+def _field_has_value(field: str, *, component: str | None, labels: list[str], project: str | None) -> bool:
+    if field == "component":
+        return bool(component)
+    if field == "labels":
+        return bool(labels)
+    if field == "project":
+        return bool(project)
+    raise ValueError(f"unknown predicate field: {field!r}")
