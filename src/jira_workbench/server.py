@@ -5147,7 +5147,8 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
     @app.get("/api/items/{key}")
     def get_item(key: str) -> dict[str, Any]:
         try:
-            detail = item_detail_data(jira_dir, key)
+            # Freshdesk tickets are listed by /api/items too; fall back as the HTML detail page does.
+            detail = item_detail_data(jira_dir, key) or freshdesk_ticket_detail_data(jira_dir, key)
         except MetadataError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         if detail is None:

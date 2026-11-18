@@ -5930,6 +5930,23 @@ def test_item_detail_page_freshdesk_prefers_and_escapes_the_plain_text_field(tmp
     assert "onerror" not in response.text
 
 
+def test_api_item_returns_a_freshdesk_ticket_listed_by_api_items(tmp_path: Path) -> None:
+    # /api/items lists FD-<id> entries, so /api/items/FD-<id> must resolve them as the HTML page does.
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1, subject="Login broken")})
+
+    response = client.get("/api/items/FD-1")
+
+    assert response.status_code == 200
+    assert response.json()["ticket"]["subject"] == "Login broken"
+    assert "conversations" in response.json()
+
+
+def test_api_item_404s_for_a_key_that_matches_neither_source(tmp_path: Path) -> None:
+    client = _synced_client_with_freshdesk(tmp_path)
+
+    assert client.get("/api/items/FD-999").status_code == 404
+
+
 def test_item_detail_page_404s_for_a_key_that_matches_neither_source(tmp_path: Path) -> None:
     client = _synced_client_with_freshdesk(tmp_path)
 
