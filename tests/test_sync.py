@@ -837,3 +837,164 @@ def test_sync_project_survives_metadata_refresh_failures(tmp_path: Path, monkeyp
     assert (result.assignee_count, result.component_count, result.board_count) == (None, None, None)
     assert any("assignee refresh skipped: nope" in line for line in progress)
     assert any("board refresh skipped: nope" in line for line in progress)
+
+
+# --- serve --watch quick sync ------------------------------------------------
+
+
+class FakeQuickClient(FakeJiraClient):
+    """A Jira whose "changed since" query returns `changed` (key -> updated)."""
+
+    def __init__(self, changed: dict[str, str]) -> None:
+        super().__init__()
+        self.changed = changed
+
+    def enhanced_jql_get_list_of_tickets(self, jql: str, fields: Any = "*all", limit: Any = None, expand: Any = None) -> Any:
+        self.calls.append(("enhanced_jql_get_list_of_tickets", jql, fields, limit))
+        return [{"key": key, "fields": {"updated": updated}} for key, updated in self.changed.items()]
+
+    def get_issue(self, issue_id_or_key: str, fields: Any = None, properties: Any = None, update_history: bool = True, expand: Any = None) -> Any:
+        issue = super().get_issue(issue_id_or_key, fields=fields, expand=expand)
+        if issue_id_or_key in self.changed:
+            issue["fields"]["updated"] = self.changed[issue_id_or_key]
+            issue["fields"]["summary"] = f"Changed {issue_id_or_key}"
+        return issue
+
+
+def _initial_sync(tmp_path: Path) -> None:
+    sync_project(SyncConfig(project="SAT", component_field="customfield_10071", jira_dir=tmp_path), FakeJiraClient(), progress=None)
+
+
+def test_build_changed_since_jql_keeps_each_projects_history_cutoff() -> None:
+    from jira_workbench.sync import QuickSyncProject, build_changed_since_jql
+
+    jql = build_changed_since_jql([QuickSyncProject("SAT", history_months=6), QuickSyncProject("PLAT")], 7)
+
+    assert jql == (
+        "((project=SAT AND (statusCategory != Done OR statuscategorychangedate >= -180d)) OR (project=PLAT))"
+        " AND updated >= -7m ORDER BY key"
+    )
+
+
+def test_quick_sync_with_no_changes_costs_one_request_and_writes_nothing(tmp_path: Path, monkeypatch: Any) -> None:
+    from jira_workbench.sync import QuickSyncProject, quick_sync
+
+    _initial_sync(tmp_path)
+    manifest_before = (tmp_path / "manifest.json").read_text()
+    client = FakeQuickClient({})
+
+    result = quick_sync(tmp_path, [QuickSyncProject("SAT", "customfield_10071")], client, since_minutes=7)
+
+    assert result.changed_keys == ()
+    assert [call[0] for call in client.calls] == ["enhanced_jql_get_list_of_tickets"]
+    assert (tmp_path / "manifest.json").read_text() == manifest_before
+
+
+def test_quick_sync_fetches_only_changed_issues_and_patches_index(tmp_path: Path, monkeypatch: Any) -> None:
+    import jira_workbench.metadata as metadata
+    from jira_workbench import db
+    from jira_workbench.sync import QuickSyncProject, quick_sync
+
+    _initial_sync(tmp_path)
+    board_refreshes: list[str] = []
+    monkeypatch.setattr(
+        metadata, "refresh_boards_api", lambda jira_dir, project, client, field: board_refreshes.append(project) or {"boards": []}
+    )
+    # SAT-1 is unchanged (same `updated` as on disk -- the overlapping
+    # window re-reports it); SAT-2 really changed.
+    client = FakeQuickClient({"SAT-1": "2026-07-20T00:00:01.000+0000", "SAT-2": "2026-11-17T10:00:00.000+0000"})
+
+    result = quick_sync(tmp_path, [QuickSyncProject("SAT", "customfield_10071")], client, since_minutes=7)
+
+    assert result.changed_keys == ("SAT-2",)
+    assert ("get_issue", "SAT-1", "*all") not in client.calls
+    assert read_json(tmp_path / "components/_unassigned/SAT-2/issue.json")["fields"]["summary"] == "Changed SAT-2"
+    manifest = read_json(tmp_path / "manifest.json")
+    assert [item["key"] for item in manifest["workItems"]] == ["SAT-1", "SAT-2"]
+    assert next(item for item in manifest["workItems"] if item["key"] == "SAT-2")["updated"] == "2026-11-17T10:00:00.000+0000"
+    conn = db.connect(tmp_path)
+    try:
+        title = conn.execute("SELECT title FROM items WHERE external_key = 'SAT-2'").fetchone()["title"]
+    finally:
+        conn.close()
+    assert title == "Changed SAT-2"
+    assert board_refreshes == ["SAT"]
+
+
+def test_quick_sync_preserves_shadow_edits(tmp_path: Path) -> None:
+    from jira_workbench.sync import QuickSyncProject, quick_sync
+
+    _initial_sync(tmp_path)
+    write_json(tmp_path / "components/_unassigned/SAT-2/shadow.json", {"fields": {"summary": "local edit"}})
+
+    quick_sync(
+        tmp_path,
+        [QuickSyncProject("SAT", "customfield_10071")],
+        FakeQuickClient({"SAT-2": "2026-11-17T10:00:00.000+0000"}),
+        since_minutes=7,
+    )
+
+    assert read_json(tmp_path / "components/_unassigned/SAT-2/shadow.json") == {"fields": {"summary": "local edit"}}
+
+
+def test_sync_lock_non_blocking_reports_busy(tmp_path: Path) -> None:
+    import pytest
+
+    from jira_workbench.sync import SyncLockBusy, sync_lock
+
+    with sync_lock(tmp_path):
+        with pytest.raises(SyncLockBusy):
+            with sync_lock(tmp_path, blocking=False):
+                pass
+    with sync_lock(tmp_path, blocking=False):
+        pass
+
+
+def test_quick_sync_ignores_issues_from_unconfigured_projects(tmp_path: Path) -> None:
+    from jira_workbench.sync import QuickSyncProject, quick_sync
+
+    _initial_sync(tmp_path)
+    client = FakeQuickClient({"OTHER-1": "2026-11-17T10:00:00.000+0000"})
+
+    result = quick_sync(tmp_path, [QuickSyncProject("SAT", "customfield_10071")], client, since_minutes=7)
+
+    assert result.changed_keys == ()
+    assert not any(call[0] == "get_issue" for call in client.calls)
+
+
+def test_quick_sync_moves_an_issue_whose_component_changed(tmp_path: Path, monkeypatch: Any) -> None:
+    import jira_workbench.metadata as metadata
+    from jira_workbench.sync import QuickSyncProject, quick_sync
+
+    _initial_sync(tmp_path)
+    monkeypatch.setattr(metadata, "refresh_boards_api", lambda *args: {"boards": []})
+
+    class MovingClient(FakeQuickClient):
+        def get_issue(self, issue_id_or_key: str, **kwargs: Any) -> Any:
+            issue = super().get_issue(issue_id_or_key, **kwargs)
+            issue["fields"]["customfield_10071"] = {"value": "Platform"}
+            return issue
+
+    quick_sync(
+        tmp_path,
+        [QuickSyncProject("SAT", "customfield_10071")],
+        MovingClient({"SAT-2": "2026-11-17T10:00:00.000+0000"}),
+        since_minutes=7,
+    )
+
+    assert (tmp_path / "components/platform/SAT-2/issue.json").exists()
+    assert not (tmp_path / "components/_unassigned/SAT-2").exists()
+    manifest = read_json(tmp_path / "manifest.json")
+    assert next(item for item in manifest["workItems"] if item["key"] == "SAT-2")["component"] == "platform"
+    assert {c["component"]: c["workItems"] for c in manifest["components"]}["platform"] == ["SAT-2"]
+
+
+def test_update_manifest_items_builds_a_full_manifest_when_none_exists(tmp_path: Path) -> None:
+    from jira_workbench.sync import update_manifest_items
+
+    _initial_sync(tmp_path)
+    (tmp_path / "manifest.json").unlink()
+
+    update_manifest_items(tmp_path, ["SAT-2"])
+
+    assert [item["key"] for item in read_json(tmp_path / "manifest.json")["workItems"]] == ["SAT-1", "SAT-2"]

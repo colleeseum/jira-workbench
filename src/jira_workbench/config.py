@@ -72,6 +72,10 @@ class WorkbenchConfig:
     issue_default_type: str | None = None
     host: str | None = None
     port: int | None = None
+    serve_watch: bool | None = None
+    serve_refresh_interval: int | None = None
+    serve_full_refresh_interval: int | None = None
+    serve_idle_pause: int | None = None
 
     def resolved_projects(self) -> tuple[ProjectSettings, ...]:
         """The multi-project `[[projects]]` list if configured, else a
@@ -231,6 +235,10 @@ def load_config(path: Path) -> WorkbenchConfig:
         issue_default_type=optional_string(issue, "default_type", expanded),
         host=optional_string(serve, "host", expanded),
         port=optional_int(serve, "port", expanded),
+        serve_watch=optional_bool(serve, "watch", expanded),
+        serve_refresh_interval=optional_positive_int(serve, "refresh_interval", expanded),
+        serve_full_refresh_interval=optional_positive_int(serve, "full_refresh_interval", expanded),
+        serve_idle_pause=optional_positive_int(serve, "idle_pause", expanded),
     )
     reject_freshdesk_key_collision(config, expanded)
     return config

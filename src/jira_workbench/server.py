@@ -8,6 +8,7 @@ import uuid
 from html.parser import HTMLParser
 from pathlib import Path
 from collections.abc import Callable
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -487,6 +488,60 @@ def _goto_section(form_wrapped: bool) -> str:
     """
 
 
+# True only while handling a request of an app created with background_sync
+# (serve --watch) -- page() renders the status chip and its script just then,
+# so pages served without --watch stay script-free where they were before.
+_sync_status_enabled: ContextVar[bool] = ContextVar("jira_wb_sync_status_enabled", default=False)
+
+SYNC_STATUS_SCRIPT = """
+<script>
+// serve --watch status chip (see watch.py). Polls /api/sync/status, which
+// deliberately doesn't count as UI activity, so an open-but-unused tab
+// still lets the background sync pause. Never reloads on its own -- that
+// could throw away an edit in progress -- just offers a reload link.
+(function () {
+  var el = document.getElementById('sync-status');
+  if (!el || !window.fetch) return;
+  var baseline = null;
+  function ago(seconds) {
+    if (seconds == null) return 'never';
+    if (seconds < 60) return 'just now';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+    return Math.floor(seconds / 3600) + 'h ago';
+  }
+  function render(s) {
+    if (baseline === null) baseline = s.changesTotal;
+    var fresh = s.changesTotal - baseline;
+    var text;
+    if (s.state === 'running') text = 'syncing\u2026';
+    else if (s.state === 'paused') text = 'sync paused (idle)';
+    else if (s.state === 'backoff') text = 'sync failed, retrying';
+    else text = 'synced ' + ago(s.lastSuccessAgeSeconds);
+    el.className = 'sync-status' + (s.state === 'backoff' ? ' sync-error' : '');
+    el.title = s.error || (s.lastKind ? 'last ' + s.lastKind + ' refresh ' + (s.lastSuccessAt || '') : '');
+    el.textContent = text;
+    if (fresh > 0) {
+      var link = document.createElement('a');
+      link.href = '#';
+      link.textContent = ' \u00b7 ' + fresh + ' updated, reload';
+      link.onclick = function (e) { e.preventDefault(); location.reload(); };
+      el.appendChild(link);
+    }
+    el.hidden = false;
+  }
+  function poll() {
+    fetch('/api/sync/status').then(function (r) { return r.json(); }).then(function (s) {
+      if (!s.enabled) return;
+      render(s);
+      setTimeout(poll, 30000);
+    }).catch(function () { setTimeout(poll, 60000); });
+  }
+  poll();
+})();
+</script>
+"""
+
+
 def page(
     body: str,
     *,
@@ -881,6 +936,9 @@ def page(
       vertical-align: -0.15em; animation: jira-wb-spin 0.7s linear infinite;
     }}
     @keyframes jira-wb-spin {{ to {{ transform: rotate(360deg); }} }}
+    .sync-status {{ font-size: 0.8em; opacity: 0.75; padding: 4px 10px; }}
+    .sync-status a {{ color: inherit; font-weight: 600; }}
+    .sync-status.sync-error {{ color: #b45309; opacity: 1; }}
   </style>
 </head>
 <body>
@@ -894,6 +952,7 @@ def page(
           {nav_link("/meta", "meta", "Meta")}
           {nav_link("/assistant", "assistant", "Assistant")}
         </nav>
+        {'<div id="sync-status" class="sync-status" hidden></div>' if _sync_status_enabled.get() else ""}
         {_goto_section(form_wrapped)}
         {sidebar_extra}
       </div>
@@ -902,6 +961,7 @@ def page(
 {body}
     </main>
   </{wrapper_tag}>
+  {SYNC_STATUS_SCRIPT if _sync_status_enabled.get() else ""}
 </body>
 </html>
 """
@@ -5065,8 +5125,32 @@ def render_assistant_page(
     return page(body, title="Assistant - Jira Workbench", active_nav="assistant", form_wrapped=False)
 
 
-def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None = None) -> FastAPI:
+def create_app(
+    jira_dir: Path,
+    config: WorkbenchConfig,
+    config_path: Path | None = None,
+    *,
+    background_sync: Any | None = None,
+) -> FastAPI:
     app = FastAPI(title="Jira Workbench API")
+
+    # serve --watch (watch.BackgroundSync): any real request counts as UI
+    # activity and wakes an idle-paused syncer; the status chip's own poll
+    # must not, or an open-but-unused tab would keep it syncing forever.
+    if background_sync is not None:
+
+        @app.middleware("http")
+        async def _record_ui_activity(request: Any, call_next: Any) -> Any:
+            if request.url.path != "/api/sync/status":
+                background_sync.touch()
+            _sync_status_enabled.set(True)
+            return await call_next(request)
+
+    @app.get("/api/sync/status")
+    def get_sync_status() -> dict[str, Any]:
+        if background_sync is None:
+            return {"enabled": False}
+        return background_sync.status()
 
     # Same lifetime/intent as the TUI's own app.issue_type_fields_cache
     # (tui/app.py): one issue_createmeta call per project for as long as
@@ -6627,8 +6711,22 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
 
 
 def serve(
-    jira_dir: Path, host: str, port: int, config: WorkbenchConfig | None = None, config_path: Path | None = None
+    jira_dir: Path,
+    host: str,
+    port: int,
+    config: WorkbenchConfig | None = None,
+    config_path: Path | None = None,
+    *,
+    background_sync: Any | None = None,
 ) -> None:
-    app = create_app(jira_dir, config if config is not None else WorkbenchConfig(), config_path)
+    app = create_app(
+        jira_dir, config if config is not None else WorkbenchConfig(), config_path, background_sync=background_sync
+    )
     print(f"Serving Jira Workbench at http://{host}:{port}")
-    uvicorn.run(app, host=host, port=int(port), log_level="warning")
+    if background_sync is not None:
+        background_sync.start()
+    try:
+        uvicorn.run(app, host=host, port=int(port), log_level="warning")
+    finally:
+        if background_sync is not None:
+            background_sync.stop()

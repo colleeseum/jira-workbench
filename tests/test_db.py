@@ -568,3 +568,25 @@ def test_reindex_freshdesk_items_does_not_touch_the_jira_source(tmp_path: Path) 
 
     assert {item["key"] for item in list_items(tmp_path)} == {"SAT-1"}
     assert {item["key"] for item in list_items(tmp_path, source_slug="freshdesk")} == {"FD-1"}
+
+
+def test_reindex_items_with_keys_only_touches_those_keys(tmp_path: Path) -> None:
+    import shutil
+
+    _write_issue(tmp_path, "SAT-1", "a")
+    _write_issue(tmp_path, "SAT-2", "a")
+    _write_issue(tmp_path, "SAT-3", "a")
+    reindex_items(tmp_path)
+
+    # SAT-1 edited, SAT-2 gone from disk, SAT-3 gone too but NOT in keys=.
+    _write_issue(tmp_path, "SAT-1", "a", summary="changed")
+    shutil.rmtree(tmp_path / "components/a/SAT-2")
+    shutil.rmtree(tmp_path / "components/a/SAT-3")
+    reindex_items(tmp_path, keys=["SAT-1", "SAT-2"])
+
+    conn = connect(tmp_path)
+    try:
+        rows = {row["external_key"]: row["title"] for row in conn.execute("SELECT external_key, title FROM items")}
+    finally:
+        conn.close()
+    assert rows == {"SAT-1": "changed", "SAT-3": "summary for SAT-3"}

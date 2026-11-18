@@ -319,12 +319,17 @@ def reindex_items(
     *,
     dev_status_field: str | None = None,
     source_slug: str = DEFAULT_SOURCE_SLUG,
+    keys: list[str] | None = None,
 ) -> int:
     """Upsert every item currently found on disk, then delete only the rows
     whose key no longer exists there -- never a blanket DELETE before the
     inserts, since that would churn the surrogate id (and any future FK'd
     shadow/link) of every unchanged item in the batch. Idempotent and safe
-    to re-run; unchanged items keep their `id`."""
+    to re-run; unchanged items keep their `id`.
+
+    keys= limits both halves to just those keys (serve --watch's quick
+    sync): only their issue.json files are read, and only those keys' rows
+    can be deleted -- every other row is left untouched."""
     conn = connect(jira_dir)
     try:
         sid = source_id(conn, source_slug)
@@ -335,7 +340,14 @@ def reindex_items(
         conn.execute("CREATE TEMP TABLE reindex_seen (external_key TEXT PRIMARY KEY)")
         try:
             if components_dir.exists():
-                for issue_path in sorted(components_dir.glob("*/*/issue.json"), key=issue_path_sort_key):
+                if keys is None:
+                    issue_paths = sorted(components_dir.glob("*/*/issue.json"), key=issue_path_sort_key)
+                else:
+                    issue_paths = sorted(
+                        (path for wanted in keys for path in components_dir.glob(f"*/{wanted}/issue.json")),
+                        key=issue_path_sort_key,
+                    )
+                for issue_path in issue_paths:
                     issue_dir = issue_path.parent
                     component = issue_dir.parent.name
                     key = issue_dir.name
@@ -406,14 +418,24 @@ def reindex_items(
                         ),
                     )
                     count += 1
-            conn.execute(
-                """
-                DELETE FROM items
-                WHERE source_id = ?
-                  AND NOT EXISTS (SELECT 1 FROM reindex_seen s WHERE s.external_key = items.external_key)
-                """,
-                (sid,),
-            )
+            if keys is None:
+                conn.execute(
+                    """
+                    DELETE FROM items
+                    WHERE source_id = ?
+                      AND NOT EXISTS (SELECT 1 FROM reindex_seen s WHERE s.external_key = items.external_key)
+                    """,
+                    (sid,),
+                )
+            else:
+                conn.executemany(
+                    """
+                    DELETE FROM items
+                    WHERE source_id = ? AND external_key = ?
+                      AND NOT EXISTS (SELECT 1 FROM reindex_seen s WHERE s.external_key = items.external_key)
+                    """,
+                    [(sid, wanted) for wanted in keys],
+                )
             conn.commit()
         except BaseException:
             conn.rollback()
