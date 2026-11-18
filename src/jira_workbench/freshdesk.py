@@ -21,7 +21,7 @@ from typing import Any, Protocol
 
 import requests
 
-from .config import FreshdeskSettings
+from .config import FRESHDESK_KEY_PREFIX, FreshdeskSettings
 from .sync import Progress, read_json, utc_now, write_json
 
 DEFAULT_SOURCE_KIND = "freshdesk"
@@ -225,7 +225,7 @@ def freshdesk_dir(jira_dir: Path) -> Path:
 
 
 def ticket_key(ticket_id: int) -> str:
-    return f"FD-{ticket_id}"
+    return f"{FRESHDESK_KEY_PREFIX}-{ticket_id}"
 
 
 def find_existing_ticket(base_dir: Path, ticket_id: int | str) -> Path | None:

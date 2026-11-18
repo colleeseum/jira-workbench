@@ -196,7 +196,7 @@ def load_config(path: Path) -> WorkbenchConfig:
     if not isinstance(issue, dict):
         raise ConfigError(f"invalid config file {expanded}: [issue] must be a table")
 
-    return WorkbenchConfig(
+    config = WorkbenchConfig(
         project=optional_string(data, "project", expanded),
         component_field=optional_string(data, "component_field", expanded),
         jira_dir=optional_string(data, "jira_dir", expanded),
@@ -226,6 +226,30 @@ def load_config(path: Path) -> WorkbenchConfig:
         host=optional_string(serve, "host", expanded),
         port=optional_int(serve, "port", expanded),
     )
+    reject_freshdesk_key_collision(config, expanded)
+    return config
+
+
+def reject_freshdesk_key_collision(config: WorkbenchConfig, path: Path) -> None:
+    """A Jira project keyed FD would produce issue keys such as FD-123 that are identical to a
+    Freshdesk ticket's key, so the item list, detail pages and API could not tell them apart."""
+    if not config.freshdesk_sources:
+        return
+    keys = [config.project or ""] + [project.key for project in config.projects]
+    if any(key.strip().upper() == FRESHDESK_KEY_PREFIX for key in keys):
+        raise ConfigError(
+            f"invalid config file {path}: Jira project key {FRESHDESK_KEY_PREFIX!r} conflicts with "
+            f"Freshdesk ticket keys ({FRESHDESK_KEY_PREFIX}-<id>) while a Freshdesk source is configured"
+        )
+
+
+# Slugs the local index already uses for its own sources (db.DEFAULT_SOURCE_SLUG). A Freshdesk
+# source sharing one would take over that source's rows, and each reindex would delete the other's
+# items.
+RESERVED_SOURCE_SLUGS = frozenset({"jira"})
+
+# Freshdesk tickets are indexed and served as FD-<id> (freshdesk.ticket_key).
+FRESHDESK_KEY_PREFIX = "FD"
 
 
 def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
@@ -301,6 +325,8 @@ def parse_freshdesk_sources(value: Any, path: Path) -> tuple[FreshdeskSettings, 
         api_key = optional_string(entry, "api_key", path)
         if not api_key:
             raise ConfigError(f"invalid config file {path}: sources entry {slug!r} needs a non-empty api_key")
+        if slug in RESERVED_SOURCE_SLUGS:
+            raise ConfigError(f"invalid config file {path}: sources slug {slug!r} is reserved for Jira")
         if slug in seen_slugs:
             raise ConfigError(f"invalid config file {path}: duplicate sources slug {slug!r}")
         seen_slugs.add(slug)

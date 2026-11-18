@@ -571,6 +571,43 @@ def test_load_config_reads_freshdesk_sources(tmp_path: Path) -> None:
     assert config.freshdesk_sources == (FreshdeskSettings(slug="freshdesk", domain="acme", api_key="secret"),)
 
 
+def test_load_config_rejects_the_reserved_jira_source_slug(tmp_path: Path) -> None:
+    # The index bootstraps a "jira" source row; a Freshdesk source sharing that slug would convert it
+    # and let each source's reindex delete the other's items.
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\nslug = "jira"\ndomain = "acme"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError, match="reserved"):
+        load_config(path)
+
+
+def test_reserved_source_slug_matches_the_index_default() -> None:
+    from jira_workbench.config import RESERVED_SOURCE_SLUGS
+    from jira_workbench.db import DEFAULT_SOURCE_SLUG
+
+    assert DEFAULT_SOURCE_SLUG in RESERVED_SOURCE_SLUGS
+
+
+@pytest.mark.parametrize(
+    "project_config",
+    ['project = "FD"', '[[projects]]\nkey = "fd"', '[[projects]]\nkey = "SAT"\n[[projects]]\nkey = "FD"'],
+)
+def test_load_config_rejects_jira_project_fd_alongside_a_freshdesk_source(tmp_path: Path, project_config: str) -> None:
+    # Freshdesk tickets are keyed FD-<id>; a Jira project FD would make FD-123 ambiguous.
+    path = tmp_path / "config.toml"
+    path.write_text(project_config + '\n[[sources]]\nkind = "freshdesk"\ndomain = "acme"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError, match="FD"):
+        load_config(path)
+
+
+def test_load_config_allows_jira_project_fd_without_a_freshdesk_source(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "FD"\n')
+
+    assert load_config(path).projects[0].key == "FD"
+
+
 def test_load_config_freshdesk_domain_strips_an_accidental_scheme(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "https://acme.freshdesk.com"\napi_key = "secret"\n')
