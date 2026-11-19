@@ -3,7 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from .metadata import is_project_read_only
 from .sync import (
+    ComponentFields,
     build_manifest,
     component_slug,
     find_existing_issue,
@@ -696,7 +697,14 @@ def refresh_local_issue_after_push(
     key: str,
     jira_client: JiraClient,
     component_field: str,
+    *,
+    index_component_fields: ComponentFields = None,
 ) -> None:
+    """Re-fetches one issue after a push/create into the local cache, then
+    rebuilds the index. `component_field` picks this issue's folder; the
+    rebuild covers every synced project, so pass `index_component_fields`
+    (project key -> component field) to derive each issue's component with its
+    own project's field -- without it `component_field` is applied to all."""
     try:
         issue = jira_client.get_issue(key, fields="*all", expand="changelog")
     except Exception as exc:
@@ -720,7 +728,12 @@ def refresh_local_issue_after_push(
 
     if old_dest is not None and old_dest != dest and old_dest.exists():
         shutil.rmtree(old_dest)
-    build_manifest(jira_dir, component_field)
+    build_manifest(
+        jira_dir,
+        {**index_component_fields, issue_project_key(issue) or "": component_field}
+        if isinstance(index_component_fields, Mapping)
+        else component_field,
+    )
 
 
 def push_key(
@@ -731,6 +744,7 @@ def push_key(
     dry_run: bool = False,
     progress: Progress | None = print,
     component_field: str = "components",
+    index_component_fields: ComponentFields = None,
 ) -> str:
     shadow = load_shadow(jira_dir, key)
     if shadow is None:
@@ -834,7 +848,9 @@ def push_key(
             except Exception as exc:
                 raise ShadowError(f"{key}: could not delete comment {comment_id}: {exc}") from exc
 
-    refresh_local_issue_after_push(jira_dir, key, jira_client, component_field)
+    refresh_local_issue_after_push(
+        jira_dir, key, jira_client, component_field, index_component_fields=index_component_fields
+    )
     delete_shadow(jira_dir, key)
     if progress:
         progress(f"{key}: pushed")
@@ -850,10 +866,12 @@ def push_shadows(
     progress: Progress | None = print,
     component_field: str = "components",
     component_field_for: Callable[[str], str] | None = None,
+    index_component_fields: ComponentFields = None,
 ) -> PushResult:
     """Pushes the staged shadows for `keys` (all shadows when empty). `component_field_for`
     resolves each issue's own project's component field, for pushes spanning several projects;
-    without it every issue uses `component_field`."""
+    without it every issue uses `component_field`. `index_component_fields` is passed to each
+    post-push index rebuild (see refresh_local_issue_after_push)."""
     selected, dependencies = order_push_keys(jira_dir, keys or all_shadow_keys(jira_dir))
     selected_set = set(selected)
     pushed = skipped = blocked = failed = 0
@@ -888,6 +906,7 @@ def push_shadows(
                 dry_run=dry_run,
                 progress=progress,
                 component_field=component_field_for(key) if component_field_for else component_field,
+                index_component_fields=index_component_fields,
             )
         except ShadowError as exc:
             failed += 1

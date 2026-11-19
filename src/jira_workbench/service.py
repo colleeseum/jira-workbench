@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -409,6 +410,8 @@ def bulk_edit_label(
     jira_email: object | None,
     jira_api_token: object | None,
     component_field: object | None,
+    *,
+    index_component_fields: Mapping[str, str | None] | None = None,
 ) -> LabelBulkEditResult:
     """Jira has no API for labels as an independent entity -- a label is
     just free text on each issue's `labels` field, so renaming/deleting one
@@ -422,7 +425,10 @@ def bulk_edit_label(
     edited), same as the TUI's own policy -- their keys are reported
     separately so a caller can tell the user what was left untouched.
     """
-    items: list[dict[str, Any]] = load_manifest_items(jira_dir, str(component_field) if component_field else None)
+    items: list[dict[str, Any]] = load_manifest_items(
+        jira_dir,
+        index_component_fields if index_component_fields is not None else str(component_field) if component_field else None,
+    )
     # Scoped to `project`, matching the project-scoped Labels page this is
     # driven from: the same label text in another project is a different
     # set of issues the user never saw or confirmed.
@@ -455,5 +461,11 @@ def bulk_edit_label(
         return LabelBulkEditResult(
             affected_keys=tuple(keys), skipped_read_only_keys=skipped_keys, push_result=None, push_error=str(exc)
         )
-    result = push_shadows(jira_dir, keys, client, component_field=str(component_field or "components"))
+    result = push_shadows(
+        jira_dir,
+        keys,
+        client,
+        component_field=str(component_field or "components"),
+        index_component_fields=index_component_fields,
+    )
     return LabelBulkEditResult(affected_keys=tuple(keys), skipped_read_only_keys=skipped_keys, push_result=result)

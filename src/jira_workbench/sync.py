@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +50,13 @@ ISSUE_KEY_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*-\d+")
 
 Progress = Callable[[str], None]
 
+# Either one component field applied to every issue (the legacy, single-project
+# shape) or a per-project mapping (project key -> that project's component field,
+# None meaning Jira's native `components`). Projects can configure different
+# fields, so anything that derives components for issues of several projects
+# (an index rebuild walks every synced project) needs the mapping.
+ComponentFields = str | Mapping[str, str | None] | None
+
 
 @dataclass(frozen=True)
 class SyncConfig:
@@ -65,6 +72,17 @@ class SyncConfig:
     # Issues that age out (or that a newly-added cutoff excludes) are simply
     # left alone on disk, not deleted -- see build_index_jql.
     history_months: int | None = None
+    # Every configured project's component field (project key -> field), used
+    # when rebuilding the index: the rebuild covers all synced projects, not
+    # only `project`. `component_field` still wins for `project` itself.
+    # None keeps the legacy behaviour of applying `component_field` to every
+    # issue.
+    index_component_fields: Mapping[str, str | None] | None = None
+
+    def component_fields_for_index(self) -> ComponentFields:
+        if self.index_component_fields is None:
+            return self.component_field
+        return {**self.index_component_fields, self.project: self.component_field}
 
 
 @dataclass(frozen=True)
@@ -189,6 +207,16 @@ def issue_project_key(issue: dict[str, Any]) -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def resolve_component_field(component_fields: ComponentFields, project_key: str | None) -> str | None:
+    """The component field for an issue of `project_key`. A plain field (or None)
+    applies to every project; a mapping resolves per project, and a project missing
+    from it uses Jira's native field (None), matching
+    WorkbenchConfig.effective_component_field for unconfigured projects."""
+    if component_fields is None or isinstance(component_fields, str):
+        return component_fields
+    return component_fields.get(project_key or "")
 
 
 def status_category_key(status: Any) -> str | None:
@@ -451,7 +479,7 @@ def issue_summary(component: str, key: str, issue_path: Path, base_dir: Path) ->
 
 
 def build_manifest(
-    jira_dir: Path, component_field: str | None = None, *, dev_status_field: str | None = None
+    jira_dir: Path, component_field: ComponentFields = None, *, dev_status_field: str | None = None
 ) -> dict[str, Any]:
     components_dir = jira_dir / "components"
     items: list[dict[str, Any]] = []
@@ -687,7 +715,7 @@ def sync_project(
 
     if progress:
         progress("[6/7] Building manifest...")
-    build_manifest(jira_dir, config.component_field)
+    build_manifest(jira_dir, config.component_fields_for_index())
     if progress:
         progress("[7/7] Done.")
     return SyncResult(

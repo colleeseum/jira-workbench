@@ -98,6 +98,7 @@ class PushAllProgressScreen(ModalScreen[PushResult | None]):
             self.app.call_from_thread(log.write, line)
 
         resolve = self._component_field_for
+        index_component_fields = self.app.index_component_fields
         try:
             result = push_shadows(
                 self._jira_dir,
@@ -106,6 +107,7 @@ class PushAllProgressScreen(ModalScreen[PushResult | None]):
                 progress=progress,
                 component_field=self._component_field,
                 component_field_for=(lambda key: resolve(key) or "components") if resolve else None,
+                index_component_fields=index_component_fields,
             )
         except Exception as exc:
             self.app.call_from_thread(self._finish, None, f"push all failed: {exc}")

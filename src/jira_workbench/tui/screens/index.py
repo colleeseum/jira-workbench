@@ -152,7 +152,7 @@ class IndexScreen(Screen[None]):
             label = self._column_label(column) if column in SORT_FIELDS else column
             table.add_column(label, key=column, width=width)
         self.items = load_manifest_items(
-            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+            self.app.jira_dir, self.app.index_component_fields, dev_status_field=self.app.dev_status_field
         )
         self._rebuild_table()
         if self.app.initial_key:
@@ -541,7 +541,7 @@ class IndexScreen(Screen[None]):
 
     def action_reload(self) -> None:
         self.items = load_manifest_items(
-            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+            self.app.jira_dir, self.app.index_component_fields, dev_status_field=self.app.dev_status_field
         )
         self._rebuild_table()
         self.notify(f"reloaded {len(self.items)} items")
@@ -662,7 +662,7 @@ class IndexScreen(Screen[None]):
             return
 
         self.items = load_manifest_items(
-            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+            self.app.jira_dir, self.app.index_component_fields, dev_status_field=self.app.dev_status_field
         )
         self._rebuild_table()
         self._select_key(key)
@@ -720,7 +720,7 @@ class IndexScreen(Screen[None]):
             return
 
         self.items = load_manifest_items(
-            self.app.jira_dir, self.app.component_field, dev_status_field=self.app.dev_status_field
+            self.app.jira_dir, self.app.index_component_fields, dev_status_field=self.app.dev_status_field
         )
         self._rebuild_table()
         self._select_key(new_key)

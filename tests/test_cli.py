@@ -580,6 +580,72 @@ def test_sync_uses_per_project_component_field_without_leaking_across_projects(
     assert by_project["PLAT"].component_field == "components"
 
 
+def test_sync_rebuilds_the_index_with_every_projects_own_component_field(tmp_path: Path, monkeypatch) -> None:
+    # Each project's sync rebuilds the index for all synced projects, so it needs every
+    # project's field, not only its own.
+    from jira_workbench.sync import SyncResult
+
+    captured_configs = []
+
+    def fake_sync_project(config, client, progress=None):
+        captured_configs.append(config)
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "sync"]) == 0
+
+    expected = {"SAT": "customfield_10071", "PLAT": "components"}
+    for config in captured_configs:
+        index_fields = config.component_fields_for_index()
+        assert {project: field or "components" for project, field in index_fields.items()} == expected
+
+
+def test_db_reindex_uses_each_projects_own_component_field(tmp_path: Path, monkeypatch) -> None:
+    from jira_workbench import db
+
+    captured = []
+    monkeypatch.setattr(db, "reindex_items", lambda jira_dir, component_field: captured.append(component_field) or 0)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "db", "reindex"]) == 0
+
+    assert captured == [{"SAT": "customfield_10071", "PLAT": None}]
+
+
 def test_sync_history_months_flag_overrides_config_for_every_project(tmp_path: Path, monkeypatch) -> None:
     from jira_workbench.sync import SyncResult
 

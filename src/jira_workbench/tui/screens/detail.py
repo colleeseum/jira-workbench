@@ -379,6 +379,7 @@ class DetailScreen(Screen[None]):
                 self.key,
                 client,
                 self.app.component_field_for(self.key) or "components",
+                index_component_fields=self.app.index_component_fields,
             )
         except ShadowError as exc:
             self.notify(f"refresh failed: {exc}", severity="error")
@@ -404,6 +405,7 @@ class DetailScreen(Screen[None]):
                 client,
                 progress=None,
                 component_field=self.app.component_field_for(self.key) or "components",
+                index_component_fields=self.app.index_component_fields,
             )
         except (MetadataError, ShadowError) as exc:
             self.notify(f"push failed: {exc}", severity="error")

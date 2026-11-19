@@ -136,6 +136,13 @@ class WorkbenchConfig:
             return None
         return self.component_field
 
+    def component_fields_by_project(self) -> dict[str, str | None]:
+        """Every configured project's own component field (None meaning Jira's
+        native `components`), for code that derives components for issues of
+        several projects at once -- an index rebuild covers every synced project,
+        so a single field would be wrong for all but one of them."""
+        return {project.key: self.effective_component_field(project.key) for project in self.resolved_projects()}
+
     def component_field_for_issue(self, issue_key: str) -> str:
         """The component field of the project an issue key belongs to (a Jira issue key is always
         `<PROJECT>-<number>`), defaulting to Jira's native `components` field."""

@@ -25,11 +25,13 @@ from .metadata import (
 from .shadow import load_shadow, render_diff
 from .sync import (
     FALLBACK_DONE_STATUS_NAMES,
+    ComponentFields,
     find_existing_issue,
     issue_key_sort_key,
     issue_path_sort_key,
     issue_project_key,
     read_json,
+    resolve_component_field,
     status_category_key,
 )
 
@@ -879,7 +881,7 @@ def _directory_component_hint(path: str | None) -> str | None:
 def _enrich_indexed_item(
     jira_dir: Path,
     indexed: dict[str, Any],
-    component_field: str | None,
+    component_field: ComponentFields,
     *,
     boards: list[dict[str, Any]],
     status_categories: dict[str, str],
@@ -926,7 +928,7 @@ def _enrich_indexed_item(
 
 
 def load_manifest_items(
-    jira_dir: Path, component_field: str | None = None, *, dev_status_field: str | None = None
+    jira_dir: Path, component_field: ComponentFields = None, *, dev_status_field: str | None = None
 ) -> list[dict[str, Any]]:
     """Reads the SQLite index (already carrying every enrichment field
     `compute_issue_fields` computes, baked in at the last `jira-wb sync`)
@@ -992,7 +994,7 @@ def load_manifest_items(
 
 def filtered_manifest_items(
     jira_dir: Path,
-    component_field: str | None = None,
+    component_field: ComponentFields = None,
     *,
     field_filters: dict[str, list[str]] | None = None,
     board: str | None = None,
@@ -1040,7 +1042,7 @@ def filtered_manifest_items(
 def compute_issue_fields(
     jira_dir: Path,
     issue: dict[str, Any],
-    component_field: str | None = None,
+    component_field: ComponentFields = None,
     *,
     fallback_component: Any = None,
     status_categories: dict[str, str] | None = None,
@@ -1077,7 +1079,10 @@ def compute_issue_fields(
         category = status_categories.get(result["status"])
     result["statusCategory"] = category
     result["type"] = display_name(issue_type)
-    result["component"] = hierarchy_component(issue, component_field) or display_name(fallback_component)
+    project = issue_project_key(issue)
+    result["component"] = hierarchy_component(issue, resolve_component_field(component_field, project)) or display_name(
+        fallback_component
+    )
     result["fixVersion"] = fix_version_names[0] if fix_version_names else ""
     # Full multi-value list, alongside the display-only singular
     # "fixVersion" above (kept as-is -- other callers already depend on
@@ -1100,7 +1105,7 @@ def compute_issue_fields(
     result["epicSummary"] = display_name(parent_fields.get("summary"))
     result["statusCategoryChangeDate"] = display_name(fields.get("statuscategorychangedate"))
     result["issueId"] = issue.get("id")
-    result["project"] = issue_project_key(issue)
+    result["project"] = project
     result["devStatus"] = parse_dev_status_summary(fields.get(dev_status_field or DEV_STATUS_FIELD_DEFAULT))
     result["labels"] = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
     return result
@@ -1169,7 +1174,7 @@ def attach_board_fields(
 def with_local_index_fields(
     jira_dir: Path,
     item: dict[str, Any],
-    component_field: str | None = None,
+    component_field: ComponentFields = None,
     *,
     boards: list[dict[str, Any]] | None = None,
     status_categories: dict[str, str] | None = None,
@@ -1209,7 +1214,7 @@ def refresh_index_item(
     jira_dir: Path,
     items: list[dict[str, Any]],
     key: str,
-    component_field: str | None = None,
+    component_field: ComponentFields = None,
     *,
     boards: list[dict[str, Any]] | None = None,
     status_categories: dict[str, str] | None = None,

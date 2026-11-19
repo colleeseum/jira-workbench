@@ -70,7 +70,7 @@ from .shadow import (
     shadow_status,
     unset_field,
 )
-from .sync import SyncConfig, SyncError, sync_project
+from .sync import ComponentFields, SyncConfig, SyncError, sync_project
 from .view import SWIMLANE_MODES, ViewError, detailed_shadow_report_lines, format_components, format_work_item
 
 
@@ -80,7 +80,7 @@ def tui_component_fields(
     """Each configured project's own component field, for the TUI to resolve
     per issue rather than applying the default project's field everywhere.
     An explicit --component-field applies to the default project only."""
-    fields = {project.key: config.effective_component_field(project.key) for project in config.resolved_projects()}
+    fields = config.component_fields_by_project()
     if override and default_project:
         fields[default_project] = str(override)
     return fields
@@ -566,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
                         jira_dir=jira_dir,
                         force=args.force,
                         history_months=history_months,
+                        index_component_fields=config.component_fields_by_project(),
                     ),
                     api_client,
                     progress=sync_progress_printer(
@@ -749,6 +750,7 @@ def main(argv: list[str] | None = None) -> int:
                 jira_email,
                 jira_api_token,
                 issue_type,
+                index_component_fields=config.component_fields_by_project(),
             )
         except MetadataError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -810,7 +812,10 @@ def main(argv: list[str] | None = None) -> int:
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
         project = config.default_project_key()
         component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
-        return run_db(args, jira_dir, component_field)
+        # The index spans every synced project: each one's own field, with an
+        # explicit --component-field applying to the default project only.
+        component_fields = tui_component_fields(config, project, args.component_field)
+        return run_db(args, jira_dir, component_fields or component_field)
 
     parser.print_help()
     return 0
@@ -837,6 +842,8 @@ def run_issue(
     jira_email: object | None,
     jira_api_token: object | None,
     issue_type: object | None,
+    *,
+    index_component_fields: dict[str, str | None] | None = None,
 ) -> int:
     if args.issue_command == "create":
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
@@ -874,7 +881,13 @@ def run_issue(
                 print(f"{key}: {fields[key]}")
             return 0
         key = create_issue(client, fields)
-        refresh_local_issue_after_push(jira_dir, key, client, str(component_field or "components"))
+        refresh_local_issue_after_push(
+            jira_dir,
+            key,
+            client,
+            str(component_field or "components"),
+            index_component_fields=index_component_fields,
+        )
         print(f"created {key}: {summary}")
         return 0
 
@@ -1166,7 +1179,7 @@ def run_meta(
     return 2
 
 
-def run_db(args: argparse.Namespace, jira_dir: Path, component_field: str) -> int:
+def run_db(args: argparse.Namespace, jira_dir: Path, component_field: ComponentFields) -> int:
     from . import db
 
     if args.db_command == "reindex":
@@ -1277,6 +1290,7 @@ def run_shadow(args: argparse.Namespace, jira_dir: Path, config: object) -> int:
             dry_run=args.dry_run,
             progress=lambda message: print(message, file=sys.stderr),
             component_field_for=config.component_field_for_issue,
+            index_component_fields=config.component_fields_by_project(),
         )
         print(
             f"push summary: pushed={result.pushed} skipped={result.skipped} "

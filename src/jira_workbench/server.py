@@ -212,10 +212,8 @@ def all_items(jira_dir: Path, config: WorkbenchConfig) -> list[dict[str, Any]]:
     (which is Jira-only, see the "Freshdesk as a second source" plan) --
     they're already fully computed at sync time, so no further
     Jira-specific enrichment is needed."""
-    default_project = config.default_project_key()
-    component_field = config.effective_component_field(default_project)
     try:
-        jira_items = load_manifest_items(jira_dir, component_field)
+        jira_items = load_manifest_items(jira_dir, config.component_fields_by_project())
     except ViewError:
         if not config.freshdesk_sources:
             raise
@@ -1261,9 +1259,8 @@ def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any],
     # for counting. Fetches the (project-scoped, so still small) enriched
     # item list instead and counts off that, same computation as before
     # this function moved everything else to SQL.
-    fix_version_component_field = config.effective_component_field(config.default_project_key())
     fix_version_items = filtered_manifest_items(
-        jira_dir, fix_version_component_field, field_filters={"project": scoped_projects} if scoped_projects else None
+        jira_dir, config.component_fields_by_project(), field_filters={"project": scoped_projects} if scoped_projects else None
     )
     # Same policy as the TUI's version picker: archived versions never
     # show, released ones are hidden unless the "show released" toggle is
@@ -5362,7 +5359,8 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # Freshdesk source to show instead.
         if not (jira_dir / "manifest.json").exists() and not config.freshdesk_sources:
             return page("<h1>Jira Workbench</h1><p>No manifest found. Run <code>jira-wb sync</code>.</p>")
-        component_field = config.effective_component_field(config.default_project_key())
+        # Per project: the index and the items it yields span every project.
+        component_fields = config.component_fields_by_project()
         from .db import count_items, reindex_items
 
         if count_items(jira_dir) == 0:
@@ -5376,7 +5374,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             # real, already-synced data manifest.json says exists.
             # Self-heals here instead: one slow request rebuilds it, every
             # request after this one hits the normal fast path.
-            reindex_items(jira_dir, component_field)
+            reindex_items(jira_dir, component_fields)
         # filtered_manifest_items pushes the SQL-native fields (not
         # fixVersion -- see its own docstring) plus board membership down
         # into a WHERE clause as a safe-superset narrowing (db.list_items);
@@ -5421,7 +5419,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             # Freshdesk items never carry a shadow (no edit pipeline exists
             # for them yet), so modified_only naturally excludes them below
             # without needing to skip merging them in here.
-            narrowed = filtered_manifest_items(jira_dir, component_field, field_filters=sql_field_filters)
+            narrowed = filtered_manifest_items(jira_dir, component_fields, field_filters=sql_field_filters)
             narrowed += _freshdesk_indexed_items(jira_dir, config)
             archived_names, archived_component_names_by_project = _archived_by_project(narrowed)
             filtered = filter_items(
@@ -5437,7 +5435,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             )
         else:
             narrowed = filtered_manifest_items(
-                jira_dir, component_field, field_filters=sql_field_filters, board=board or None
+                jira_dir, component_fields, field_filters=sql_field_filters, board=board or None
             )
             # An explicit board filters Freshdesk items out on their own
             # (they always have an empty boards list, see
@@ -5799,7 +5797,9 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             return back_to_form(str(exc))
 
         try:
-            refresh_local_issue_after_push(jira_dir, key, client, component_field)
+            refresh_local_issue_after_push(
+                jira_dir, key, client, component_field, index_component_fields=config.component_fields_by_project()
+            )
         except ShadowError as exc:
             query_string = urlencode({"flash": f"created but local refresh failed: {exc}", "flash_kind": "error"})
             return RedirectResponse(url=f"/items/{key}?{query_string}", status_code=303)
@@ -6219,7 +6219,13 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # safety (still touches only this one key when it has no parent
         # dependency on another unpushed shadow) that the TUI's own
         # action_push doesn't bother with today.
-        result = push_shadows(jira_dir, [key], client, component_field=component_field)
+        result = push_shadows(
+            jira_dir,
+            [key],
+            client,
+            component_field=component_field,
+            index_component_fields=config.component_fields_by_project(),
+        )
         if result.failed:
             error = result.errors[0] if result.errors else "push failed"
             return _redirect_to_item(key, flash=error, flash_kind="error")
@@ -6266,7 +6272,13 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 errors.append(str(exc))
                 continue
             component_field = config.effective_component_field(project) or "components"
-            result = push_shadows(jira_dir, keys, client, component_field=component_field)
+            result = push_shadows(
+                jira_dir,
+                keys,
+                client,
+                component_field=component_field,
+                index_component_fields=config.component_fields_by_project(),
+            )
             pushed += result.pushed
             blocked += result.blocked
             failed += result.failed
@@ -6597,6 +6609,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 config.jira_email,
                 config.jira_api_token,
                 component_field,
+                index_component_fields=config.component_fields_by_project(),
             )
         except ShadowError as exc:
             return _redirect_to_meta_section("labels", project, flash=str(exc), flash_kind="error")
@@ -6608,7 +6621,15 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         component_field = config.effective_component_field(project)
         try:
             result = bulk_edit_label(
-                jira_dir, label, None, project, config.jira_url, config.jira_email, config.jira_api_token, component_field
+                jira_dir,
+                label,
+                None,
+                project,
+                config.jira_url,
+                config.jira_email,
+                config.jira_api_token,
+                component_field,
+                index_component_fields=config.component_fields_by_project(),
             )
         except ShadowError as exc:
             return _redirect_to_meta_section("labels", project, flash=str(exc), flash_kind="error")

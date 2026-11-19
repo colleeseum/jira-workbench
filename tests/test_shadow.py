@@ -261,6 +261,45 @@ def test_push_shadows_resolves_the_component_field_per_issue(tmp_path: Path) -> 
     assert (tmp_path / "components/api-team/PLAT-1/issue.json").exists()
 
 
+def test_push_rebuilds_the_index_with_each_projects_own_component_field(tmp_path: Path) -> None:
+    # Every issue carries values in both fields (SAT's customfield_10071 and PLAT's native
+    # components), as do PushJiraClient's refreshed issues. Each push rebuilds the whole index;
+    # whichever project triggers it, every issue's indexed component must come from its own
+    # project's field, not the pushing project's.
+    from jira_workbench.db import list_items
+
+    for key in ("SAT-1", "PLAT-1"):
+        write_json(
+            tmp_path / f"components/old/{key}/issue.json",
+            {
+                "key": key,
+                "fields": {
+                    "updated": "2026-07-20T00:00:00.000+0000",
+                    "summary": "Old",
+                    "components": [{"name": "api-team"}],
+                    "customfield_10071": {"value": "helm-chart"},
+                },
+            },
+        )
+    client = PushJiraClient("2026-07-20T00:00:00.000+0000")
+    fields = {"SAT": "customfield_10071", "PLAT": None}
+
+    for key in ("PLAT-1", "SAT-1", "PLAT-1"):
+        set_field(tmp_path, key, "summary", f"New {key}")
+        commit_shadow(tmp_path, key)
+        result = push_shadows(
+            tmp_path,
+            [key],
+            client,
+            progress=None,
+            component_field=fields[key.split("-")[0]] or "components",
+            index_component_fields=fields,
+        )
+        assert result.pushed == 1
+        indexed = {item["key"]: item["component"] for item in list_items(tmp_path)}
+        assert indexed == {"SAT-1": "helm-chart", "PLAT-1": "api-team"}, f"after pushing {key}"
+
+
 class ChangelogJiraClient(PushJiraClient):
     """Like Jira, returns the changelog only when it is requested with expand=changelog."""
 

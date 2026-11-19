@@ -134,6 +134,24 @@ def test_reindex_items_populates_items_from_disk(tmp_path: Path) -> None:
     assert items["SAT-1"]["status"] == "To Do"
 
 
+def test_reindex_items_resolves_the_component_field_per_project(tmp_path: Path) -> None:
+    # Each issue carries a value in both projects' component fields: SAT's lives in
+    # customfield_10071, PLAT's in the native components field.
+    for key in ("SAT-1", "PLAT-1"):
+        _write_issue(
+            tmp_path,
+            key,
+            "folder",
+            components=[{"name": f"{key} native"}],
+            customfield_10071={"value": f"{key} custom"},
+        )
+
+    reindex_items(tmp_path, {"SAT": "customfield_10071", "PLAT": None})
+
+    components = {item["key"]: item["component"] for item in list_items(tmp_path)}
+    assert components == {"SAT-1": "SAT-1 custom", "PLAT-1": "PLAT-1 native"}
+
+
 def test_reindex_items_preserves_id_for_an_unchanged_row_across_repeated_runs(tmp_path: Path) -> None:
     _write_issue(tmp_path, "SAT-123", "helm-chart")
     reindex_items(tmp_path)

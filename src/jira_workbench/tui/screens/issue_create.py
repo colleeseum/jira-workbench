@@ -459,7 +459,13 @@ class IssueCreateScreen(Screen[str | None]):
             return
 
         try:
-            refresh_local_issue_after_push(self._jira_dir, key, self._client, self._component_field)
+            refresh_local_issue_after_push(
+                self._jira_dir,
+                key,
+                self._client,
+                self._component_field,
+                index_component_fields=self.app.index_component_fields,
+            )
         except ShadowError as exc:
             self.notify(f"created {key}, but local refresh failed: {exc}", severity="warning")
 

@@ -383,7 +383,14 @@ class VersionsScreen(Screen[None]):
         for key in keys:
             component_field = self.app.component_field_for(key) or "components"
             try:
-                await asyncio.to_thread(refresh_local_issue_after_push, self.app.jira_dir, key, client, component_field)
+                await asyncio.to_thread(
+                    refresh_local_issue_after_push,
+                    self.app.jira_dir,
+                    key,
+                    client,
+                    component_field,
+                    index_component_fields=self.app.index_component_fields,
+                )
             except ShadowError:
                 continue
             self.app.mark_changed(key)
@@ -852,7 +859,7 @@ class BoardsScreen(Screen[None]):
 
     def _manifest_items(self) -> list[dict[str, Any]]:
         if self._items is None:
-            self._items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+            self._items = load_manifest_items(self.app.jira_dir, self.app.index_component_fields)
         return self._items
 
     def compose(self) -> ComposeResult:
@@ -1050,7 +1057,7 @@ class LabelsScreen(Screen[None]):
         self._reload()
 
     def _reload(self) -> None:
-        items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        items = load_manifest_items(self.app.jira_dir, self.app.index_component_fields)
         self.counts = label_counts(items)
         self._rebuild_table()
 
@@ -1100,7 +1107,7 @@ class LabelsScreen(Screen[None]):
         await self._bulk_edit(label, None)
 
     async def _bulk_edit(self, label: str, new_name: str | None) -> None:
-        items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        items = load_manifest_items(self.app.jira_dir, self.app.index_component_fields)
         affected = [item for item in items if label in (item.get("labels") or [])]
         if not affected:
             self.notify(f"no issues currently have label '{label}'")

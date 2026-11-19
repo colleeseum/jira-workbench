@@ -260,6 +260,21 @@ def test_effective_component_field_falls_back_to_flat_value_in_legacy_single_pro
     assert config.effective_component_field("SAT") == "customfield_10071"
 
 
+def test_component_fields_by_project_maps_every_configured_project_to_its_own_field() -> None:
+    config = WorkbenchConfig(
+        component_field="customfield_10071",
+        projects=(
+            ProjectSettings(key="SAT", component_field="customfield_10071"),
+            ProjectSettings(key="PLAT"),
+        ),
+    )
+
+    assert config.component_fields_by_project() == {"SAT": "customfield_10071", "PLAT": None}
+    assert WorkbenchConfig(project="SAT", component_field="customfield_10050").component_fields_by_project() == {
+        "SAT": "customfield_10050"
+    }
+
+
 def test_resolved_projects_falls_back_to_flat_project_key() -> None:
     config = WorkbenchConfig(project="SAT")
 

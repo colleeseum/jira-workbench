@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from .sync import issue_path_sort_key, read_json, updated_at, utc_now
+from .sync import ComponentFields, issue_path_sort_key, read_json, updated_at, utc_now
 from .view import (
     as_dict,
     attach_board_fields,
@@ -341,7 +341,7 @@ _EXTRA_KEYS = (
 
 def reindex_items(
     jira_dir: Path,
-    component_field: str | None = None,
+    component_field: ComponentFields = None,
     *,
     dev_status_field: str | None = None,
     source_slug: str = DEFAULT_SOURCE_SLUG,
@@ -350,7 +350,12 @@ def reindex_items(
     whose key no longer exists there -- never a blanket DELETE before the
     inserts, since that would churn the surrogate id (and any future FK'd
     shadow/link) of every unchanged item in the batch. Idempotent and safe
-    to re-run; unchanged items keep their `id`."""
+    to re-run; unchanged items keep their `id`.
+
+    The index spans every synced project, so pass `component_field` as a
+    per-project mapping (project key -> field) whenever projects can
+    configure different component fields: a single field is applied to
+    every issue."""
     conn = connect(jira_dir)
     try:
         sid = source_id(conn, source_slug)

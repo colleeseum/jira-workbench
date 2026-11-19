@@ -7,6 +7,7 @@ from textual import events
 from textual.app import App
 
 from ..metadata import JiraApiConfig, MetadataError, jira_api_client, load_project_registry
+from ..sync import ComponentFields
 from ..view import DEV_STATUS_FIELD_DEFAULT, normalize_swimlane
 
 DEFAULT_PREVIEW_LINES = 10
@@ -97,6 +98,13 @@ class JiraWorkbenchApp(App):
         # field/status edit already goes through regardless of entry point;
         # checking here just avoids surfacing a raw ShadowError to the user.
         self._read_only_projects = load_project_registry(self.jira_dir)
+
+    @property
+    def index_component_fields(self) -> ComponentFields:
+        """What to derive indexed/enriched components with: every configured
+        project's own field when known (the index spans all projects), else the
+        single default field."""
+        return self.component_fields or self.component_field
 
     def component_field_for(self, key_or_project: str | None) -> str | None:
         """The component field of the project an issue key (or project key)

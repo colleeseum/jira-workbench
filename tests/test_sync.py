@@ -332,6 +332,41 @@ def test_sync_project_writes_component_layout_and_manifest(tmp_path: Path) -> No
     assert "[3/7] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in progress
 
 
+def test_sync_project_rebuilds_the_index_with_each_projects_own_component_field(tmp_path: Path) -> None:
+    from jira_workbench.db import list_items
+
+    # Already synced by an earlier PLAT sync: PLAT uses the native components field, but the
+    # issue also has a value in SAT's customfield_10071.
+    write_json(
+        tmp_path / "components/plat-native/PLAT-7/issue.json",
+        {
+            "key": "PLAT-7",
+            "fields": {
+                "summary": "PLAT issue",
+                "status": {"name": "Open"},
+                "components": [{"name": "Plat Native"}],
+                "customfield_10071": {"value": "Not PLAT's field"},
+            },
+        },
+    )
+
+    sync_project(
+        SyncConfig(
+            project="SAT",
+            component_field="customfield_10071",
+            jira_dir=tmp_path,
+            index_component_fields={"SAT": "components", "PLAT": None},
+        ),
+        FakeJiraClient(),
+        progress=None,
+    )
+
+    components = {item["key"]: item["component"] for item in list_items(tmp_path)}
+    assert components["PLAT-7"] == "Plat Native"
+    # The synced project's own (possibly --component-field overridden) field wins over the map.
+    assert components["SAT-1"] == "API Team"
+
+
 def test_sync_project_fetches_each_issue_with_its_changelog(tmp_path: Path) -> None:
     # expand="changelog" -- written verbatim into issue.json (sync.py does
     # no filtering of the raw API response) so view.py's last_changed_by/
