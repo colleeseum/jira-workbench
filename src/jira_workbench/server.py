@@ -3755,7 +3755,9 @@ def render_item_detail_page(
             f'<ul class="detail-children">{linked_freshdesk_rows}</ul></div>'
         )
 
-    description_value = display_name(fields.get("description")) if "description" not in editable_fields else ""
+    # description_plain, not display_name: an ADF dict would otherwise be
+    # serialized to raw JSON on a read-only project's Detail page.
+    description_value = description_plain if "description" not in editable_fields else ""
     description_html = (
         _field_editor_html(
             jira_dir,

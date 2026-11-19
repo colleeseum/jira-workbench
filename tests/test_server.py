@@ -1153,6 +1153,29 @@ def test_item_detail_page_ships_icon_select_script_only_when_needed(tmp_path: Pa
     assert "function jiraWbIconToggle" not in read_only_response.text
 
 
+def test_item_detail_page_read_only_renders_adf_description_as_text(tmp_path: Path) -> None:
+    # Regression (#53 review): the read-only branch used display_name, which
+    # serialized an ADF description dict to raw JSON.
+    client = _synced_client(tmp_path)
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+    path = tmp_path / "components/api-team/SAT-1/issue.json"
+    issue = read_json(path)
+    issue["fields"]["description"] = {
+        "type": "doc",
+        "version": 1,
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Hello ADF"}]}],
+    }
+    write_json(path, issue)
+
+    response = client.get("/items/SAT-1")
+
+    description = re.search(r'class="detail-description[^"]*".*?<pre>(.*?)</pre>', response.text, re.S)
+    assert description is not None
+    assert "Hello ADF" in description.group(1)
+    assert "&quot;type&quot;" not in description.group(1)
+    assert '"type": "doc"' not in response.text
+
+
 def test_item_detail_page_priority_dropdown_uses_the_same_svg_icons_as_the_items_list(tmp_path: Path) -> None:
     client = _synced_client(tmp_path)
 
