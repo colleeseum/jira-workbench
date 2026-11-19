@@ -49,10 +49,13 @@ EPOCH_START = "2000-01-01T00:00:00Z"
 # documented predefined filters (`?filter=deleted`, `?filter=spam`) list them.
 REMOVED_TICKET_FILTERS = ("deleted", "spam")
 
-# Freshdesk documents that the list endpoint returns at most 300 pages
-# (30000 tickets). A listing that reaches that size may be truncated, so it
+# Freshdesk documents that the ticket list endpoint returns at most 300 pages
+# (30000 tickets), so ticket listings stop there instead of requesting a page
+# past the cap. A listing that reaches that size may be truncated, so it
 # cannot prove that an unlisted ticket is gone.
-MAX_LISTED_TICKETS = 300 * 100
+TICKET_LIST_MAX_PAGES = 300
+PAGE_SIZE = 100
+MAX_LISTED_TICKETS = TICKET_LIST_MAX_PAGES * PAGE_SIZE
 
 # Freshdesk's 4 universal built-in statuses -- present on every account
 # regardless of plan, so this is the fallback used only when the real,
@@ -160,15 +163,20 @@ class FreshdeskClient:
         except (TypeError, ValueError):
             return DEFAULT_RETRY_AFTER_SECONDS
 
-    def _paginated(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    def _paginated(
+        self, path: str, params: dict[str, Any], *, max_pages: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Every record of a listing, page by page. With `max_pages`, stops
+        after that page even when it is full, returning what was collected;
+        callers treat a result of max_pages * PAGE_SIZE as possibly truncated."""
         results: list[dict[str, Any]] = []
         page = 1
         while True:
-            batch = self._get(path, params={**params, "per_page": 100, "page": page})
+            batch = self._get(path, params={**params, "per_page": PAGE_SIZE, "page": page})
             if not isinstance(batch, list) or not batch:
                 break
             results.extend(batch)
-            if len(batch) < 100:
+            if len(batch) < PAGE_SIZE or (max_pages is not None and page >= max_pages):
                 break
             page += 1
         return results
@@ -199,7 +207,7 @@ class FreshdeskClient:
             "include": "description,requester",
             "updated_since": updated_since or EPOCH_START,
         }
-        return self._paginated("tickets", params)
+        return self._paginated("tickets", params, max_pages=TICKET_LIST_MAX_PAGES)
 
     def list_removed_ticket_ids(self) -> set[int]:
         """Ids of tickets Freshdesk reports as deleted or spam -- the ones
@@ -210,7 +218,7 @@ class FreshdeskClient:
         full sync reconciles those (see sync_freshdesk_source)."""
         removed: set[int] = set()
         for filter_name in REMOVED_TICKET_FILTERS:
-            for ticket in self._paginated("tickets", {"filter": filter_name}):
+            for ticket in self._paginated("tickets", {"filter": filter_name}, max_pages=TICKET_LIST_MAX_PAGES):
                 if isinstance(ticket, dict) and isinstance(ticket.get("id"), int):
                     removed.add(ticket["id"])
         return removed
@@ -393,6 +401,15 @@ def sync_freshdesk_source(
     # and a cursor taken at the end would skip that update for good.
     next_cursor = utc_now()
     tickets = client.list_tickets(updated_since=updated_since)
+    listing_truncated = len(tickets) >= MAX_LISTED_TICKETS
+    if listing_truncated:
+        # The listing stopped at Freshdesk's page cap. It is ordered by
+        # updated_at ascending, so the next run resumes from the last listed
+        # update instead of skipping every ticket past the cap.
+        listed_updates = [t["updated_at"] for t in tickets if isinstance(t, dict) and isinstance(t.get("updated_at"), str)]
+        next_cursor = max(listed_updates) if listed_updates else (updated_since or EPOCH_START)
+        if progress:
+            progress(f"[2/4] Listing reached Freshdesk's {MAX_LISTED_TICKETS}-ticket cap; the next sync continues from there")
 
     if progress:
         progress("[3/4] Syncing tickets...")
@@ -467,7 +484,7 @@ def sync_freshdesk_source(
     # A full listing (first sync or --force) is the complete active set, so
     # any other local ticket is gone or no longer visible -- unless the
     # listing hit Freshdesk's documented size cap and may be truncated.
-    if updated_since is None and len(tickets) < MAX_LISTED_TICKETS:
+    if updated_since is None and not listing_truncated:
         gone_ids |= unlisted_ticket_ids(tickets_dir, listed_ids)
     removed_ids = remove_ticket_dirs(tickets_dir, gone_ids)
     if removed_ids and progress:

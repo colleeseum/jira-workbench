@@ -10,7 +10,9 @@ from jira_workbench.config import FreshdeskSettings
 from jira_workbench.freshdesk import (
     DEFAULT_RETRY_AFTER_SECONDS,
     EPOCH_START,
+    MAX_LISTED_TICKETS,
     MAX_RATE_LIMIT_RETRIES,
+    TICKET_LIST_MAX_PAGES,
     FreshdeskClient,
     FreshdeskError,
     FreshdeskSyncResult,
@@ -395,6 +397,25 @@ def test_sync_freshdesk_source_forced_full_listing_removes_unlisted_tickets(tmp_
     assert {item["key"] for item in db.list_items(tmp_path, source_slug="freshdesk")} == {"FD-1"}
 
 
+def test_sync_freshdesk_source_forced_listing_at_the_cap_keeps_unlisted_tickets_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression (#52 review): a listing stopped at Freshdesk's page cap is
+    # possibly truncated -- it cannot prove an unlisted ticket is gone, and the
+    # next run must resume after the last listed update, not skip past it.
+    from jira_workbench import freshdesk
+
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    tickets = {i: _ticket(i, updated_at=f"2026-01-0{i}T00:00:00Z") for i in (1, 2, 5)}
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets), progress=None)
+
+    monkeypatch.setattr(freshdesk, "MAX_LISTED_TICKETS", 2)
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets, index_keys=[1, 2]), force=True, progress=None)
+
+    assert (tmp_path / "freshdesk/tickets/5/ticket.json").exists()
+    assert read_json(freshdesk_dir(tmp_path) / "last_sync.json")["syncedAt"] == "2026-01-02T00:00:00Z"
+
+
 def test_sync_freshdesk_source_keeps_tickets_when_listing_removed_ones_fails(tmp_path: Path) -> None:
     settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
     tickets = {1: _ticket(1), 5: _ticket(5)}
@@ -451,6 +472,24 @@ def test_freshdesk_client_list_tickets_paginates_until_a_short_page(tmp_path: Pa
     assert len(tickets) == 102
     pages = [call[1]["page"] for call in session.calls]
     assert pages == [1, 2]
+
+
+def test_freshdesk_client_ticket_listings_stop_at_freshdesks_page_cap() -> None:
+    # Regression (#52 review): a full page 300 led to a request for page 301,
+    # past the documented 300-page cap of the ticket list endpoint.
+    full_page = [{"id": i} for i in range(100)]
+    client, session = _client([_FakeResponse(200, full_page) for _ in range(TICKET_LIST_MAX_PAGES + 1)])
+
+    tickets = client.list_tickets()
+
+    assert len(tickets) == MAX_LISTED_TICKETS
+    assert [call[1]["page"] for call in session.calls] == list(range(1, TICKET_LIST_MAX_PAGES + 1))
+
+    client, session = _client([_FakeResponse(200, full_page) for _ in range(2 * TICKET_LIST_MAX_PAGES + 2)])
+    client.list_removed_ticket_ids()
+
+    assert max(call[1]["page"] for call in session.calls) == TICKET_LIST_MAX_PAGES
+    assert len(session.calls) == 2 * TICKET_LIST_MAX_PAGES
 
 
 def test_freshdesk_client_list_tickets_stops_on_an_empty_page() -> None:
