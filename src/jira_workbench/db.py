@@ -224,21 +224,40 @@ def _bootstrap_rows(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _open(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+def _open(path: Path, timeout: float) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=timeout)
     conn.row_factory = sqlite3.Row
+    # busy_timeout first, so switching to WAL waits out another
+    # connection's lock instead of failing straight away.
+    conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
-def connect(jira_dir: Path) -> sqlite3.Connection:
+# Only these mean the file itself is damaged. Anything else -- notably
+# SQLITE_BUSY/SQLITE_LOCKED ("database is locked") while another process
+# holds a lock -- is transient, and moving a healthy index.db aside for it
+# would throw away a good database.
+_CORRUPTION_ERROR_CODES = frozenset({sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB})
+
+
+def _is_corruption(exc: sqlite3.DatabaseError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        return False
+    # Extended result codes carry the primary code in their low byte.
+    return code in _CORRUPTION_ERROR_CODES or (code & 0xFF) in _CORRUPTION_ERROR_CODES
+
+
+def connect(jira_dir: Path, *, timeout: float = 5.0) -> sqlite3.Connection:
     path = db_path(jira_dir)
     try:
-        conn = _open(path)
+        conn = _open(path, timeout)
         conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-    except sqlite3.DatabaseError:
+    except sqlite3.DatabaseError as exc:
+        if not _is_corruption(exc):
+            raise
         if path.exists():
             corrupt_path = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
             logger.warning(
@@ -249,7 +268,7 @@ def connect(jira_dir: Path) -> sqlite3.Connection:
                 corrupt_path,
             )
             path.rename(corrupt_path)
-        conn = _open(path)
+        conn = _open(path, timeout)
     _run_migrations(conn)
     _bootstrap_rows(conn)
     return conn

@@ -97,6 +97,29 @@ def test_connect_recovers_from_a_corrupt_database_file(tmp_path: Path) -> None:
     assert len(corrupt_copies) == 1
 
 
+def test_connect_does_not_treat_a_locked_database_as_corrupt(tmp_path: Path) -> None:
+    # Regression (#53 review): any sqlite3.DatabaseError, including
+    # "database is locked" while another process held a lock, moved a
+    # healthy index.db aside as corrupt.
+    import pytest
+
+    path = db_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    holder = sqlite3.connect(path, isolation_level=None)
+    try:
+        holder.execute("PRAGMA journal_mode=DELETE")
+        holder.execute("CREATE TABLE t (x)")
+        holder.execute("BEGIN EXCLUSIVE")
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            connect(tmp_path, timeout=0.05)
+    finally:
+        holder.close()
+
+    assert list(tmp_path.glob("index.db.corrupt-*")) == []
+    assert path.exists()
+
+
 def test_reindex_items_populates_items_from_disk(tmp_path: Path) -> None:
     _write_issue(tmp_path, "SAT-1", "helm-chart", assignee={"displayName": "Serge Colle"})
     _write_issue(tmp_path, "SAT-2", "helm-chart")
