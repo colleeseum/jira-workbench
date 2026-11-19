@@ -2191,6 +2191,26 @@ def test_push_review_page_back_link_uses_return_to(tmp_path: Path) -> None:
     assert 'name="return_to" value="/?project=SAT"' in response.text
 
 
+@pytest.mark.parametrize(
+    "return_to",
+    ["javascript:alert(1)", "data:text/html,x", "//evil.example", "/\\evil.example", " javascript:alert(1)"],
+)
+def test_push_review_page_back_link_ignores_a_non_local_return_to(tmp_path: Path, return_to: str) -> None:
+    # The "Back to items" href is request-supplied; a scheme or a
+    # protocol-relative URL there would run script / leave the origin on
+    # click, so only a local path is honoured.
+    client = _synced_client(tmp_path)
+    set_field(tmp_path, "SAT-1", "summary", "Edited")
+
+    response = client.get("/items/push-review", params={"return_to": return_to})
+
+    assert '<a href="/">Back to items</a>' in response.text
+    assert 'name="return_to" value="/"' in response.text
+    assert "evil.example" not in response.text
+    assert "javascript:" not in response.text
+    assert "data:text" not in response.text
+
+
 def test_post_push_all_modified_pushes_every_shadow_and_clears_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2830,6 +2850,43 @@ def test_post_new_issue_warns_when_the_created_item_does_not_match_the_list_filt
     list_response = client.get(location, follow_redirects=False)
     assert 'class="flash flash-warning"' in list_response.text
     assert '<a href="/items/SAT-999">' in list_response.text
+
+
+@pytest.mark.parametrize(
+    "flash_href",
+    [
+        "javascript:alert(1)",
+        "JavaScript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "vbscript:msgbox(1)",
+        "//evil.example",
+        "/\\evil.example",
+        "/\t/evil.example",
+        " javascript:alert(1)",
+        "\x01javascript:alert(1)",
+        "https://evil.example/",
+    ],
+)
+def test_items_page_flash_link_is_dropped_for_a_non_local_href(tmp_path: Path, flash_href: str) -> None:
+    # flash_href comes straight from the query string; HTML escaping keeps
+    # the attribute intact but not the URL's scheme, so a crafted link
+    # could run script in the workbench origin on click. The message
+    # still shows, just without the link.
+    client = _synced_client(tmp_path)
+
+    response = client.get("/", params={"flash": "Open details", "flash_kind": "warning", "flash_href": flash_href})
+
+    assert '<p class="flash flash-warning">Open details</p>' in response.text
+    assert f'href="{html.escape(flash_href)}"' not in response.text
+    assert "evil.example" not in response.text
+
+
+def test_items_page_flash_link_keeps_a_local_path(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.get("/", params={"flash": "Open details", "flash_href": "/items/SAT-1?tab=comments"})
+
+    assert '<a href="/items/SAT-1?tab=comments">Open details</a>' in response.text
 
 
 def test_new_issue_page_return_to_round_trips_through_a_type_change_reload(

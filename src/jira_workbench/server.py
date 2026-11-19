@@ -1586,6 +1586,28 @@ function jiraWbBulkStatusChanged(select) {
 """
 
 
+def _local_href(value: str | None) -> str | None:
+    """Return ``value`` when it is safe to render as a same-origin link.
+
+    Request-supplied URLs (``flash_href``, ``return_to``) end up in
+    ``href`` attributes; HTML escaping keeps the attribute intact but does
+    nothing about the URL's scheme, so ``javascript:``/``data:`` links
+    would run in the workbench origin on click. Only a local absolute path
+    is accepted: one leading "/" not followed by "/" or "\\" (browsers
+    treat both as protocol-relative), and no whitespace, control
+    characters, or backslashes anywhere (browsers strip tabs/newlines and
+    fold "\\" into "/" before parsing, which could turn "/\\t/evil" into
+    "//evil"). Anything else yields None.
+    """
+    if not value or not value.startswith("/"):
+        return None
+    if len(value) > 1 and value[1] in "/\\":
+        return None
+    if any(ch <= " " or ch == "\x7f" or ch == "\\" for ch in value):
+        return None
+    return value
+
+
 def render_items_page(
     items: list[dict[str, Any]],
     total: int,
@@ -2141,8 +2163,9 @@ def render_items_page(
     if flash:
         kind = flash_kind or "success"
         message_html = html.escape(flash)
-        if flash_href:
-            message_html = f'<a href="{html.escape(flash_href)}">{message_html}</a>'
+        safe_flash_href = _local_href(flash_href)
+        if safe_flash_href:
+            message_html = f'<a href="{html.escape(safe_flash_href)}">{message_html}</a>'
         flash_banner = f'<p class="flash flash-{html.escape(kind)}">{message_html}</p>'
     # Counts every locally modified issue, not just whatever's currently
     # filtered/visible -- "is there anything anywhere that needs pushing"
@@ -5868,7 +5891,9 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # stays as-is for the Detail page's "Local diff" and the CLI) --
         # a unified diff of pretty-printed JSON is right for a terminal,
         # not a browser reader looking at a one-word field change.
-        return_to_value = return_to or "/"
+        # The "Back to items" link renders this request-supplied URL as an
+        # href, so it gets the same local-path check as flash links.
+        return_to_value = _local_href(return_to) or "/"
         keys = sorted(modified_issue_keys(jira_dir))
         sections = []
         for key in keys:
