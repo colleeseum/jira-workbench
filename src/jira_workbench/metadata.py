@@ -438,22 +438,30 @@ def write_project_registry(jira_dir: Path, projects: tuple[ProjectSettings, ...]
 
 
 def seed_project_registry(jira_dir: Path, projects: tuple[ProjectSettings, ...]) -> None:
-    """Fill in a registry entry for any project config.toml declares that the
-    registry has never recorded at all, so a freshly added `read_only = true`
-    takes effect on the very next command instead of staying "fully permissive"
-    (see load_project_registry) until someone happens to run a full `sync`.
+    """Bring the registry up to date with the current config's read-only
+    declarations on every command, so a freshly added `read_only = true`
+    takes effect immediately -- staging and pushing alike (see shadow.py's
+    push_key) -- instead of staying permissive (see load_project_registry)
+    until someone happens to run a full `sync`.
 
-    Deliberately additive-only: a project already present in the registry --
-    however it got there -- is left untouched, even if this config disagrees
-    (e.g. a `--config` pointed at a file without read_only info). Only
-    write_project_registry's full overwrite, from `sync`, may change or
-    remove an existing entry; this only ever adds ones that were missing."""
+    Fills in an entry for any project the registry has never recorded, and
+    marks an existing entry read-only when the config now declares it so.
+    It never loosens: a project already present in the registry as read-only
+    stays read-only even if this config disagrees (e.g. a `--config` pointed
+    at a file without read_only info). Only write_project_registry's full
+    overwrite, from `sync`, may clear read-only or remove an entry."""
     existing = load_project_registry(jira_dir)
-    missing = {p.key: p for p in projects if p.key not in existing}
-    if not missing:
+    updates = {
+        p.key: {"readOnly": p.read_only, "default": p.default}
+        for p in projects
+        if p.key not in existing or (p.read_only and not existing[p.key]["readOnly"])
+    }
+    for key, entry in updates.items():
+        if key in existing:
+            entry["default"] = existing[key]["default"]
+    if not updates:
         return
-    merged = {**existing, **{key: {"readOnly": p.read_only, "default": p.default} for key, p in missing.items()}}
-    write_json(project_registry_path(jira_dir), {"projects": merged})
+    write_json(project_registry_path(jira_dir), {"projects": {**existing, **updates}})
 
 
 def load_project_registry(jira_dir: Path) -> dict[str, dict[str, bool]]:

@@ -163,9 +163,16 @@ read_only = true
 - Exactly one entry may set `default = true` -- this is the project the TUI
   opens against and the one `jira-wb issue create` targets when `--project`
   isn't passed.
-- `read_only = true` blocks field/status edits, pushes, and new-issue creation
-  for that project everywhere (CLI and TUI) -- **adding a comment still always
-  works**, even on a read-only project, since comments are never blocked.
+- `read_only = true` blocks field/status edits and new-issue creation for that
+  project everywhere (CLI, TUI, and web UI). It is also enforced at push time:
+  field/status changes staged before the project became read-only are refused
+  by `shadow push` (and the TUI/web push actions) and stay staged. **Comments
+  still always work**, even on a read-only project: comment additions, edits,
+  and deletions are pushed, and a shadow mixing both pushes its comment
+  changes and keeps only the refused field/status changes staged.
+- Setting `read_only = true` takes effect on the next command, without a
+  sync. Removing it (making a project writable again) takes effect after the
+  next `jira-wb sync`.
 - All projects share the same `jira_url`/`jira_email`/`jira_api_token` --
   multi-project support assumes one Jira Cloud site with shared credentials,
   not several separate instances.

@@ -504,13 +504,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # Seed the on-disk read-only/default registry for any project config.toml
-    # declares that the registry has never recorded at all -- otherwise
-    # is_project_read_only() defaults such a project to "fully permissive"
-    # until a full `sync` happens to run for it first. This only fills in
-    # missing keys; it never touches an entry the registry already has
-    # (that stays authoritative, and only `sync`'s full write_project_registry
-    # call is allowed to change it -- see is_project_read_only/shadow.py).
+    # Bring the on-disk read-only/default registry up to date with this
+    # config before any command runs -- otherwise a project newly declared
+    # (or newly marked `read_only = true`) stays "fully permissive" for
+    # staging and pushing until a full `sync` happens to run. This only adds
+    # missing entries and tightens to read-only; clearing read-only is left
+    # to `sync`'s full write_project_registry (see seed_project_registry).
     seed_project_registry(resolve_jira_dir(getattr(args, "jira_dir", None), config.jira_dir), config.resolved_projects())
 
     if args.command == "sync":

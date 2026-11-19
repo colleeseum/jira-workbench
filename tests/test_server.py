@@ -2037,6 +2037,24 @@ def test_post_item_push_succeeds_and_clears_the_shadow(tmp_path: Path, monkeypat
     assert push_client.update_calls
 
 
+def test_post_item_push_refuses_a_field_shadow_once_the_project_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression (#53 review, #11): staged while writable, then marked read-only.
+    client = _synced_client(tmp_path, _pushable_config())
+    set_field(tmp_path, "SAT-1", "summary", "Edited via web")
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True),))
+    push_client = PushJiraClient(updated="2026-07-20T00:00:01.000+0000")
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: push_client)
+
+    response = client.post("/items/SAT-1/push", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert "flash_kind=error" in response.headers["location"]
+    assert push_client.update_calls == []
+    assert load_shadow(tmp_path, "SAT-1")["fields"] == {"summary": "Edited via web"}
+
+
 def test_post_item_push_without_jira_credentials_flashes_an_error(tmp_path: Path) -> None:
     client = _synced_client(tmp_path)
     set_field(tmp_path, "SAT-1", "summary", "Edited")

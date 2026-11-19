@@ -61,6 +61,7 @@ from jira_workbench.metadata import (
     refresh_versions_api,
     remember_field_names,
     resolve_version_id,
+    seed_project_registry,
     set_board_active,
     set_component_archived,
     set_local_board_filters,
@@ -323,6 +324,30 @@ def test_is_project_read_only_true_for_a_registered_read_only_project(tmp_path: 
 def test_is_project_read_only_permissive_when_registry_missing_or_project_unknown(tmp_path: Path) -> None:
     assert is_project_read_only(tmp_path, "SAT") is False
     assert is_project_read_only(tmp_path, None) is False
+
+
+def test_seed_project_registry_adds_missing_projects_and_tightens_to_read_only(tmp_path: Path) -> None:
+    write_project_registry(
+        tmp_path,
+        (ProjectSettings(key="SAT", default=True), ProjectSettings(key="OTHERPROJ", read_only=True)),
+    )
+
+    seed_project_registry(
+        tmp_path,
+        (
+            ProjectSettings(key="SAT", read_only=True),
+            ProjectSettings(key="OTHERPROJ", read_only=False),
+            ProjectSettings(key="NEW", read_only=True),
+        ),
+    )
+
+    # SAT flipped to read-only without a sync takes effect; OTHERPROJ is never
+    # loosened by seeding (only sync's full write may clear read-only).
+    assert load_project_registry(tmp_path) == {
+        "SAT": {"readOnly": True, "default": True},
+        "OTHERPROJ": {"readOnly": True, "default": False},
+        "NEW": {"readOnly": True, "default": False},
+    }
 
 
 def test_load_board_settings_permissive_when_missing(tmp_path: Path) -> None:

@@ -1425,6 +1425,50 @@ def test_shadow_push_resolves_the_component_field_per_issue_project(
     assert resolve("PLAT-7") == "components"
 
 
+def test_shadow_push_refuses_once_config_marks_the_project_read_only_without_a_sync(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The registry (written by the last sync) still says SAT is writable; the
+    # config now says read-only. The next push must honor the config.
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+    from jira_workbench.shadow import load_shadow, set_field
+    from test_shadow import synced_jira_dir
+
+    class NoJiraClient:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"read-only push must not call Jira ({name})")
+
+    jira_dir = synced_jira_dir(tmp_path / "jira")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=False),))
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: NoJiraClient())
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "read_only = true",
+            ]
+        )
+        + "\n"
+    )
+
+    code = main(["--config", str(config_path), "shadow", "push", "SAT-1"])
+
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "failed=1" in captured.out
+    assert "project SAT is read-only" in captured.err
+    assert load_shadow(jira_dir, "SAT-1")["fields"] == {"summary": "New summary"}
+
+
 def test_versions_filter_is_read_from_config(tmp_path: Path) -> None:
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text("[versions]\nfilter = \"helm-chart-sa 3\\\\.[45]\"\n")

@@ -736,6 +736,45 @@ def refresh_local_issue_after_push(
     )
 
 
+COMMENT_SHADOW_KEYS = ("comments", "commentEdits", "commentDeletes")
+FIELD_SHADOW_KEYS = ("fields", "statusChange")
+
+
+def shadow_has_field_changes(shadow: dict[str, Any]) -> bool:
+    return any(shadow.get(name) for name in FIELD_SHADOW_KEYS)
+
+
+def shadow_has_comment_changes(shadow: dict[str, Any]) -> bool:
+    comments = shadow.get("comments")
+    if isinstance(comments, list) and any(
+        isinstance(comment, dict) and comment.get("state") != "pushed" for comment in comments
+    ):
+        return True
+    return bool(shadow.get("commentEdits")) or bool(shadow.get("commentDeletes"))
+
+
+def withheld_read_only_changes(jira_dir: Path, key: str, shadow: dict[str, Any]) -> str | None:
+    """The read-only project key when `shadow` stages field/status changes
+    for an issue in a read-only project (which must not be pushed), else None."""
+    if not shadow_has_field_changes(shadow):
+        return None
+    issue = read_json(issue_path(jira_dir, key)) if issue_path(jira_dir, key).exists() else None
+    project = issue_project_key(issue) if isinstance(issue, dict) else None
+    return project if project and is_project_read_only(jira_dir, project) else None
+
+
+def comment_only_shadow(shadow: dict[str, Any]) -> dict[str, Any]:
+    stripped = {name: value for name, value in shadow.items() if name not in FIELD_SHADOW_KEYS}
+    stripped["fields"] = {}
+    return stripped
+
+
+def field_only_shadow(shadow: dict[str, Any]) -> dict[str, Any]:
+    stripped = {name: value for name, value in shadow.items() if name not in COMMENT_SHADOW_KEYS}
+    stripped["comments"] = []
+    return stripped
+
+
 def push_key(
     jira_dir: Path,
     key: str,
@@ -749,6 +788,20 @@ def push_key(
     shadow = load_shadow(jira_dir, key)
     if shadow is None:
         return "skipped"
+
+    # Read-only is enforced again here, not only at staging time: a shadow
+    # staged while its project was writable must not reach Jira once the
+    # project is read-only. Comments stay allowed, so a mixed shadow pushes
+    # just its comment changes and keeps the field/status part staged.
+    withheld = withheld_read_only_changes(jira_dir, key, shadow)
+    if withheld is not None:
+        if not shadow_has_comment_changes(shadow):
+            raise ShadowError(
+                f"{key}: project {withheld} is read-only; staged field/status changes were not pushed "
+                "(revert them; comments are still allowed)"
+            )
+        withheld_shadow = shadow
+        shadow = comment_only_shadow(shadow)
 
     current_updated = remote_updated(jira_client, key)
     if shadow.get("baseUpdated") != current_updated:
@@ -781,6 +834,11 @@ def push_key(
         )
 
     if dry_run:
+        if withheld is not None:
+            raise ShadowError(
+                f"{key}: project {withheld} is read-only; would push only its comment changes "
+                "(staged field/status changes would stay staged)"
+            )
         if progress:
             progress(f"{key}: would push")
         return "pushed"
@@ -851,6 +909,12 @@ def push_key(
     refresh_local_issue_after_push(
         jira_dir, key, jira_client, component_field, index_component_fields=index_component_fields
     )
+    if withheld is not None:
+        save_shadow(jira_dir, key, field_only_shadow(withheld_shadow))
+        raise ShadowError(
+            f"{key}: comments pushed, but project {withheld} is read-only; "
+            "staged field/status changes were not pushed and remain staged"
+        )
     delete_shadow(jira_dir, key)
     if progress:
         progress(f"{key}: pushed")

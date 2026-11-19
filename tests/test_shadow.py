@@ -458,6 +458,76 @@ def test_set_field_allowed_when_no_registry_exists_at_all(tmp_path: Path) -> Non
     assert shadow["fields"]["summary"] == "New summary"
 
 
+def test_push_refuses_field_edits_staged_before_the_project_became_read_only(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    set_field(jira_dir, "SAT-1", "status", "Done")
+    commit_shadow(jira_dir, "SAT-1")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.failed == 1
+    assert result.pushed == 0
+    assert "project SAT is read-only" in result.errors[0]
+    assert client.update_calls == []
+    assert client.transition_calls == []
+    assert load_shadow(jira_dir, "SAT-1")["fields"] == {"summary": "New summary", "status": "Done"}
+
+
+def test_push_dry_run_reports_read_only_field_edits_as_refused(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+
+    result = push_shadows(
+        jira_dir, ["SAT-1"], PushJiraClient("2026-07-20T00:00:01.000+0000"), dry_run=True, progress=None
+    )
+
+    assert result.failed == 1
+    assert "read-only" in result.errors[0]
+
+
+def test_push_still_pushes_comment_only_shadows_on_a_read_only_project(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    add_comment(jira_dir, "SAT-1", "Local comment")
+    edit_comment(jira_dir, "SAT-1", "10001", "Edited body")
+    delete_comment(jira_dir, "SAT-1", "10002")
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    assert client.add_comment_calls == [("SAT-1", "Local comment")]
+    assert client.edit_comment_calls == [("SAT-1", "10001", "Edited body")]
+    assert len(client.deleted_paths) == 1
+    assert load_shadow(jira_dir, "SAT-1") is None
+
+
+def test_push_of_a_mixed_shadow_on_a_read_only_project_pushes_comments_and_keeps_fields_staged(
+    tmp_path: Path,
+) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    set_status_change(jira_dir, "SAT-1", resolution="Done")
+    add_comment(jira_dir, "SAT-1", "Local comment")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.failed == 1
+    assert "comments pushed" in result.errors[0]
+    assert client.add_comment_calls == [("SAT-1", "Local comment")]
+    assert client.update_calls == []
+    remaining = load_shadow(jira_dir, "SAT-1")
+    assert remaining["fields"] == {"summary": "New summary"}
+    assert remaining["statusChange"] == {"resolution": "Done"}
+    assert remaining["comments"] == []
+
+
 def test_set_field_and_delete_shadow_keep_the_sql_index_has_shadow_flag_current(tmp_path: Path) -> None:
     # save_shadow/delete_shadow are the choke point that keeps
     # db.items.has_shadow accurate between reindexes -- this must happen
