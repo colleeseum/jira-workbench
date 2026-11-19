@@ -3,7 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from .metadata import is_project_read_only
 from .sync import (
+    ComponentFields,
     build_manifest,
     component_slug,
     find_existing_issue,
@@ -147,12 +148,18 @@ def new_shadow(jira_dir: Path, key: str) -> dict[str, Any]:
 def save_shadow(jira_dir: Path, key: str, shadow: dict[str, Any]) -> None:
     shadow["updatedAt"] = now()
     write_json(shadow_path(jira_dir, key), shadow)
+    from . import db as _db  # deferred: avoid a module-level import cycle (db -> view -> shadow)
+
+    _db.set_item_has_shadow(jira_dir, key, True)
 
 
 def delete_shadow(jira_dir: Path, key: str) -> None:
     path = shadow_path(jira_dir, key)
     if path.exists():
         path.unlink()
+    from . import db as _db  # deferred: avoid a module-level import cycle (db -> view -> shadow)
+
+    _db.set_item_has_shadow(jira_dir, key, False)
 
 
 def ensure_shadow(jira_dir: Path, key: str) -> dict[str, Any]:
@@ -690,9 +697,16 @@ def refresh_local_issue_after_push(
     key: str,
     jira_client: JiraClient,
     component_field: str,
+    *,
+    index_component_fields: ComponentFields = None,
 ) -> None:
+    """Re-fetches one issue after a push/create into the local cache, then
+    rebuilds the index. `component_field` picks this issue's folder; the
+    rebuild covers every synced project, so pass `index_component_fields`
+    (project key -> component field) to derive each issue's component with its
+    own project's field -- without it `component_field` is applied to all."""
     try:
-        issue = jira_client.get_issue(key, fields="*all")
+        issue = jira_client.get_issue(key, fields="*all", expand="changelog")
     except Exception as exc:
         raise ShadowError(f"{key}: Jira push succeeded but local refresh failed: {exc}") from exc
     if not isinstance(issue, dict):
@@ -714,7 +728,51 @@ def refresh_local_issue_after_push(
 
     if old_dest is not None and old_dest != dest and old_dest.exists():
         shutil.rmtree(old_dest)
-    build_manifest(jira_dir)
+    build_manifest(
+        jira_dir,
+        {**index_component_fields, issue_project_key(issue) or "": component_field}
+        if isinstance(index_component_fields, Mapping)
+        else component_field,
+    )
+
+
+COMMENT_SHADOW_KEYS = ("comments", "commentEdits", "commentDeletes")
+FIELD_SHADOW_KEYS = ("fields", "statusChange")
+
+
+def shadow_has_field_changes(shadow: dict[str, Any]) -> bool:
+    return any(shadow.get(name) for name in FIELD_SHADOW_KEYS)
+
+
+def shadow_has_comment_changes(shadow: dict[str, Any]) -> bool:
+    comments = shadow.get("comments")
+    if isinstance(comments, list) and any(
+        isinstance(comment, dict) and comment.get("state") != "pushed" for comment in comments
+    ):
+        return True
+    return bool(shadow.get("commentEdits")) or bool(shadow.get("commentDeletes"))
+
+
+def withheld_read_only_changes(jira_dir: Path, key: str, shadow: dict[str, Any]) -> str | None:
+    """The read-only project key when `shadow` stages field/status changes
+    for an issue in a read-only project (which must not be pushed), else None."""
+    if not shadow_has_field_changes(shadow):
+        return None
+    issue = read_json(issue_path(jira_dir, key)) if issue_path(jira_dir, key).exists() else None
+    project = issue_project_key(issue) if isinstance(issue, dict) else None
+    return project if project and is_project_read_only(jira_dir, project) else None
+
+
+def comment_only_shadow(shadow: dict[str, Any]) -> dict[str, Any]:
+    stripped = {name: value for name, value in shadow.items() if name not in FIELD_SHADOW_KEYS}
+    stripped["fields"] = {}
+    return stripped
+
+
+def field_only_shadow(shadow: dict[str, Any]) -> dict[str, Any]:
+    stripped = {name: value for name, value in shadow.items() if name not in COMMENT_SHADOW_KEYS}
+    stripped["comments"] = []
+    return stripped
 
 
 def push_key(
@@ -725,10 +783,25 @@ def push_key(
     dry_run: bool = False,
     progress: Progress | None = print,
     component_field: str = "components",
+    index_component_fields: ComponentFields = None,
 ) -> str:
     shadow = load_shadow(jira_dir, key)
     if shadow is None:
         return "skipped"
+
+    # Read-only is enforced again here, not only at staging time: a shadow
+    # staged while its project was writable must not reach Jira once the
+    # project is read-only. Comments stay allowed, so a mixed shadow pushes
+    # just its comment changes and keeps the field/status part staged.
+    withheld = withheld_read_only_changes(jira_dir, key, shadow)
+    if withheld is not None:
+        if not shadow_has_comment_changes(shadow):
+            raise ShadowError(
+                f"{key}: project {withheld} is read-only; staged field/status changes were not pushed "
+                "(revert them; comments are still allowed)"
+            )
+        withheld_shadow = shadow
+        shadow = comment_only_shadow(shadow)
 
     current_updated = remote_updated(jira_client, key)
     if shadow.get("baseUpdated") != current_updated:
@@ -761,6 +834,11 @@ def push_key(
         )
 
     if dry_run:
+        if withheld is not None:
+            raise ShadowError(
+                f"{key}: project {withheld} is read-only; would push only its comment changes "
+                "(staged field/status changes would stay staged)"
+            )
         if progress:
             progress(f"{key}: would push")
         return "pushed"
@@ -828,7 +906,15 @@ def push_key(
             except Exception as exc:
                 raise ShadowError(f"{key}: could not delete comment {comment_id}: {exc}") from exc
 
-    refresh_local_issue_after_push(jira_dir, key, jira_client, component_field)
+    refresh_local_issue_after_push(
+        jira_dir, key, jira_client, component_field, index_component_fields=index_component_fields
+    )
+    if withheld is not None:
+        save_shadow(jira_dir, key, field_only_shadow(withheld_shadow))
+        raise ShadowError(
+            f"{key}: comments pushed, but project {withheld} is read-only; "
+            "staged field/status changes were not pushed and remain staged"
+        )
     delete_shadow(jira_dir, key)
     if progress:
         progress(f"{key}: pushed")
@@ -843,7 +929,13 @@ def push_shadows(
     dry_run: bool = False,
     progress: Progress | None = print,
     component_field: str = "components",
+    component_field_for: Callable[[str], str] | None = None,
+    index_component_fields: ComponentFields = None,
 ) -> PushResult:
+    """Pushes the staged shadows for `keys` (all shadows when empty). `component_field_for`
+    resolves each issue's own project's component field, for pushes spanning several projects;
+    without it every issue uses `component_field`. `index_component_fields` is passed to each
+    post-push index rebuild (see refresh_local_issue_after_push)."""
     selected, dependencies = order_push_keys(jira_dir, keys or all_shadow_keys(jira_dir))
     selected_set = set(selected)
     pushed = skipped = blocked = failed = 0
@@ -877,7 +969,8 @@ def push_shadows(
                 jira_client,
                 dry_run=dry_run,
                 progress=progress,
-                component_field=component_field,
+                component_field=component_field_for(key) if component_field_for else component_field,
+                index_component_fields=index_component_fields,
             )
         except ShadowError as exc:
             failed += 1

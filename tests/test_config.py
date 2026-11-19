@@ -9,6 +9,7 @@ import pytest
 from jira_workbench.config import (
     DEFAULT_JIRA_DIR,
     ConfigError,
+    FreshdeskSettings,
     ProjectSettings,
     WorkbenchConfig,
     load_config,
@@ -132,6 +133,146 @@ def test_effective_history_months_none_when_nothing_configured() -> None:
     config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
 
     assert config.effective_history_months("SAT") is None
+
+
+def test_load_config_reads_project_exclude_assignees(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[projects]]",
+                'key = "SAT"',
+                'exclude_assignees = ["Matt Petrillo", "Rafael Campo"]',
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.projects == (ProjectSettings(key="SAT", exclude_assignees=("Matt Petrillo", "Rafael Campo")),)
+
+
+def test_load_config_rejects_non_string_exclude_assignees(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\nexclude_assignees = [1, 2]\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_excluded_assignees_is_case_insensitive() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT", exclude_assignees=("Matt Petrillo",)),))
+
+    assert config.excluded_assignees("SAT") == {"matt petrillo"}
+
+
+def test_excluded_assignees_empty_for_unknown_project_or_unconfigured() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
+
+    assert config.excluded_assignees("SAT") == frozenset()
+
+
+def test_load_config_reads_project_fix_version_single_select(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\nfix_version_single_select = true\n')
+
+    config = load_config(path)
+
+    assert config.projects == (ProjectSettings(key="SAT", fix_version_single_select=True),)
+
+
+def test_load_config_rejects_non_bool_fix_version_single_select(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\nfix_version_single_select = "yes"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_fix_version_single_select_project_defaults_to_false() -> None:
+    config = WorkbenchConfig(projects=(ProjectSettings(key="SAT"),))
+
+    assert config.fix_version_single_select_project("SAT") is False
+    assert config.fix_version_single_select_project("UNKNOWN") is False
+
+
+def test_fix_version_single_select_project_reads_the_matching_project() -> None:
+    config = WorkbenchConfig(
+        projects=(ProjectSettings(key="SAT", fix_version_single_select=True), ProjectSettings(key="PLAT"))
+    )
+
+    assert config.fix_version_single_select_project("SAT") is True
+    assert config.fix_version_single_select_project("PLAT") is False
+    assert config.excluded_assignees("SOMETHING") == frozenset()
+
+
+def test_load_config_reads_project_component_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "",
+                "[[projects]]",
+                'key = "PLAT"',
+                "read_only = true",
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.projects == (
+        ProjectSettings(key="SAT", default=True, component_field="customfield_10071"),
+        ProjectSettings(key="PLAT", read_only=True),
+    )
+
+
+def test_load_config_rejects_blank_project_component_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "SAT"\ncomponent_field = ""\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_effective_component_field_uses_project_override_with_no_cross_project_fallback() -> None:
+    config = WorkbenchConfig(
+        component_field="customfield_10071",
+        projects=(
+            ProjectSettings(key="SAT", component_field="customfield_10071"),
+            ProjectSettings(key="PLAT"),
+        ),
+    )
+
+    assert config.effective_component_field("SAT") == "customfield_10071"
+    assert config.effective_component_field("PLAT") is None
+    assert config.effective_component_field("UNKNOWN") is None
+
+
+def test_effective_component_field_falls_back_to_flat_value_in_legacy_single_project_config() -> None:
+    config = WorkbenchConfig(project="SAT", component_field="customfield_10071")
+
+    assert config.effective_component_field("SAT") == "customfield_10071"
+
+
+def test_component_fields_by_project_maps_every_configured_project_to_its_own_field() -> None:
+    config = WorkbenchConfig(
+        component_field="customfield_10071",
+        projects=(
+            ProjectSettings(key="SAT", component_field="customfield_10071"),
+            ProjectSettings(key="PLAT"),
+        ),
+    )
+
+    assert config.component_fields_by_project() == {"SAT": "customfield_10071", "PLAT": None}
+    assert WorkbenchConfig(project="SAT", component_field="customfield_10050").component_fields_by_project() == {
+        "SAT": "customfield_10050"
+    }
 
 
 def test_resolved_projects_falls_back_to_flat_project_key() -> None:
@@ -425,3 +566,187 @@ def test_save_view_defaults_rejects_unparseable_existing_file(tmp_path: Path) ->
 
     with pytest.raises(ConfigError):
         save_view_defaults(path, {"component": "helm-chart"})
+
+
+def test_load_config_reads_freshdesk_sources(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'domain = "acme"',
+                'api_key = "secret"',
+            ]
+        )
+    )
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources == (FreshdeskSettings(slug="freshdesk", domain="acme", api_key="secret"),)
+
+
+def test_load_config_rejects_the_reserved_jira_source_slug(tmp_path: Path) -> None:
+    # The index bootstraps a "jira" source row; a Freshdesk source sharing that slug would convert it
+    # and let each source's reindex delete the other's items.
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\nslug = "jira"\ndomain = "acme"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError, match="reserved"):
+        load_config(path)
+
+
+def test_reserved_source_slug_matches_the_index_default() -> None:
+    from jira_workbench.config import RESERVED_SOURCE_SLUGS
+    from jira_workbench.db import DEFAULT_SOURCE_SLUG
+
+    assert DEFAULT_SOURCE_SLUG in RESERVED_SOURCE_SLUGS
+
+
+@pytest.mark.parametrize(
+    "project_config",
+    ['project = "FD"', '[[projects]]\nkey = "fd"', '[[projects]]\nkey = "SAT"\n[[projects]]\nkey = "FD"'],
+)
+def test_load_config_rejects_jira_project_fd_alongside_a_freshdesk_source(tmp_path: Path, project_config: str) -> None:
+    # Freshdesk tickets are keyed FD-<id>; a Jira project FD would make FD-123 ambiguous.
+    path = tmp_path / "config.toml"
+    path.write_text(project_config + '\n[[sources]]\nkind = "freshdesk"\ndomain = "acme"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError, match="FD"):
+        load_config(path)
+
+
+def test_load_config_allows_jira_project_fd_without_a_freshdesk_source(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[projects]]\nkey = "FD"\n')
+
+    assert load_config(path).projects[0].key == "FD"
+
+
+def test_load_config_freshdesk_domain_strips_an_accidental_scheme(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "https://acme.freshdesk.com"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].domain == "acme"
+
+
+def test_load_config_freshdesk_domain_strips_the_freshdesk_com_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme.freshdesk.com"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].domain == "acme"
+
+
+def test_load_config_freshdesk_domain_strips_a_trailing_path(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme.freshdesk.com/api/v2"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].domain == "acme"
+
+
+def test_load_config_rejects_a_custom_cname_domain(tmp_path: Path) -> None:
+    # Freshdesk's API explicitly doesn't work via a custom CNAME even if
+    # the support portal itself is branded with one -- a value like this
+    # would otherwise silently build an unreachable
+    # "support.example.com.freshdesk.com" URL.
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "support.example.com"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_freshdesk_source_slug_defaults_to_kind(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme"\napi_key = "secret"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].slug == "freshdesk"
+
+
+def test_load_config_reads_freshdesk_source_explicit_slug(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[[sources]]\nkind = "freshdesk"\nslug = "support"\ndomain = "acme"\napi_key = "secret"\n'
+    )
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources[0].slug == "support"
+
+
+def test_load_config_rejects_unrecognized_source_kind(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "linear"\ndomain = "acme"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_freshdesk_source_without_domain(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\napi_key = "secret"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_freshdesk_source_without_api_key(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sources]]\nkind = "freshdesk"\ndomain = "acme"\n')
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_duplicate_source_slugs(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'slug = "support"',
+                'domain = "acme"',
+                'api_key = "secret"',
+                "",
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'slug = "support"',
+                'domain = "other"',
+                'api_key = "secret2"',
+            ]
+        )
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_more_than_one_freshdesk_source(tmp_path: Path) -> None:
+    # Every Freshdesk source shares jira_dir/freshdesk/ (cursor, tickets, metadata) and the FD-<id>
+    # key space, so two accounts with distinct slugs would still overwrite and collide (issue #60).
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[[sources]]\nkind = "freshdesk"\nslug = "support"\ndomain = "acme"\napi_key = "secret"\n'
+        '[[sources]]\nkind = "freshdesk"\nslug = "helpdesk"\ndomain = "other"\napi_key = "secret2"\n'
+    )
+
+    with pytest.raises(ConfigError, match="only one \\[\\[sources\\]\\] Freshdesk entry"):
+        load_config(path)
+
+
+def test_load_config_with_no_sources_array_has_no_freshdesk_sources(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('project = "SAT"\n')
+
+    config = load_config(path)
+
+    assert config.freshdesk_sources == ()

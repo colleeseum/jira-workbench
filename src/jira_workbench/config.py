@@ -25,11 +25,21 @@ class ConfigError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class FreshdeskSettings:
+    slug: str
+    domain: str
+    api_key: str
+
+
+@dataclass(frozen=True)
 class ProjectSettings:
     key: str
     default: bool = False
     read_only: bool = False
     history_months: int | None = None
+    component_field: str | None = None
+    exclude_assignees: tuple[str, ...] = ()
+    fix_version_single_select: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +51,7 @@ class WorkbenchConfig:
     jira_email: str | None = None
     jira_api_token: str | None = None
     projects: tuple[ProjectSettings, ...] = ()
+    freshdesk_sources: tuple[FreshdeskSettings, ...] = ()
     sync_history_months: int | None = None
     view_project: tuple[str, ...] | None = None
     view_status: tuple[str, ...] | None = None
@@ -82,6 +93,61 @@ class WorkbenchConfig:
 
     def read_only_project_keys(self) -> frozenset[str]:
         return frozenset(project.key for project in self.resolved_projects() if project.read_only)
+
+    def excluded_assignees(self, project_key: str | None) -> frozenset[str]:
+        """Names to hide from the ASSIGN dropdown regardless of what Jira's
+        own APIs say -- a manual, user-maintained escape hatch for people
+        who've stopped actually working on a project but still hold a
+        project role Jira never got cleaned up (confirmed in practice:
+        neither the "assignable users" search nor Administrator/Member
+        project-role membership reliably reflects this, since both depend
+        on someone remembering to update Jira's own access settings)."""
+        for project in self.resolved_projects():
+            if project.key == project_key:
+                return frozenset(name.strip().lower() for name in project.exclude_assignees)
+        return frozenset()
+
+    def fix_version_single_select_project(self, project_key: str | None) -> bool:
+        """Whether this project's Fix Version field should only ever allow
+        one selection at a time -- a workbench-local preference (not read
+        from Jira's own field configuration, which would need an extra,
+        admin-gated API call), off by default (Jira issues can genuinely
+        have more than one fix version, and most projects use that)."""
+        for project in self.resolved_projects():
+            if project.key == project_key:
+                return project.fix_version_single_select
+        return False
+
+    def effective_component_field(self, project_key: str | None) -> str | None:
+        """Which Jira field holds "components" for this project -- a
+        project's own `component_field` wins. Unlike `effective_history_months`,
+        a [[projects]] config does NOT fall back to the top-level
+        `component_field` for a project that doesn't set its own: a wrong
+        custom-field id silently blanks out that project's real component
+        data at sync time (see sync.py's component_slug), so leaking one
+        project's custom field onto another is actively harmful, not just a
+        missing default. The top-level value only still applies to the
+        legacy single-project (`project = "..."`, no [[projects]] array)
+        config, where there's exactly one project anyway."""
+        if self.projects:
+            for project in self.projects:
+                if project.key == project_key:
+                    return project.component_field
+            return None
+        return self.component_field
+
+    def component_fields_by_project(self) -> dict[str, str | None]:
+        """Every configured project's own component field (None meaning Jira's
+        native `components`), for code that derives components for issues of
+        several projects at once -- an index rebuild covers every synced project,
+        so a single field would be wrong for all but one of them."""
+        return {project.key: self.effective_component_field(project.key) for project in self.resolved_projects()}
+
+    def component_field_for_issue(self, issue_key: str) -> str:
+        """The component field of the project an issue key belongs to (a Jira issue key is always
+        `<PROJECT>-<number>`), defaulting to Jira's native `components` field."""
+        project_key = issue_key.rsplit("-", 1)[0] if "-" in issue_key else None
+        return self.effective_component_field(project_key) or "components"
 
     def effective_history_months(self, project_key: str | None) -> int | None:
         """How many months of statusCategory=Done history to sync for this
@@ -143,7 +209,7 @@ def load_config(path: Path) -> WorkbenchConfig:
     if not isinstance(issue, dict):
         raise ConfigError(f"invalid config file {expanded}: [issue] must be a table")
 
-    return WorkbenchConfig(
+    config = WorkbenchConfig(
         project=optional_string(data, "project", expanded),
         component_field=optional_string(data, "component_field", expanded),
         jira_dir=optional_string(data, "jira_dir", expanded),
@@ -151,6 +217,7 @@ def load_config(path: Path) -> WorkbenchConfig:
         jira_email=optional_string(data, "jira_email", expanded),
         jira_api_token=optional_string(data, "jira_api_token", expanded),
         projects=parse_projects(data.get("projects"), expanded),
+        freshdesk_sources=parse_freshdesk_sources(data.get("sources"), expanded),
         sync_history_months=optional_positive_int(data, "sync_history_months", expanded),
         view_project=optional_string_tuple(view, "project", expanded),
         view_status=optional_string_tuple(view, "status", expanded),
@@ -172,6 +239,30 @@ def load_config(path: Path) -> WorkbenchConfig:
         host=optional_string(serve, "host", expanded),
         port=optional_int(serve, "port", expanded),
     )
+    reject_freshdesk_key_collision(config, expanded)
+    return config
+
+
+def reject_freshdesk_key_collision(config: WorkbenchConfig, path: Path) -> None:
+    """A Jira project keyed FD would produce issue keys such as FD-123 that are identical to a
+    Freshdesk ticket's key, so the item list, detail pages and API could not tell them apart."""
+    if not config.freshdesk_sources:
+        return
+    keys = [config.project or ""] + [project.key for project in config.projects]
+    if any(key.strip().upper() == FRESHDESK_KEY_PREFIX for key in keys):
+        raise ConfigError(
+            f"invalid config file {path}: Jira project key {FRESHDESK_KEY_PREFIX!r} conflicts with "
+            f"Freshdesk ticket keys ({FRESHDESK_KEY_PREFIX}-<id>) while a Freshdesk source is configured"
+        )
+
+
+# Slugs the local index already uses for its own sources (db.DEFAULT_SOURCE_SLUG). A Freshdesk
+# source sharing one would take over that source's rows, and each reindex would delete the other's
+# items.
+RESERVED_SOURCE_SLUGS = frozenset({"jira"})
+
+# Freshdesk tickets are indexed and served as FD-<id> (freshdesk.ticket_key).
+FRESHDESK_KEY_PREFIX = "FD"
 
 
 def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
@@ -195,12 +286,107 @@ def parse_projects(value: Any, path: Path) -> tuple[ProjectSettings, ...]:
         history_months = entry.get("history_months")
         if history_months is not None and (not isinstance(history_months, int) or history_months <= 0):
             raise ConfigError(f"invalid config file {path}: projects.history_months must be a positive integer")
+        component_field = optional_string(entry, "component_field", path)
+        exclude_assignees_raw = entry.get("exclude_assignees", [])
+        if not isinstance(exclude_assignees_raw, list) or not all(isinstance(item, str) for item in exclude_assignees_raw):
+            raise ConfigError(f"invalid config file {path}: projects.exclude_assignees must be an array of strings")
+        fix_version_single_select = entry.get("fix_version_single_select", False)
+        if not isinstance(fix_version_single_select, bool):
+            raise ConfigError(f"invalid config file {path}: projects.fix_version_single_select must be a boolean")
         projects.append(
-            ProjectSettings(key=key, default=default, read_only=read_only, history_months=history_months)
+            ProjectSettings(
+                key=key,
+                default=default,
+                read_only=read_only,
+                history_months=history_months,
+                component_field=component_field,
+                exclude_assignees=tuple(exclude_assignees_raw),
+                fix_version_single_select=fix_version_single_select,
+            )
         )
     if sum(1 for p in projects if p.default) > 1:
         raise ConfigError(f"invalid config file {path}: only one [[projects]] entry may set default = true")
     return tuple(projects)
+
+
+def parse_freshdesk_sources(value: Any, path: Path) -> tuple[FreshdeskSettings, ...]:
+    """`[[sources]]` -- currently the only supported `kind` is "freshdesk";
+    an unrecognized kind raises rather than being silently ignored, since a
+    typo'd kind would otherwise look like a working config with a source
+    that just never syncs anything. `slug` defaults to `kind` (today that
+    means "freshdesk").
+
+    At most one Freshdesk source is accepted: every Freshdesk source shares
+    the `jira_dir/freshdesk/` cache (sync cursor, tickets, agents, groups)
+    and its tickets are keyed `FD-<id>` without the slug, so two accounts
+    would overwrite each other's cursor and collide on ticket keys.
+    Per-source storage and keys are future work (issue #60)."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"invalid config file {path}: [[sources]] must be an array of tables")
+    if len(value) > 1:
+        raise ConfigError(
+            f"invalid config file {path}: only one [[sources]] Freshdesk entry is supported "
+            f"(got {len(value)}); multiple Freshdesk accounts would share one freshdesk/ cache "
+            "and collide on FD-<id> ticket keys"
+        )
+    sources = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ConfigError(f"invalid config file {path}: each [[sources]] entry must be a table")
+        kind = entry.get("kind")
+        if kind != "freshdesk":
+            raise ConfigError(
+                f"invalid config file {path}: sources.kind must be \"freshdesk\" (got {kind!r})"
+            )
+        slug = optional_string(entry, "slug", path) or kind
+        domain = optional_string(entry, "domain", path)
+        if not domain:
+            raise ConfigError(f"invalid config file {path}: sources entry {slug!r} needs a non-empty domain")
+        domain = normalize_freshdesk_domain(domain, slug=slug, path=path)
+        api_key = optional_string(entry, "api_key", path)
+        if not api_key:
+            raise ConfigError(f"invalid config file {path}: sources entry {slug!r} needs a non-empty api_key")
+        if slug in RESERVED_SOURCE_SLUGS:
+            raise ConfigError(f"invalid config file {path}: sources slug {slug!r} is reserved for Jira")
+        sources.append(FreshdeskSettings(slug=slug, domain=domain, api_key=api_key))
+    return tuple(sources)
+
+
+def normalize_freshdesk_domain(domain: str, *, slug: str, path: Path) -> str:
+    """Accepts what someone would naturally paste in -- a bare subdomain
+    ("acme"), a full <name>.freshdesk.com hostname, or either with an
+    accidental http(s):// scheme/trailing path -- and reduces it to the
+    bare subdomain FreshdeskClient builds its base URL from.
+
+    Freshdesk's REST API documents that it "works only via Freshdesk
+    domains and not via custom CNAMEs" -- a support portal fronted by a
+    custom domain (e.g. support.company.com) still requires the account's
+    real <name>.freshdesk.com hostname for API calls, so a value that looks
+    like a custom domain (contains a "." and doesn't end in
+    ".freshdesk.com") is rejected here with a clear explanation instead of
+    silently building an unreachable "<value>.freshdesk.com" URL --
+    without this check, that mistake previously surfaced only as a
+    NameResolutionError deep inside requests, with a URL mangled beyond
+    recognition if the pasted value also included a scheme.
+    """
+    value = domain.strip()
+    for scheme in ("https://", "http://"):
+        if value.lower().startswith(scheme):
+            value = value[len(scheme) :]
+            break
+    value = value.split("/", 1)[0].strip()
+    if value.lower().endswith(".freshdesk.com"):
+        value = value[: -len(".freshdesk.com")]
+    if not value or "." in value:
+        raise ConfigError(
+            f"invalid config file {path}: sources entry {slug!r} has domain {domain!r}, which doesn't look like "
+            "a bare Freshdesk subdomain. Freshdesk's API only works via <subdomain>.freshdesk.com, even if your "
+            "support portal itself uses a custom domain -- set domain to just the subdomain part (e.g. \"acme\" "
+            "for acme.freshdesk.com), not a custom CNAME like \"support.yourcompany.com\"."
+        )
+    return value
 
 
 def optional_string(data: dict[str, Any], key: str, path: Path) -> str | None:

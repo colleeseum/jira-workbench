@@ -6,6 +6,7 @@ from jira_workbench.issue import (
     IssueError,
     build_create_fields,
     create_issue,
+    current_user_payload,
     fetch_all_field_names,
     fetch_current_user,
     fetch_issue_edit_fields,
@@ -213,6 +214,21 @@ def test_resolve_reporter_wraps_client_exception() -> None:
 
     with pytest.raises(IssueError):
         resolve_reporter(client)
+
+
+@pytest.mark.parametrize("value", ["Serge Colle", "serge@example.com", "acc-1", " Serge Colle "])
+def test_current_user_payload_resolves_the_current_users_names_to_account_id(value: str) -> None:
+    client = FakeIssueClient(
+        myself={"accountId": "acc-1", "displayName": "Serge Colle", "emailAddress": "serge@example.com"}
+    )
+
+    assert current_user_payload(client, value) == {"accountId": "acc-1"}
+
+
+def test_current_user_payload_returns_none_for_someone_else_or_on_failure() -> None:
+    assert current_user_payload(FakeIssueClient(myself={"accountId": "acc-1", "displayName": "Me"}), "Other") is None
+    assert current_user_payload(FakeIssueClient(raise_on={"myself"}), "Me") is None
+    assert current_user_payload(FakeIssueClient(myself={"accountId": "acc-1"}), "  ") is None
 
 
 def test_issue_component_value_uses_native_components_shape() -> None:

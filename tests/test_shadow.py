@@ -235,6 +235,96 @@ def test_push_applies_comment_edits_and_deletes(tmp_path: Path) -> None:
     assert load_shadow(jira_dir, "SAT-1") is None
 
 
+def test_push_shadows_resolves_the_component_field_per_issue(tmp_path: Path) -> None:
+    # SAT keeps its component in customfield_10071, PLAT in the native components field. One
+    # push covering both must refresh each issue with its own project's field.
+    for key in ("SAT-1", "PLAT-1"):
+        write_json(
+            tmp_path / f"components/old/{key}/issue.json",
+            {"key": key, "fields": {"updated": "2026-07-20T00:00:00.000+0000", "summary": "Old"}},
+        )
+        set_field(tmp_path, key, "summary", "New")
+        commit_shadow(tmp_path, key)
+    client = PushJiraClient("2026-07-20T00:00:00.000+0000")
+    fields = {"SAT": "customfield_10071", "PLAT": "components"}
+
+    result = push_shadows(
+        tmp_path,
+        ["SAT-1", "PLAT-1"],
+        client,
+        progress=None,
+        component_field_for=lambda key: fields[key.split("-")[0]],
+    )
+
+    assert result.pushed == 2
+    assert (tmp_path / "components/helm-chart/SAT-1/issue.json").exists()
+    assert (tmp_path / "components/api-team/PLAT-1/issue.json").exists()
+
+
+def test_push_rebuilds_the_index_with_each_projects_own_component_field(tmp_path: Path) -> None:
+    # Every issue carries values in both fields (SAT's customfield_10071 and PLAT's native
+    # components), as do PushJiraClient's refreshed issues. Each push rebuilds the whole index;
+    # whichever project triggers it, every issue's indexed component must come from its own
+    # project's field, not the pushing project's.
+    from jira_workbench.db import list_items
+
+    for key in ("SAT-1", "PLAT-1"):
+        write_json(
+            tmp_path / f"components/old/{key}/issue.json",
+            {
+                "key": key,
+                "fields": {
+                    "updated": "2026-07-20T00:00:00.000+0000",
+                    "summary": "Old",
+                    "components": [{"name": "api-team"}],
+                    "customfield_10071": {"value": "helm-chart"},
+                },
+            },
+        )
+    client = PushJiraClient("2026-07-20T00:00:00.000+0000")
+    fields = {"SAT": "customfield_10071", "PLAT": None}
+
+    for key in ("PLAT-1", "SAT-1", "PLAT-1"):
+        set_field(tmp_path, key, "summary", f"New {key}")
+        commit_shadow(tmp_path, key)
+        result = push_shadows(
+            tmp_path,
+            [key],
+            client,
+            progress=None,
+            component_field=fields[key.split("-")[0]] or "components",
+            index_component_fields=fields,
+        )
+        assert result.pushed == 1
+        indexed = {item["key"]: item["component"] for item in list_items(tmp_path)}
+        assert indexed == {"SAT-1": "helm-chart", "PLAT-1": "api-team"}, f"after pushing {key}"
+
+
+class ChangelogJiraClient(PushJiraClient):
+    """Like Jira, returns the changelog only when it is requested with expand=changelog."""
+
+    def get_issue(self, issue_id_or_key: str, fields: str | list | tuple | set | None = None, **kwargs: Any) -> Any:
+        issue = super().get_issue(issue_id_or_key, fields=fields)
+        if fields == "*all" and kwargs.get("expand") == "changelog":
+            issue = {**issue, "changelog": {"histories": [{"id": "1", "author": {"displayName": "Ada"}}]}}
+        return issue
+
+
+def test_post_push_refresh_keeps_the_changelog(tmp_path: Path) -> None:
+    # Last changed by / Resolved by are read from the cached changelog; a post-push refresh that
+    # dropped it blanked them until the next full sync.
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    commit_shadow(jira_dir, "SAT-1")
+    client = ChangelogJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    issue_path = next((jira_dir / "components").glob("*/SAT-1/issue.json"))
+    assert read_json(issue_path)["changelog"]["histories"][0]["author"]["displayName"] == "Ada"
+
+
 def test_push_blocks_when_remote_change_conflicts_with_a_shadow_edited_field(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)
     set_field(jira_dir, "SAT-1", "description", "Local description")
@@ -366,6 +456,97 @@ def test_set_field_allowed_when_no_registry_exists_at_all(tmp_path: Path) -> Non
     shadow = load_shadow(jira_dir, "SAT-1")
     assert shadow is not None
     assert shadow["fields"]["summary"] == "New summary"
+
+
+def test_push_refuses_field_edits_staged_before_the_project_became_read_only(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    set_field(jira_dir, "SAT-1", "status", "Done")
+    commit_shadow(jira_dir, "SAT-1")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.failed == 1
+    assert result.pushed == 0
+    assert "project SAT is read-only" in result.errors[0]
+    assert client.update_calls == []
+    assert client.transition_calls == []
+    assert load_shadow(jira_dir, "SAT-1")["fields"] == {"summary": "New summary", "status": "Done"}
+
+
+def test_push_dry_run_reports_read_only_field_edits_as_refused(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+
+    result = push_shadows(
+        jira_dir, ["SAT-1"], PushJiraClient("2026-07-20T00:00:01.000+0000"), dry_run=True, progress=None
+    )
+
+    assert result.failed == 1
+    assert "read-only" in result.errors[0]
+
+
+def test_push_still_pushes_comment_only_shadows_on_a_read_only_project(tmp_path: Path) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    add_comment(jira_dir, "SAT-1", "Local comment")
+    edit_comment(jira_dir, "SAT-1", "10001", "Edited body")
+    delete_comment(jira_dir, "SAT-1", "10002")
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.pushed == 1
+    assert client.add_comment_calls == [("SAT-1", "Local comment")]
+    assert client.edit_comment_calls == [("SAT-1", "10001", "Edited body")]
+    assert len(client.deleted_paths) == 1
+    assert load_shadow(jira_dir, "SAT-1") is None
+
+
+def test_push_of_a_mixed_shadow_on_a_read_only_project_pushes_comments_and_keeps_fields_staged(
+    tmp_path: Path,
+) -> None:
+    jira_dir = synced_jira_dir(tmp_path)
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    set_status_change(jira_dir, "SAT-1", resolution="Done")
+    add_comment(jira_dir, "SAT-1", "Local comment")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
+    client = PushJiraClient("2026-07-20T00:00:01.000+0000")
+
+    result = push_shadows(jira_dir, ["SAT-1"], client, progress=None)
+
+    assert result.failed == 1
+    assert "comments pushed" in result.errors[0]
+    assert client.add_comment_calls == [("SAT-1", "Local comment")]
+    assert client.update_calls == []
+    remaining = load_shadow(jira_dir, "SAT-1")
+    assert remaining["fields"] == {"summary": "New summary"}
+    assert remaining["statusChange"] == {"resolution": "Done"}
+    assert remaining["comments"] == []
+
+
+def test_set_field_and_delete_shadow_keep_the_sql_index_has_shadow_flag_current(tmp_path: Path) -> None:
+    # save_shadow/delete_shadow are the choke point that keeps
+    # db.items.has_shadow accurate between reindexes -- this must happen
+    # without a jira-wb sync in between, since load_manifest_items trusts
+    # the flag alone to decide whether an item needs its shadow content
+    # read at all.
+    from jira_workbench.db import list_items
+    from jira_workbench.shadow import delete_shadow
+
+    jira_dir = synced_jira_dir(tmp_path)
+    assert {item["key"]: item for item in list_items(jira_dir)}["SAT-1"]["hasShadow"] is False
+
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+
+    assert {item["key"]: item for item in list_items(jira_dir)}["SAT-1"]["hasShadow"] is True
+
+    delete_shadow(jira_dir, "SAT-1")
+
+    assert {item["key"]: item for item in list_items(jira_dir)}["SAT-1"]["hasShadow"] is False
 
 
 def test_push_applies_supported_fields_and_comments(tmp_path: Path) -> None:

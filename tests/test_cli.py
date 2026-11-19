@@ -7,14 +7,11 @@ from pathlib import Path
 import pytest
 
 import jira_workbench.cli
+import jira_workbench.freshdesk
+import jira_workbench.service
 from jira_workbench.cli import (
-    filter_versions,
-    meta_component_field_options_output,
     main,
-    meta_components_output,
-    meta_versions_output,
     sync_progress_printer,
-    version_identifier,
 )
 from jira_workbench.config import ConfigError, load_config
 from jira_workbench.metadata import remember_field_names
@@ -107,7 +104,7 @@ def test_sync_uses_default_jira_dir_when_unset(tmp_path: Path, monkeypatch) -> N
 
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
@@ -144,31 +141,31 @@ def test_sync_progress_printer_rewrites_issue_progress_on_tty() -> None:
     stream = _FakeStream()
     progress = sync_progress_printer(stream)
 
-    progress("[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0")
-    progress("[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0")
-    progress("[4/6] Building manifest...")
+    progress("[3/7] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0")
+    progress("[3/7] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0")
+    progress("[6/7] Building manifest...")
 
-    assert "\r[3/6] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in stream.output
-    assert "\r[3/6] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in stream.output
-    assert "\n[4/6] Building manifest...\n" in stream.output
+    assert "\r[3/7] Syncing changed issues... 1/2 SAT-1 changed=0 unchanged=0" in stream.output
+    assert "\r[3/7] Syncing changed issues... 2/2 SAT-2 changed=1 unchanged=0" in stream.output
+    assert "\n[6/7] Building manifest...\n" in stream.output
 
 
 def test_sync_progress_printer_prefixes_every_line_with_the_project() -> None:
     stream = _FakeStream()
     progress = sync_progress_printer(stream, project="PLAT")
 
-    progress("[1/6] Refreshing project metadata...")
+    progress("[1/7] Refreshing project metadata...")
 
-    assert stream.output == "PLAT [1/6] Refreshing project metadata...\n"
+    assert stream.output == "PLAT [1/7] Refreshing project metadata...\n"
 
 
 def test_sync_progress_printer_project_prefix_also_applies_to_tty_rewrite() -> None:
     stream = _FakeStream()
     progress = sync_progress_printer(stream, project="PLAT")
 
-    progress("[3/6] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0")
+    progress("[3/7] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0")
 
-    assert "\rPLAT [3/6] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0" in stream.output
+    assert "\rPLAT [3/7] Syncing changed issues... 1/2 PLAT-1 changed=0 unchanged=0" in stream.output
 
 
 def test_sync_force_flag_threads_through_to_sync_config(tmp_path: Path, monkeypatch) -> None:
@@ -180,7 +177,7 @@ def test_sync_force_flag_threads_through_to_sync_config(tmp_path: Path, monkeypa
 
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
@@ -203,6 +200,119 @@ def test_sync_force_flag_threads_through_to_sync_config(tmp_path: Path, monkeypa
     assert captured_configs[1].force is False
 
 
+def test_sync_source_freshdesk_force_flag_threads_through(tmp_path: Path, monkeypatch) -> None:
+    captured_force: list[bool] = []
+
+    def fake_sync_freshdesk_source(settings, jira_dir, client, *, force=False, progress=None):
+        captured_force.append(force)
+        from jira_workbench.freshdesk import FreshdeskSyncResult
+
+        return FreshdeskSyncResult(ticket_count=0, changed_count=0)
+
+    monkeypatch.setattr(jira_workbench.freshdesk, "FreshdeskClient", lambda settings, **kwargs: object())
+    monkeypatch.setattr(jira_workbench.freshdesk, "sync_freshdesk_source", fake_sync_freshdesk_source)
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{tmp_path / "jira"}"',
+                "[[sources]]",
+                'kind = "freshdesk"',
+                'domain = "acme"',
+                'api_key = "key"',
+            ]
+        )
+    )
+
+    assert jira_workbench.cli.main(["--config", str(config_path), "sync", "--source", "freshdesk", "--force"]) == 0
+    assert jira_workbench.cli.main(["--config", str(config_path), "sync", "--source", "freshdesk"]) == 0
+
+    assert captured_force == [True, False]
+
+
+@pytest.mark.parametrize("source", [None, "all", "jira", "freshdesk"])
+@pytest.mark.parametrize("has_jira", [True, False])
+def test_sync_selects_configured_source_kinds(tmp_path: Path, monkeypatch, source, has_jira) -> None:
+    from jira_workbench.freshdesk import FreshdeskSyncResult
+    from jira_workbench.sync import SyncResult
+
+    calls = []
+
+    def sync_jira(config, client, progress=None):
+        calls.append(("jira", config.force))
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0)
+
+    def sync_freshdesk(settings, jira_dir, client, *, force=False, progress=None):
+        assert jira_dir == tmp_path / "jira"
+        calls.append((settings.slug, force))
+        return FreshdeskSyncResult(ticket_count=0, changed_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", sync_jira)
+    monkeypatch.setattr(jira_workbench.freshdesk, "FreshdeskClient", lambda settings, **kw: object())
+    monkeypatch.setattr(jira_workbench.freshdesk, "sync_freshdesk_source", sync_freshdesk)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'jira_dir = "{tmp_path / "jira"}"\n'
+        + ('project = "SAT"\njira_url = "https://example.atlassian.net"\n'
+           'jira_email = "user@example.com"\njira_api_token = "token"\n' if has_jira else "")
+        + '\n'.join(
+            f'[[sources]]\nkind = "freshdesk"\nslug = "{slug}"\ndomain = "acme"\napi_key = "key"'
+            for slug in ("support",)
+        )
+    )
+    argv = ["--config", str(config_path), "sync", "--force"]
+    if source:
+        argv += ["--source", source]
+    expected = []
+    if has_jira and source != "freshdesk":
+        expected.append(("jira", True))
+    if source != "jira":
+        expected.append(("support", True))
+    assert main(argv) == (2 if source == "jira" and not has_jira else 0)
+    assert calls == expected
+
+
+@pytest.mark.parametrize("failure", ["jira", "jira_config", "freshdesk", "ticket"])
+def test_sync_all_reports_failures_and_continues(tmp_path: Path, monkeypatch, failure) -> None:
+    from jira_workbench.freshdesk import FreshdeskError, FreshdeskSyncResult
+    from jira_workbench.sync import SyncError, SyncResult
+
+    calls = []
+
+    def sync_jira(config, client, progress=None):
+        calls.append("jira")
+        if failure == "jira":
+            raise SyncError("Jira unavailable")
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0)
+
+    def sync_freshdesk(settings, jira_dir, client, **kwargs):
+        calls.append(settings.slug)
+        if settings.slug == "support":
+            if failure == "freshdesk":
+                raise FreshdeskError("Freshdesk unavailable")
+            if failure == "ticket":
+                return FreshdeskSyncResult(ticket_count=1, changed_count=0, failed_keys=("FD-1",))
+        return FreshdeskSyncResult(ticket_count=0, changed_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", sync_jira)
+    monkeypatch.setattr(jira_workbench.freshdesk, "FreshdeskClient", lambda settings, **kw: object())
+    monkeypatch.setattr(jira_workbench.freshdesk, "sync_freshdesk_source", sync_freshdesk)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'jira_dir = "{tmp_path / "jira"}"\nproject = "SAT"\n'
+        + ('' if failure == "jira_config" else
+           'jira_url = "https://example.atlassian.net"\njira_email = "user@example.com"\njira_api_token = "token"\n')
+        + '\n'.join(
+            f'[[sources]]\nkind = "freshdesk"\nslug = "{slug}"\ndomain = "acme"\napi_key = "key"'
+            for slug in ("support",)
+        )
+    )
+    assert main(["--config", str(config_path), "sync"]) == (2 if failure == "jira_config" else 1)
+    assert calls == ([] if failure == "jira_config" else ["jira"]) + ["support"]
+
+
 def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys, monkeypatch) -> None:
     class Client:
         def __init__(self) -> None:
@@ -222,7 +332,7 @@ def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys, monke
             return []
 
     client = Client()
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: client)
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: client)
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
         "\n".join(
@@ -258,7 +368,7 @@ def test_sync_with_no_explicit_project_syncs_every_configured_project(
         synced_projects.append(config.project)
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     jira_dir = tmp_path / "jira"
     config_path = tmp_path / "jira-wb.conf"
@@ -299,10 +409,10 @@ def test_sync_multi_project_run_prefixes_progress_lines_with_the_project(
 
     def fake_sync_project(config, client, progress=None):
         if progress:
-            progress("[1/6] Refreshing project metadata...")
+            progress("[1/7] Refreshing project metadata...")
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
@@ -325,8 +435,8 @@ def test_sync_multi_project_run_prefixes_progress_lines_with_the_project(
 
     captured = capsys.readouterr()
     assert code == 0
-    assert "SAT [1/6] Refreshing project metadata..." in captured.err
-    assert "OTHERPROJ [1/6] Refreshing project metadata..." in captured.err
+    assert "SAT [1/7] Refreshing project metadata..." in captured.err
+    assert "OTHERPROJ [1/7] Refreshing project metadata..." in captured.err
 
 
 def test_sync_single_project_run_does_not_prefix_progress_lines(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -334,10 +444,10 @@ def test_sync_single_project_run_does_not_prefix_progress_lines(tmp_path: Path, 
 
     def fake_sync_project(config, client, progress=None):
         if progress:
-            progress("[1/6] Refreshing project metadata...")
+            progress("[1/7] Refreshing project metadata...")
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
@@ -356,8 +466,8 @@ def test_sync_single_project_run_does_not_prefix_progress_lines(tmp_path: Path, 
 
     captured = capsys.readouterr()
     assert code == 0
-    assert "[1/6] Refreshing project metadata...\n" in captured.err
-    assert "SAT [1/6]" not in captured.err
+    assert "[1/7] Refreshing project metadata...\n" in captured.err
+    assert "SAT [1/7]" not in captured.err
 
 
 def test_sync_writes_project_registry_even_for_a_single_project_sync(
@@ -369,7 +479,7 @@ def test_sync_writes_project_registry_even_for_a_single_project_sync(
     def fake_sync_project(config, client, progress=None):
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     jira_dir = tmp_path / "jira"
     config_path = tmp_path / "jira-wb.conf"
@@ -401,7 +511,7 @@ def test_sync_uses_per_project_history_months_falling_back_to_the_global_default
         captured_configs.append(config)
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     jira_dir = tmp_path / "jira"
     config_path = tmp_path / "jira-wb.conf"
@@ -430,6 +540,112 @@ def test_sync_uses_per_project_history_months_falling_back_to_the_global_default
     assert by_project["HUGEPROJ"].history_months == 6
 
 
+def test_sync_uses_per_project_component_field_without_leaking_across_projects(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from jira_workbench.sync import SyncResult
+
+    captured_configs = []
+
+    def fake_sync_project(config, client, progress=None):
+        captured_configs.append(config)
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+                "read_only = true",
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "sync"]) == 0
+
+    by_project = {config.project: config for config in captured_configs}
+    assert by_project["SAT"].component_field == "customfield_10071"
+    assert by_project["PLAT"].component_field == "components"
+
+
+def test_sync_rebuilds_the_index_with_every_projects_own_component_field(tmp_path: Path, monkeypatch) -> None:
+    # Each project's sync rebuilds the index for all synced projects, so it needs every
+    # project's field, not only its own.
+    from jira_workbench.sync import SyncResult
+
+    captured_configs = []
+
+    def fake_sync_project(config, client, progress=None):
+        captured_configs.append(config)
+        return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "sync"]) == 0
+
+    expected = {"SAT": "customfield_10071", "PLAT": "components"}
+    for config in captured_configs:
+        index_fields = config.component_fields_for_index()
+        assert {project: field or "components" for project, field in index_fields.items()} == expected
+
+
+def test_db_reindex_uses_each_projects_own_component_field(tmp_path: Path, monkeypatch) -> None:
+    from jira_workbench import db
+
+    captured = []
+    monkeypatch.setattr(db, "reindex_items", lambda jira_dir, component_field: captured.append(component_field) or 0)
+    jira_dir = tmp_path / "jira"
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+    )
+
+    assert main(["--config", str(config_path), "db", "reindex"]) == 0
+
+    assert captured == [{"SAT": "customfield_10071", "PLAT": None}]
+
+
 def test_sync_history_months_flag_overrides_config_for_every_project(tmp_path: Path, monkeypatch) -> None:
     from jira_workbench.sync import SyncResult
 
@@ -439,7 +655,7 @@ def test_sync_history_months_flag_overrides_config_for_every_project(tmp_path: P
         captured_configs.append(config)
         return SyncResult(work_item_count=0, changed_count=0, skipped_count=0, version_count=0)
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     monkeypatch.setattr(jira_workbench.cli, "sync_project", fake_sync_project)
     jira_dir = tmp_path / "jira"
     config_path = tmp_path / "jira-wb.conf"
@@ -797,6 +1013,35 @@ def test_view_all_flag_overrides_configured_active_default(tmp_path: Path, monke
     assert calls[0][1]["active"] is False
 
 
+def test_view_passes_each_projects_own_component_field_to_the_tui(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "jira-wb.conf"
+    jira_dir = tmp_path / "jira"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+        + "\n"
+    )
+    calls = []
+    monkeypatch.setattr(
+        jira_workbench.cli, "open_interactive_view", lambda *args, **kwargs: calls.append(kwargs)
+    )
+
+    code = main(["--config", str(config_path), "view"])
+
+    assert code == 0
+    assert calls[0]["component_field"] == "customfield_10071"
+    assert calls[0]["component_fields"] == {"SAT": "customfield_10071", "PLAT": None}
+
+
 def test_view_flags_override_config_defaults(tmp_path: Path, monkeypatch) -> None:
     config_path = tmp_path / "jira-wb.conf"
     jira_dir = tmp_path / "jira"
@@ -866,7 +1111,7 @@ def test_issue_create_dry_run_uses_configured_component_field(tmp_path: Path, ca
         def myself(self) -> dict[str, str]:
             return {"accountId": "me"}
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: Client())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: Client())
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
         "\n".join(
@@ -912,7 +1157,7 @@ def test_issue_create_blocked_for_a_read_only_project(tmp_path: Path, capsys, mo
         def issue_createmeta(self, project: str) -> dict[str, object]:
             raise AssertionError("should not fetch createmeta for a read-only project")
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: Client())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: Client())
     jira_dir = tmp_path / "jira"
     write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=True),))
     config_path = tmp_path / "jira-wb.conf"
@@ -938,7 +1183,7 @@ def test_issue_create_blocked_for_a_read_only_project(tmp_path: Path, capsys, mo
 
 
 def test_issue_create_requires_type_when_no_flag_or_config_default(tmp_path: Path, capsys, monkeypatch) -> None:
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: object())
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
         "\n".join(
@@ -972,7 +1217,7 @@ def test_issue_create_uses_configured_default_type(tmp_path: Path, capsys, monke
                 ]
             }
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: Client())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: Client())
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
         "\n".join(
@@ -1013,7 +1258,7 @@ def test_issue_create_type_flag_overrides_configured_default(tmp_path: Path, cap
                 ]
             }
 
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: Client())
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: Client())
     config_path = tmp_path / "jira-wb.conf"
     config_path.write_text(
         "\n".join(
@@ -1085,7 +1330,7 @@ def test_issue_create_creates_and_refreshes_local_issue(tmp_path: Path, capsys, 
             self.created_fields = fields
             return {"key": "SAT-900"}
 
-        def get_issue(self, issue_id_or_key: str, fields: object = None) -> dict[str, object]:
+        def get_issue(self, issue_id_or_key: str, fields: object = None, expand: object = None) -> dict[str, object]:
             return {
                 "key": issue_id_or_key,
                 "fields": {
@@ -1096,7 +1341,7 @@ def test_issue_create_creates_and_refreshes_local_issue(tmp_path: Path, capsys, 
             }
 
     client = Client()
-    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: client)
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: client)
     config_path = tmp_path / "jira-wb.conf"
     jira_dir = tmp_path / "jira"
     config_path.write_text(
@@ -1139,6 +1384,89 @@ def test_issue_create_creates_and_refreshes_local_issue(tmp_path: Path, capsys, 
     assert client.created_fields["parent"] == {"key": "SAT-749"}
     assert client.created_fields["priority"] == {"name": "High"}
     assert (jira_dir / "components/resource-as-code/SAT-900/issue.json").exists()
+
+
+def test_shadow_push_resolves_the_component_field_per_issue_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default project's field must not be applied to every pushed issue.
+    captured: dict[str, object] = {}
+
+    def fake_push_shadows(jira_dir: Path, keys: list[str], **kwargs: object) -> object:
+        captured.update(kwargs)
+        return type("Result", (), {"pushed": 0, "skipped": 0, "blocked": 0, "failed": 0, "errors": []})()
+
+    monkeypatch.setattr(jira_workbench.cli, "push_shadows", fake_push_shadows)
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: object())
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{tmp_path / "jira"}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                'component_field = "customfield_10071"',
+                "[[projects]]",
+                'key = "PLAT"',
+            ]
+        )
+        + "\n"
+    )
+
+    assert main(["--config", str(config_path), "shadow", "push"]) == 0
+
+    resolve = captured["component_field_for"]
+    assert callable(resolve)
+    assert resolve("SAT-1") == "customfield_10071"
+    assert resolve("PLAT-7") == "components"
+
+
+def test_shadow_push_refuses_once_config_marks_the_project_read_only_without_a_sync(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The registry (written by the last sync) still says SAT is writable; the
+    # config now says read-only. The next push must honor the config.
+    from jira_workbench.config import ProjectSettings
+    from jira_workbench.metadata import write_project_registry
+    from jira_workbench.shadow import load_shadow, set_field
+    from test_shadow import synced_jira_dir
+
+    class NoJiraClient:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"read-only push must not call Jira ({name})")
+
+    jira_dir = synced_jira_dir(tmp_path / "jira")
+    write_project_registry(jira_dir, (ProjectSettings(key="SAT", read_only=False),))
+    set_field(jira_dir, "SAT-1", "summary", "New summary")
+    monkeypatch.setattr(jira_workbench.cli, "jira_api_client", lambda _config: NoJiraClient())
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'jira_dir = "{jira_dir}"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "read_only = true",
+            ]
+        )
+        + "\n"
+    )
+
+    code = main(["--config", str(config_path), "shadow", "push", "SAT-1"])
+
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "failed=1" in captured.out
+    assert "project SAT is read-only" in captured.err
+    assert load_shadow(jira_dir, "SAT-1")["fields"] == {"summary": "New summary"}
 
 
 def test_versions_filter_is_read_from_config(tmp_path: Path) -> None:
@@ -1212,28 +1540,6 @@ def test_version_filters_by_component_rejects_invalid_regex(tmp_path: Path) -> N
 
     with pytest.raises(ConfigError):
         load_config(config_path)
-
-
-def test_filter_versions_uses_regex() -> None:
-    versions = [
-        {"id": "1", "name": "helm-chart-sa 3.4.0", "released": False},
-        {"id": "2", "name": "helm-chart-sa 2.9.0", "released": True},
-        {"id": "3", "name": "guidedog 1.0.0", "released": False},
-    ]
-
-    filtered, error = filter_versions(versions, r"helm-chart-sa 3\.[45]")
-
-    assert error is None
-    assert [version["id"] for version in filtered] == ["1"]
-
-
-def test_filter_versions_reports_invalid_regex() -> None:
-    versions = [{"id": "1", "name": "helm-chart-sa 3.4.0"}]
-
-    filtered, error = filter_versions(versions, "[")
-
-    assert filtered == versions
-    assert error is not None
 
 
 def test_meta_versions_can_list_cached_versions(tmp_path: Path, capsys) -> None:
@@ -1393,6 +1699,207 @@ def test_meta_refresh_with_only_boards_flag_does_not_also_refresh_versions(tmp_p
     assert version_calls == []
 
 
+def test_meta_refresh_with_no_flags_refreshes_everything(tmp_path: Path, capsys, monkeypatch) -> None:
+    # Regression: a bare `meta refresh` used to silently refresh versions
+    # only -- components/boards/assignees looked untouched with no
+    # indication anything had been skipped. No flags now means "refresh
+    # everything"; naming specific flags still means "only those" (see the
+    # "only X flag" tests below/above).
+    jira_dir = tmp_path / "jira"
+    calls = []
+
+    monkeypatch.setattr(jira_workbench.cli, "refresh_versions_api", lambda *a, **k: calls.append("versions") or {"versions": []})
+    monkeypatch.setattr(jira_workbench.cli, "refresh_components_api", lambda *a, **k: calls.append("components") or {"components": []})
+    monkeypatch.setattr(jira_workbench.cli, "refresh_boards_api", lambda *a, **k: calls.append("boards") or {"boards": []})
+    monkeypatch.setattr(jira_workbench.cli, "refresh_assignees_api", lambda *a, **k: calls.append("assignees") or {"assignees": []})
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+        ]
+    )
+
+    assert code == 0
+    assert set(calls) == {"versions", "components", "boards", "assignees"}
+
+
+def test_meta_refresh_assignees_calls_refresh_assignees_api(tmp_path: Path, capsys, monkeypatch) -> None:
+    jira_dir = tmp_path / "jira"
+    calls = []
+
+    def fake_refresh_assignees_api(jira_dir_arg, project, client):
+        calls.append(project)
+        return {"assignees": [{"displayName": "Serge Colle"}]}
+
+    monkeypatch.setattr(jira_workbench.cli, "refresh_assignees_api", fake_refresh_assignees_api)
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert calls == ["SAT"]
+    assert "refreshed 1 assignable users" in captured.out
+
+
+def test_meta_refresh_assignees_warns_on_stderr_when_degraded_to_the_fallback_api(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    jira_dir = tmp_path / "jira"
+
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "refresh_assignees_api",
+        lambda *a, **k: {"assignees": [{"displayName": "Serge Colle"}], "source": "role-api-fallback"},
+    )
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "refreshed 1 assignable users" in captured.out
+    assert "warning" in captured.err.lower()
+    assert "fell back" in captured.err.lower()
+
+
+def test_meta_refresh_assignees_no_warning_when_the_internal_api_succeeds(tmp_path: Path, capsys, monkeypatch) -> None:
+    jira_dir = tmp_path / "jira"
+
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "refresh_assignees_api",
+        lambda *a, **k: {"assignees": [{"displayName": "Serge Colle"}], "source": "internal-access-api"},
+    )
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err == ""
+
+
+def test_meta_refresh_with_only_assignees_flag_does_not_also_refresh_versions(tmp_path: Path, monkeypatch) -> None:
+    jira_dir = tmp_path / "jira"
+    version_calls = []
+
+    monkeypatch.setattr(jira_workbench.cli, "refresh_versions_api", lambda *a, **k: version_calls.append(1))
+    monkeypatch.setattr(jira_workbench.cli, "refresh_assignees_api", lambda *a, **k: {"assignees": []})
+    monkeypatch.setattr(
+        jira_workbench.cli,
+        "api_client_from_config",
+        lambda project, jira_url, jira_email, jira_api_token: (project, object()),
+    )
+
+    code = main(
+        [
+            "--config",
+            str(tmp_path / "missing.conf"),
+            "meta",
+            "--project",
+            "SAT",
+            "--jira-dir",
+            str(jira_dir),
+            "--jira-url",
+            "https://example.atlassian.net",
+            "--jira-email",
+            "user@example.com",
+            "--jira-api-token",
+            "token",
+            "refresh",
+            "--assignees",
+        ]
+    )
+
+    assert code == 0
+    assert version_calls == []
+
+
 def test_meta_components_lists_cached_manifest_components(tmp_path: Path, capsys) -> None:
     jira_dir = tmp_path / "jira"
     write_json(
@@ -1420,162 +1927,6 @@ def test_meta_components_lists_cached_manifest_components(tmp_path: Path, capsys
     assert code == 0
     assert "helm-chart" in captured.out
     assert "misc" in captured.out
-
-
-def test_meta_versions_output_uses_cached_versions(tmp_path: Path) -> None:
-    jira_dir = tmp_path / "jira"
-    write_json(
-        jira_dir / "meta/SAT/versions.json",
-        {
-            "project": "SAT",
-            "fetchedAt": "2026-07-21T06:00:00Z",
-            "versions": [{"name": "helm-chart-sa 3.4.0", "released": False}],
-        },
-    )
-
-    output = meta_versions_output(
-        jira_dir,
-        "SAT",
-        "https://example.atlassian.net",
-        "user@example.com",
-        "bad-token",
-    )
-
-    assert "helm-chart-sa 3.4.0" in output
-
-
-def test_meta_components_output_uses_cached_component_metadata(tmp_path: Path) -> None:
-    jira_dir = tmp_path / "jira"
-    write_json(
-        jira_dir / "meta/SAT/components.json",
-        {
-            "project": "SAT",
-            "fetchedAt": "2026-07-21T06:00:00Z",
-            "components": [{"id": "10000", "name": "helm-chart"}],
-        },
-    )
-
-    output = meta_components_output(jira_dir, None, None, None, None, None)
-
-    assert "helm-chart" in output
-    assert "10000" in output
-
-
-def test_meta_components_output_does_not_merge_native_components(tmp_path: Path) -> None:
-    jira_dir = tmp_path / "jira"
-    write_json(
-        jira_dir / "meta/SAT/components.json",
-        {
-            "project": "SAT",
-            "fetchedAt": "2026-07-21T06:00:00Z",
-            "components": [{"id": "10000", "name": "new-component"}],
-        },
-    )
-    write_json(
-        jira_dir / "manifest.json",
-        {
-            "components": [
-                {"component": "helm-chart", "count": 3},
-                {"component": "terraform", "count": 1},
-            ],
-            "workItems": [
-                {"key": "SAT-1", "component": "helm-chart", "status": "To Do"},
-                {"key": "SAT-2", "component": "helm-chart", "status": "Done"},
-                {"key": "SAT-3", "component": "helm-chart", "status": "In Progress"},
-                {"key": "SAT-4", "component": "terraform", "status": "Open"},
-            ],
-        },
-    )
-
-    output = meta_components_output(jira_dir, None, None, None, None, None)
-
-    assert "new-component" not in output
-    assert "helm-chart" in output
-    assert "terraform" in output
-    assert "active" in output
-    assert "total" in output
-
-
-def test_meta_component_field_options_output_uses_cached_options(tmp_path: Path) -> None:
-    jira_dir = tmp_path / "jira"
-    write_json(
-        jira_dir / "meta/SAT/customfield_10071-options.json",
-        {
-            "project": "SAT",
-            "field": "customfield_10071",
-            "fetchedAt": "2026-07-21T06:00:00Z",
-            "options": [{"id": "10114", "value": "helm-chart"}],
-        },
-    )
-    write_json(
-        jira_dir / "manifest.json",
-        {
-            "components": [{"component": "helm-chart", "count": 2}],
-            "workItems": [
-                {"key": "SAT-1", "component": "helm-chart", "status": "To Do"},
-                {"key": "SAT-2", "component": "helm-chart", "status": "Closed"},
-            ],
-        },
-    )
-
-    output = meta_component_field_options_output(
-        jira_dir,
-        "SAT",
-        "customfield_10071",
-        None,
-        None,
-        None,
-        cached=True,
-    )
-
-    assert "helm-chart" in output
-    assert "10114" in output
-    assert "active" in output
-    assert "total" in output
-
-
-def test_meta_components_output_uses_component_field_options_when_configured(tmp_path: Path) -> None:
-    jira_dir = tmp_path / "jira"
-    write_json(
-        jira_dir / "meta/SAT/customfield_10071-options.json",
-        {
-            "project": "SAT",
-            "field": "customfield_10071",
-            "fetchedAt": "2026-07-21T06:00:00Z",
-            "options": [{"id": "10114", "value": "helm-chart"}],
-        },
-    )
-    write_json(
-        jira_dir / "meta/SAT/components.json",
-        {
-            "project": "SAT",
-            "fetchedAt": "2026-07-21T06:00:00Z",
-            "components": [{"id": "10584", "name": "iac-fluxcd"}],
-        },
-    )
-    write_json(
-        jira_dir / "manifest.json",
-        {
-            "components": [{"component": "helm-chart", "count": 2}],
-            "workItems": [
-                {"key": "SAT-1", "component": "helm-chart", "status": "To Do"},
-                {"key": "SAT-2", "component": "helm-chart", "status": "Done"},
-            ],
-        },
-    )
-
-    output = meta_components_output(jira_dir, "SAT", "customfield_10071", None, None, None)
-
-    assert "helm-chart" in output
-    assert "iac-fluxcd" not in output
-    assert "active" in output
-    assert "total" in output
-
-
-def test_version_identifier_prefers_id() -> None:
-    version = {"id": "10000", "name": "helm-chart-sa 3.5.0", "released": True, "archived": True}
-
-    assert version_identifier(version) == "10000"
 
 
 def test_meta_doctor_reports_missing_config(tmp_path: Path, capsys) -> None:
@@ -1646,6 +1997,151 @@ def test_meta_version_add_blocked_for_a_read_only_project(tmp_path: Path, capsys
     assert "project SAT is read-only" in captured.err
 
 
+class _FakeVersionClient:
+    """Just enough of a Jira client for version-add/rename/release/archive
+    to succeed end to end -- proves `meta version-*` genuinely reaches the
+    extracted service.py functions via main()'s real argparse dispatch, not
+    just via direct unit calls or the TUI's own separate test coverage."""
+
+    def __init__(self) -> None:
+        self.versions: list[dict[str, object]] = [{"id": "10000", "name": "v1", "released": False, "archived": False}]
+
+    def project(self, key: str) -> dict[str, str]:
+        return {"id": "1", "key": key}
+
+    def get_project_versions(self, key: str) -> object:
+        return self.versions
+
+    def add_version(self, key: str, project_id: str, version: str, **kwargs: object) -> object:
+        self.versions.append({"id": "10001", "name": version, "released": False, "archived": False})
+        return {"name": version}
+
+    def update_version(self, version: str, **kwargs: object) -> object:
+        renamed = {"is_released": "released", "is_archived": "archived"}
+        for item in self.versions:
+            if item["id"] == version:
+                for key, value in kwargs.items():
+                    if value is not None:
+                        item[renamed.get(key, key)] = value
+        return {"id": version}
+
+
+def test_meta_version_add_rename_release_archive_reach_the_service_layer(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    client = _FakeVersionClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: client)
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                'project = "SAT"',
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+            ]
+        )
+    )
+    common = ["--config", str(config_path), "meta", "--jira-dir", str(tmp_path / "jira")]
+
+    assert main([*common, "version-add", "v2"]) == 0
+    assert "created version v2" in capsys.readouterr().out
+
+    assert main([*common, "version-rename", "10001", "v2-renamed"]) == 0
+    assert "renamed version 10001 to v2-renamed" in capsys.readouterr().out
+
+    assert main([*common, "version-release", "10001"]) == 0
+    assert "released version 10001" in capsys.readouterr().out
+
+    assert main([*common, "version-archive", "10001"]) == 0
+    assert "archived version 10001" in capsys.readouterr().out
+
+
+def test_meta_refresh_resolves_default_project_from_projects_array(tmp_path: Path, monkeypatch, capsys) -> None:
+    # Regression: meta (like issue) used to resolve its project only from
+    # the legacy flat `project = "..."` config key, so a [[projects]]-only
+    # config (no flat key at all) failed with "missing required
+    # configuration for Jira API: project" even with a clear default
+    # project configured -- same bug the view command already had fixed.
+    client = _FakeVersionClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: client)
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "[[projects]]",
+                'key = "OTHERPROJ"',
+            ]
+        )
+    )
+
+    code = main(["--config", str(config_path), "meta", "--jira-dir", str(tmp_path / "jira"), "refresh", "--versions"])
+
+    assert code == 0
+    assert "refreshed 1 versions" in capsys.readouterr().out
+
+
+def test_issue_create_resolves_default_project_from_projects_array(tmp_path: Path, monkeypatch, capsys) -> None:
+    class Client:
+        def issue_createmeta(self, project: str) -> dict[str, object]:
+            return {
+                "projects": [
+                    {
+                        "key": project,
+                        "issuetypes": [
+                            {"name": "Task", "fields": {"summary": {}, "description": {}, "issuetype": {}}}
+                        ],
+                    }
+                ]
+            }
+
+        def myself(self) -> dict[str, str]:
+            return {"accountId": "me"}
+
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: Client())
+    config_path = tmp_path / "jira-wb.conf"
+    config_path.write_text(
+        "\n".join(
+            [
+                'jira_url = "https://example.atlassian.net"',
+                'jira_email = "user@example.com"',
+                'jira_api_token = "token"',
+                "[[projects]]",
+                'key = "SAT"',
+                "default = true",
+                "[[projects]]",
+                'key = "OTHERPROJ"',
+            ]
+        )
+    )
+
+    code = main(
+        [
+            "--config",
+            str(config_path),
+            "issue",
+            "--jira-dir",
+            str(tmp_path / "jira"),
+            "create",
+            "--type",
+            "Task",
+            "--summary",
+            "hi",
+            "--description",
+            "hi",
+            "--dry-run",
+        ]
+    )
+
+    assert code == 0
+
+
 def test_meta_ctrl_c_exits_without_traceback(tmp_path: Path, monkeypatch, capsys) -> None:
     def interrupt(*args, **kwargs) -> int:
         raise KeyboardInterrupt
@@ -1665,4 +2161,3 @@ def test_meta_ctrl_c_exits_without_traceback(tmp_path: Path, monkeypatch, capsys
     captured = capsys.readouterr()
     assert code == 130
     assert "Traceback" not in captured.err
-

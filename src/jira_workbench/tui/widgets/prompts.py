@@ -211,9 +211,9 @@ class OptionPickerScreen(ModalScreen[str | None]):
         with Vertical():
             yield Static(self._label, classes="title")
             yield Input(placeholder="type to filter", id="picker-filter")
+            yield OptionList(*(self._make_option(option) for option in self._options), id="picker-options")
             if self._on_toggle is not None and self._toggle_hint:
                 yield Checkbox(f"{self._toggle_hint} (ctrl+r)", id="picker-toggle")
-            yield OptionList(*(self._make_option(option) for option in self._options), id="picker-options")
             with Horizontal(classes="dialog-buttons"):
                 yield Button("Cancel (Esc)", id="cancel-button")
 

@@ -119,6 +119,34 @@ host = "127.0.0.1"
 port = 8765
 ```
 
+`jira-wb sync` syncs all configured Jira projects and Freshdesk sources.
+Use `jira-wb sync --source jira` or `jira-wb sync --source freshdesk` to sync
+only one source kind. `--force` applies to both; `--project` and other
+Jira options only affect Jira sync. A Freshdesk-only configuration needs no
+Jira project or credentials.
+
+To include Freshdesk, add a source to `config.toml`:
+
+```toml
+[[sources]]
+kind = "freshdesk"
+domain = "acme" # The subdomain in acme.freshdesk.com.
+api_key = "..."
+```
+
+Freshdesk sync is read-only and stores tickets under `jira_dir/freshdesk/`.
+Each sync removes local copies of tickets Freshdesk lists as deleted or spam;
+a full sync (the first one, or `--force`) also removes local tickets missing
+from the complete active-ticket listing. Changing the source's `domain` or
+`slug` makes the next sync a full one that replaces the previous account's
+cached tickets; changing only the `api_key` does not (the key is never written
+to the cache).
+Tickets appear as `FD-<id>`, so a configuration with a Freshdesk source cannot
+also sync a Jira project keyed `FD`. The source slug `jira` is reserved.
+Only one Freshdesk source is supported for now: a second `[[sources]]` entry
+is rejected as a configuration error, because every Freshdesk source would
+share the `freshdesk/` cache and the `FD-<id>` key space.
+
 ### Multiple projects
 
 `project = "SAT"` above is shorthand for a single, default, read-write project.
@@ -138,9 +166,16 @@ read_only = true
 - Exactly one entry may set `default = true` -- this is the project the TUI
   opens against and the one `jira-wb issue create` targets when `--project`
   isn't passed.
-- `read_only = true` blocks field/status edits, pushes, and new-issue creation
-  for that project everywhere (CLI and TUI) -- **adding a comment still always
-  works**, even on a read-only project, since comments are never blocked.
+- `read_only = true` blocks field/status edits and new-issue creation for that
+  project everywhere (CLI, TUI, and web UI). It is also enforced at push time:
+  field/status changes staged before the project became read-only are refused
+  by `shadow push` (and the TUI/web push actions) and stay staged. **Comments
+  still always work**, even on a read-only project: comment additions, edits,
+  and deletions are pushed, and a shadow mixing both pushes its comment
+  changes and keeps only the refused field/status changes staged.
+- Setting `read_only = true` takes effect on the next command, without a
+  sync. Removing it (making a project writable again) takes effect after the
+  next `jira-wb sync`.
 - All projects share the same `jira_url`/`jira_email`/`jira_api_token` --
   multi-project support assumes one Jira Cloud site with shared credentials,
   not several separate instances.
@@ -178,6 +213,16 @@ This only changes what a *future* sync fetches -- an issue that's already
 been synced and later ages out of the window is left alone on disk, not
 deleted. If a project's local storage grows too large over time, pruning
 old synced issues is a separate concern this doesn't address yet.
+
+An issue Jira no longer returns at all -- not even through a direct
+`key in (...)` lookup that ignores the history cutoff -- is either deleted or
+no longer visible to your account (issue security or project permissions);
+Jira hides both the same way. Sync therefore never deletes its local copy:
+it moves the issue's folder to `jira_dir/trash/<KEY>-<UTC timestamp>/` and
+drops it from the index. Move a folder back under `components/` and sync
+again to restore it, or delete `trash/` entries once you no longer need them.
+Issues with unpushed local edits (`shadow.json`) are kept in place and
+reported instead.
 
 One consequence of excluding old Done issues: a parent (Epic, Story, or
 anything else `fields.parent` can point at) might be old and Done enough to
@@ -271,18 +316,20 @@ By default the picker only offers versions that are both unreleased and unarchiv
 
 ## Boards (Kanban)
 
-A Jira board is not a field on an issue — it's a saved filter (JQL), plus, for Kanban boards, a separate active/backlog split tracked by Jira itself. Jira Workbench reproduces both locally:
+A Jira board is not a field on an issue — it's a saved filter (JQL), plus a separate active/backlog split tracked by Jira itself. Jira Workbench reproduces both locally:
 
 - **Board membership**: each board's filter is fetched once (`jira-wb meta refresh --boards`) and compiled into a small local predicate, then evaluated against your *locally synced and shadow-edited* copy of each issue — so editing a component or label locally updates board membership immediately, without waiting for a push or another refresh, the same way every other local filter already works.
-- **Active vs. backlog** (Kanban boards only): fetched from Jira's real backlog data at refresh time and cached alongside membership. This part genuinely can't be shadow-live — it's a classification Jira computes server-side, not a field — so it reflects the state as of your last `meta refresh --boards`, the same kind of staleness this tool already accepts for versions and components between refreshes.
+- **Active vs. backlog**: fetched from Jira's real backlog data (`GET /rest/agile/1.0/board/{id}/backlog`) at refresh time and cached alongside membership, for every board type. This part genuinely can't be shadow-live — it's a classification Jira computes server-side, not a field — so it reflects the state as of your last `meta refresh --boards`, the same kind of staleness this tool already accepts for versions and components between refreshes.
 
-Only a narrow, deliberately-scoped subset of JQL is supported: `field = value` / `field != value` clauses (a configured component field, `labels`, or `project`), combined with `AND`/`OR` and parentheses, with a trailing `ORDER BY` ignored. A board whose filter uses anything else (functions like `currentUser()`, date comparisons, `IN (...)`, other fields) is marked **unsupported** in `jira-wb meta boards` output rather than silently evaluated incorrectly.
+Only a narrow, deliberately-scoped subset of JQL is supported: `field = value` / `field != value` / `field IN (...)` / `field NOT IN (...)` clauses (a configured component field, `labels`, or `project`), combined with `AND`/`OR` and parentheses, with a trailing `ORDER BY` ignored. A board whose filter uses anything else (functions like `currentUser()`, date comparisons, other fields) is marked **unsupported** in `jira-wb meta boards` output rather than silently evaluated incorrectly.
 
-A board only ever shows issues from its own project in Jira, even when its saved filter's JQL never says so explicitly (many board filters are just e.g. `component = helm-chart`, relying on the board's own project association) — so a filter that doesn't already reference `project` itself is implicitly scoped to whichever project the board was fetched from. A board whose filter genuinely spans several projects (an explicit `project = A OR project = B`) is left alone.
+A board's saved filter is evaluated exactly as written: the project the board was fetched from adds no implicit constraint, because a company-managed board's filter can span several projects (a filter such as `labels = vip` matches every synced project's issues with that label). Jira boards only ever match Jira issues, never Freshdesk tickets; local boards can match either.
 
-**Sprints and Scrum-based backlogs are a different Jira feature and are explicitly not supported.** A Scrum board's filter membership is still evaluated (same as Kanban), but its active/backlog split is driven by Sprint field assignment, which Jira Workbench does not track — `backlogKeys` is always `null` for Scrum-type boards. Use Jira directly for sprint planning.
+**For Scrum boards, "active" means "in some sprint" (open, future, or closed), not specifically the currently-active sprint** — Jira's backlog endpoint only distinguishes "not yet pulled into any sprint" (backlog) from everything else, and Jira Workbench keeps that same binary split rather than introducing a third "which sprint" state.
 
-In the interactive `view`, use `f` (Filters) to filter by board and, for Kanban boards, by active/backlog scope, or `S` (swimlane) to group by board — an item genuinely can belong to more than one board at once (board membership isn't exclusive), so its swimlane shows every matching board joined together rather than duplicating the row.
+> **TODO**: refine Scrum board_scope to distinguish sprint states (e.g. only the currently-active sprint counts as "active", with issues in a closed sprint treated as their own bucket) instead of the current binary active/backlog split inherited from Kanban boards. Deliberately left as-is for now — binary is fine for filtering purposes, and a three-state model needs its own design (what does "active" mean for a board with zero active sprints, or several boards sharing overlapping sprints?).
+
+In the interactive `view`, use `f` (Filters) to filter by board and by active/backlog scope, or `S` (swimlane) to group by board — an item genuinely can belong to more than one board at once (board membership isn't exclusive), so its swimlane shows every matching board joined together rather than duplicating the row.
 
 "Moving an item between boards" and editing a board's filter from Jira Workbench are not supported yet — board membership follows directly from the same component/label fields you already edit via the normal shadow workflow, and the ambiguity of which field to change for an OR-based filter needs its own design before that's added.
 
@@ -301,7 +348,7 @@ A **local** board is a named, saved combination of the same filters Filters (`f`
 
 Every board — Jira or local — has an **Active** toggle (`a`), which is purely local and independent of whether Jira's own filter is supported: it only controls whether that board is offered as an option in the Filters screen's board picker (this Meta list always shows everything, active or not, so you can find and re-enable something later). Toggling active never affects matching for a board you've already selected, e.g. via a saved `[view].board` default.
 
-A local board can also define its own **Active filter** row — a Jira board's active/backlog split always comes from Jira's own live-fetched Kanban data (see above), but a local board has no such data, so by default `board_scope` is a no-op for it. Setting an Active filter (Enter on that row opens the same kind of filter-row sub-editor, minus the Name row) changes that: whatever matches it counts as "active"; everything else already on the board counts as "backlog" — mirroring Jira's own strict two-way Kanban split, just defined locally instead of fetched. Clearing it (`d` on that row) goes back to the no-op default.
+A local board can also define its own **Active filter** row — a Jira board's active/backlog split always comes from Jira's own live-fetched backlog data (see above), but a local board has no such data, so by default `board_scope` is a no-op for it. Setting an Active filter (Enter on that row opens the same kind of filter-row sub-editor, minus the Name row) changes that: whatever matches it counts as "active"; everything else already on the board counts as "backlog" — mirroring Jira's own strict two-way split, just defined locally instead of fetched. Clearing it (`d` on that row) goes back to the no-op default.
 
 ## Creating issues
 

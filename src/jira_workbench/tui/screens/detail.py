@@ -30,6 +30,7 @@ from ...view import (
     DEFAULT_RESOLUTIONS,
     apply_shadow,
     as_dict,
+    clone_prefill,
     comma_parts,
     comments_text,
     detail_field_rows,
@@ -82,6 +83,7 @@ class DetailScreen(Screen[None]):
         Binding("d", "show_diff", "Diff"),
         Binding("x", "view_field", "View full text"),
         Binding("c", "add_comment", "Comment"),
+        Binding("C", "clone_issue", "Clone"),
         Binding("r", "revert", "Revert"),
         Binding("p", "push", "Push"),
         Binding("O", "toggle_other", "Other fields"),
@@ -140,7 +142,7 @@ class DetailScreen(Screen[None]):
         self.title = issue_identity(effective)
         self._project_read_only = self.app.is_project_read_only(issue_project_key(effective))
 
-        header_lines = list(hierarchy_section(jira_dir, effective, self.app.component_field, items=self._items))
+        header_lines = list(hierarchy_section(jira_dir, effective, self.app.component_field_for(self.key), items=self._items))
         if shadow is not None and has_shadow_changes(shadow):
             header_lines.append("")
             header_lines.extend(shadow_change_summary(shadow, jira_dir, self.key))
@@ -157,9 +159,9 @@ class DetailScreen(Screen[None]):
         diff_widget.display = False
 
         comments = comments_text(jira_dir, self.key, shadow)
-        rows = list(detail_field_rows(effective, self.app.component_field, comments, edit_fields=self.edit_fields))
+        rows = list(detail_field_rows(effective, self.app.component_field_for(self.key), comments, edit_fields=self.edit_fields))
         if self.show_other_fields:
-            rows.extend((field, field, value) for field, value in other_field_rows(effective, self.app.component_field))
+            rows.extend((field, field, value) for field, value in other_field_rows(effective, self.app.component_field_for(self.key)))
 
         preview_lines = self.app.preview_lines
 
@@ -269,7 +271,7 @@ class DetailScreen(Screen[None]):
         return text
 
     def _pill_fields(self) -> set[str]:
-        component_field = self.app.component_field or "components"
+        component_field = self.app.component_field_for(self.key) or "components"
         return {"labels", "fixVersions", component_field} | {
             field_id for field_id, _ in label_type_fields(self.edit_fields)
         }
@@ -376,7 +378,8 @@ class DetailScreen(Screen[None]):
                 self.app.jira_dir,
                 self.key,
                 client,
-                self.app.component_field or "components",
+                self.app.component_field_for(self.key) or "components",
+                index_component_fields=self.app.index_component_fields,
             )
         except ShadowError as exc:
             self.notify(f"refresh failed: {exc}", severity="error")
@@ -401,7 +404,8 @@ class DetailScreen(Screen[None]):
                 self.key,
                 client,
                 progress=None,
-                component_field=self.app.component_field or "components",
+                component_field=self.app.component_field_for(self.key) or "components",
+                index_component_fields=self.app.index_component_fields,
             )
         except (MetadataError, ShadowError) as exc:
             self.notify(f"push failed: {exc}", severity="error")
@@ -423,6 +427,40 @@ class DetailScreen(Screen[None]):
             self.notify("no parent on this item")
             return
         self.app.push_screen(DetailScreen(key=parent_key, items=self._items))
+
+    @work
+    async def action_clone_issue(self) -> None:
+        project = issue_project_key(self.effective_issue)
+        if not project:
+            self.notify("cannot clone: no project configured", severity="warning")
+            return
+
+        from .issue_create import IssueCreateScreen, resolve_create_context
+
+        context = await resolve_create_context(self.app, project)
+        if context is None:
+            return
+        client, type_fields, default_reporter, default_reporter_account_id = context
+
+        prefill = clone_prefill(self.app.jira_dir, self.effective_issue, self.app.component_field_for(self.key))
+        new_key = await self.app.push_screen_wait(
+            IssueCreateScreen(
+                jira_dir=self.app.jira_dir,
+                project=str(project),
+                component_field=self.app.component_field_for(self.key) or "components",
+                type_fields=type_fields,
+                client=client,
+                epic_item=None,
+                default_reporter=default_reporter,
+                default_reporter_account_id=default_reporter_account_id,
+                context_label=f"Clone of {self.key}",
+                clone_prefill_values=prefill,
+            )
+        )
+        if new_key is None:
+            return
+        self.notify(f"created {new_key}")
+        self.app.push_screen(DetailScreen(key=new_key, items=self._items))
 
     def action_show_help(self) -> None:
         from .help import HelpScreen
@@ -449,7 +487,7 @@ class DetailScreen(Screen[None]):
         if field == "description":
             await self._view_field(field)
             return
-        editable_fields = editable_detail_fields(self.app.component_field, self.edit_fields)
+        editable_fields = editable_detail_fields(self.app.component_field_for(self.key), self.edit_fields)
         if field not in editable_fields:
             self.notify(f"{field} is not editable")
             return
@@ -466,13 +504,13 @@ class DetailScreen(Screen[None]):
             self._refresh_data()
 
     async def _view_field(self, field: str) -> None:
-        editable = field in editable_detail_fields(self.app.component_field, self.edit_fields)
+        editable = field in editable_detail_fields(self.app.component_field_for(self.key), self.edit_fields)
         result = await self.app.push_screen_wait(
             TextViewScreen("Description", self._field_values.get(field, ""), editable=editable)
         )
         if result is None:
             return
-        encoded = encode_edit_value(field, result, component_field=self.app.component_field)
+        encoded = encode_edit_value(field, result, component_field=self.app.component_field_for(self.key))
         set_field(self.app.jira_dir, self.key, field, encoded)
         self.app.mark_changed(self.key)
         self.mode = "shadow"
@@ -496,7 +534,7 @@ class DetailScreen(Screen[None]):
         options = selectable_field_options(
             self.app.jira_dir,
             field,
-            self.app.component_field,
+            self.app.component_field_for(self.key),
             # effective_issue, not issue -- reflects an unpushed local
             # component/status shadow edit, so e.g. picking Version right
             # after changing Component filters by the *new* component, not
@@ -513,7 +551,7 @@ class DetailScreen(Screen[None]):
             value = await self.app.push_screen_wait(TextPromptScreen(f"{field}:", initial=current_value))
         if value is None:
             return
-        encoded = encode_edit_value(field, value, component_field=self.app.component_field)
+        encoded = encode_edit_value(field, value, component_field=self.app.component_field_for(self.key))
         set_field(self.app.jira_dir, self.key, field, encoded)
         self.app.mark_changed(self.key)
         self.mode = "shadow"
@@ -546,7 +584,7 @@ class DetailScreen(Screen[None]):
         # deliberate second step), revealed with "r" without leaving the
         # picker.
         project = issue_project_key(self.effective_issue)
-        component = hierarchy_component(self.effective_issue, self.app.component_field)
+        component = hierarchy_component(self.effective_issue, self.app.component_field_for(self.key))
 
         def options_for(include_released: bool) -> list[str]:
             return version_options(
@@ -568,7 +606,7 @@ class DetailScreen(Screen[None]):
         )
         if value is None:
             return
-        encoded = encode_edit_value("fixVersions", value, component_field=self.app.component_field)
+        encoded = encode_edit_value("fixVersions", value, component_field=self.app.component_field_for(self.key))
         set_field(self.app.jira_dir, self.key, "fixVersions", encoded)
         self.app.mark_changed(self.key)
         self.mode = "shadow"
@@ -595,7 +633,9 @@ class DetailScreen(Screen[None]):
         # status a picker can ever show here has, by construction, already
         # been observed on some locally synced issue (see
         # observed_field_options), so its category is always known.
-        categories = observed_status_category_map(self.app.jira_dir)
+        # Within this issue's own project: two projects can share a status
+        # name with different categories (team-managed workflows).
+        categories = observed_status_category_map(self.app.jira_dir, issue_project_key(self.effective_issue))
         result = await self.app.push_screen_wait(
             StatusChangeScreen(
                 options,

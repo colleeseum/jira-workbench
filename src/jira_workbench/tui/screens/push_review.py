@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from textual import work
@@ -28,11 +29,22 @@ class PushReviewScreen(Screen[bool]):
         Binding("escape", "cancel", "Cancel"),
     ]
 
-    def __init__(self, jira_dir: Path, keys: list[str], *, component_field: str | None = None) -> None:
+    def __init__(
+        self,
+        jira_dir: Path,
+        keys: list[str],
+        *,
+        component_field: str | None = None,
+        component_field_for: Callable[[str], str | None] | None = None,
+    ) -> None:
         super().__init__()
         self.jira_dir = jira_dir
         self.keys = keys
         self.component_field = component_field
+        self.component_field_for = component_field_for
+
+    def _component_field(self, key: str) -> str | None:
+        return self.component_field_for(key) if self.component_field_for else self.component_field
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -53,7 +65,7 @@ class PushReviewScreen(Screen[bool]):
             shadow = load_shadow(self.jira_dir, key)
             effective = apply_shadow(issue, shadow) if shadow is not None else issue
             fields = as_dict(effective.get("fields"))
-            component = hierarchy_component(effective, self.component_field)
+            component = hierarchy_component(effective, self._component_field(key))
             summary = display_name(fields.get("summary"))
             state = display_name(shadow.get("state")) or "working" if shadow else "working"
             summary_lines = shadow_change_summary(shadow, self.jira_dir, key) if shadow else []
@@ -80,7 +92,7 @@ class PushReviewScreen(Screen[bool]):
             return
         from .diff_view import SideBySideDiffScreen
 
-        await self.app.push_screen_wait(SideBySideDiffScreen(self.jira_dir, key, component_field=self.component_field))
+        await self.app.push_screen_wait(SideBySideDiffScreen(self.jira_dir, key, component_field=self._component_field(key)))
 
     def action_push(self) -> None:
         self.dismiss(True)

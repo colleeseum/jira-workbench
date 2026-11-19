@@ -16,6 +16,7 @@ from .metadata import (
     load_all_boards_with_settings,
     load_all_components,
     load_all_versions,
+    load_component_settings,
     load_field_names,
     load_versions,
     normalize_versions,
@@ -24,11 +25,13 @@ from .metadata import (
 from .shadow import load_shadow, render_diff
 from .sync import (
     FALLBACK_DONE_STATUS_NAMES,
+    ComponentFields,
     find_existing_issue,
     issue_key_sort_key,
     issue_path_sort_key,
     issue_project_key,
     read_json,
+    resolve_component_field,
     status_category_key,
 )
 
@@ -38,7 +41,7 @@ class ViewError(RuntimeError):
 DEFAULT_RESOLUTIONS = ["Done", "Won't Do", "Duplicate", "Cannot Reproduce"]
 VIRTUAL_NONE = "(none)"
 FILTER_ANY = "(any)"  # UI-only "no filter on this dimension" sentinel; never stored
-SWIMLANE_MODES = ("none", "epic", "version", "component", "board")
+SWIMLANE_MODES = ("none", "epic", "version", "component", "board", "assignee")
 REPORT_FIELD_LABELS = {
     "assignee": "assignee",
     "fixVersions": "version",
@@ -204,6 +207,58 @@ def is_active_item(item: dict[str, Any]) -> bool:
     return display_name(item.get("status")).strip().lower() not in FALLBACK_DONE_STATUS_NAMES
 
 
+def archived_version_names(jira_dir: Path, project: str) -> set[str]:
+    """Lowercased display names of every version `project`'s own versions
+    cache marks archived -- one of the sets is_archived_item checks an
+    item's own fields against. Archiving is the one unambiguous "this is
+    really gone" signal Jira gives for a version (unlike released, which
+    is routine and doesn't by itself mean an item tied to it should
+    disappear)."""
+    versions = normalize_versions(load_versions(jira_dir, project))
+    return {
+        version_name(version).strip().lower()
+        for version in versions
+        if isinstance(version, dict) and is_archived_version(version)
+    }
+
+
+def archived_component_names(jira_dir: Path, project: str) -> set[str]:
+    """Lowercased names of every component `project` has locally marked
+    archived (see metadata.set_component_archived) -- unlike
+    archived_version_names, this has no Jira source at all (Jira's REST
+    API has no archived concept for components), so it's read straight
+    from component_settings.json, jira-wb's own local-only annotation file
+    that a Jira metadata refresh never touches."""
+    settings = load_component_settings(jira_dir)
+    return {name.strip().lower() for name in settings["archivedComponents"].get(project, [])}
+
+
+def is_archived_item(
+    item: dict[str, Any],
+    archived_names_by_project: dict[str, set[str]],
+    archived_component_names_by_project: dict[str, set[str]] | None = None,
+) -> bool:
+    """An item counts as archived if any of its own fix versions is itself
+    an archived version (see archived_version_names), or if its component
+    is itself an archived component (see archived_component_names) --
+    expected to grow other criteria later (hence a single named predicate
+    here, rather than an inline check at each call site). A native
+    multi-valued component is stored as one comma-joined display string
+    (see component_template_options_for's own comma-splitting in
+    server.py) -- comma_parts here matches a single-valued component just
+    as well, so this doesn't need to special-case either shape."""
+    project = str(item.get("project") or "")
+    fix_version_names = archived_names_by_project.get(project)
+    if fix_version_names and any(
+        str(version).strip().lower() in fix_version_names for version in item.get("fixVersions") or []
+    ):
+        return True
+    component_names = (archived_component_names_by_project or {}).get(project)
+    if component_names:
+        return any(part.strip().lower() in component_names for part in comma_parts(str(item.get("component") or "")))
+    return False
+
+
 def field_value(item: dict[str, Any], field: str) -> str:
     """Generic display-value extraction for an equality-filterable field.
 
@@ -273,6 +328,21 @@ def is_stale_done(item: dict[str, Any], *, max_age_days: int) -> bool:
     return (now - changed_at).days > max_age_days
 
 
+def format_display_datetime(value: str | None) -> str:
+    """Jira's own timestamp format (e.g. "2025-08-19T14:57:06.203-0400")
+    shown as something a person actually reads at a glance, for the Detail
+    page's Created/Updated fields -- kept in the timestamp's own reported
+    offset rather than converted to any particular timezone (there's no
+    single "local" timezone to convert to on a server-rendered page)."""
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
 def filter_items(
     items: list[dict[str, Any]],
     *,
@@ -284,9 +354,13 @@ def filter_items(
     board: str | None = None,
     board_scope: str | None = None,
     max_done_age_days: int | None = None,
+    show_archived: bool = False,
+    archived_names_by_project: dict[str, set[str]] | None = None,
+    archived_component_names_by_project: dict[str, set[str]] | None = None,
 ) -> list[dict[str, Any]]:
     field_filters = field_filters or {}
     modified_keys = modified_keys or set()
+    archived_names_by_project = archived_names_by_project or {}
     # Modified combines with the other filters like any of them: picking a
     # specific component while Modified is on narrows to that component's
     # modified items; leaving component at "(any)" (an empty field_filters
@@ -301,6 +375,7 @@ def filter_items(
         and (not modified_only or display_name(item.get("key")) in modified_keys)
         and matches_board(item, board, board_scope)
         and (max_done_age_days is None or not is_stale_done(item, max_age_days=max_done_age_days))
+        and (show_archived or not is_archived_item(item, archived_names_by_project, archived_component_names_by_project))
     ]
 
 
@@ -339,6 +414,20 @@ def find_next_item_index(
 def distinct_field_values(
     items: list[dict[str, Any]], field: str, *, empty_bucket: str = VIRTUAL_NONE
 ) -> list[tuple[str, int]]:
+    """Every distinct value for `field` actually observed on `items`, with
+    counts -- what both the TUI's Filters screen and the web GUI's filter
+    chips (assignee, status, ...) offer as options.
+
+    Deliberately local-only: this is whoever/whatever already appears on
+    your synced issues, not a live query against Jira's own APIs (e.g. the
+    project's assignable-users list, which is governed by a separate
+    permission from project access/role membership and is commonly broader
+    -- that's genuine Jira behavior, not something this reflects). Kept
+    this way for simplicity and because it works fully offline; if you want
+    the assignee filter (or any other field here) to instead reflect a live
+    Jira query, that's a deliberate scope decision, not an oversight --
+    PRs welcome.
+    """
     counts: dict[str, int] = {}
     for item in items:
         value = field_value(item, field) or empty_bucket
@@ -432,6 +521,8 @@ def swimlane_label(item: dict[str, Any], swimlane: str | None) -> str | None:
         return virtual_none(item_fix_version(item))
     if mode == "component":
         return virtual_none(display_name(item.get("component")))
+    if mode == "assignee":
+        return virtual_none(display_name(item.get("assignee")))
     if mode == "board":
         # An item can genuinely belong to more than one board (board
         # membership is a JQL filter match, not an exclusive field) -- shown
@@ -731,6 +822,19 @@ def display_name(value: Any) -> str:
     return str(value)
 
 
+def avatar_url(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    avatar_urls = value.get("avatarUrls")
+    if not isinstance(avatar_urls, dict):
+        return ""
+    for size in ("32x32", "24x24", "48x48", "16x16"):
+        url = avatar_urls.get(size)
+        if isinstance(url, str) and url:
+            return url
+    return ""
+
+
 def display_component(value: Any) -> str:
     # "_unassigned" is the real on-disk sync sentinel for "no component"
     # (see sync.py's component_slug) -- meaningful for filtering, but not a
@@ -757,70 +861,233 @@ def load_cached_boards(jira_dir: Path) -> list[dict[str, Any]]:
     return load_all_boards_with_settings(jira_dir)
 
 
+def _directory_component_hint(path: str | None) -> str | None:
+    """The on-disk component segment of a `db.items` row's stored
+    `components/<component>/<key>` path -- the hint find_existing_issue/
+    load_shadow need to skip their own directory glob. NOT the same thing
+    as the row's own enriched `component` field: that's hierarchy_component's
+    *display* value (e.g. a custom field's value), which commonly differs
+    from the directory an issue actually synced into (native "components"
+    vs. a project's configured component_field, unassigned-vs-fallback,
+    etc.) -- passing it as a hint would silently miss on every such issue
+    and force the expensive glob fallback for the majority of a real
+    dataset instead of the rare few it's meant for."""
+    if not path:
+        return None
+    parts = path.split("/")
+    return parts[1] if len(parts) >= 2 else None
+
+
+def _enrich_indexed_item(
+    jira_dir: Path,
+    indexed: dict[str, Any],
+    component_field: ComponentFields,
+    *,
+    boards: list[dict[str, Any]],
+    status_categories: dict[str, str],
+    version_names: dict[str, str],
+    dev_status_field: str | None,
+) -> dict[str, Any]:
+    """One `db.list_items()` row, finished exactly the way load_manifest_items
+    always has: shadow-bearing items get a live raw-issue.json re-read
+    (with_local_index_fields), everything else gets its fixVersion(s)
+    re-resolved against the current versions cache and otherwise trusts
+    the stored row as-is (including boards/boardStatus, kept current by
+    db.recompute_board_membership -- see its own docstring)."""
+    directory_hint = _directory_component_hint(indexed.get("path"))
+    # has_shadow is a plain column read, no filesystem check at all -- only
+    # the ~14 shadow-bearing items on the real dataset pay for a raw
+    # issue.json re-read via with_local_index_fields below (which does its
+    # own load_shadow call to actually fetch the content).
+    if indexed.get("hasShadow"):
+        # with_local_index_fields derives its own file-lookup hint from
+        # item["component"] -- swap in the directory hint just for that
+        # lookup; it gets fully overwritten by compute_issue_fields' real
+        # value before the enriched dict is returned, so this never leaks
+        # into the final "component" field.
+        return with_local_index_fields(
+            jira_dir,
+            {**indexed, "component": directory_hint},
+            component_field,
+            boards=boards,
+            status_categories=status_categories,
+            version_names=version_names,
+            dev_status_field=dev_status_field,
+        )
+    indexed = dict(indexed)
+    # fixVersion/fixVersions were resolved from the *versions cache as of
+    # the last reindex* when this row was written -- a version can be
+    # renamed since then without the issue itself changing (versions.json
+    # updates immediately on rename; this item won't until its next
+    # sync/reindex), so re-resolve against the current cache on every read
+    # instead of trusting the stored name.
+    resolved_fix_versions = resolve_fix_version_names(jira_dir, indexed.get("rawFixVersions"), id_to_name=version_names)
+    indexed["fixVersion"] = resolved_fix_versions[0] if resolved_fix_versions else ""
+    indexed["fixVersions"] = resolved_fix_versions
+    return indexed
+
+
 def load_manifest_items(
-    jira_dir: Path, component_field: str | None = None, *, dev_status_field: str | None = None
+    jira_dir: Path, component_field: ComponentFields = None, *, dev_status_field: str | None = None
 ) -> list[dict[str, Any]]:
+    """Reads the SQLite index (already carrying every enrichment field
+    `compute_issue_fields` computes, baked in at the last `jira-wb sync`)
+    instead of re-parsing manifest.json and re-reading every raw
+    issue.json -- the change that eliminates the historical full-file
+    re-read on every manifest load. A shadow-bearing item (rare -- ~14 of
+    8,759 issues on the real dataset) is the only case that still needs a
+    raw issue.json re-read, since a shadow overlay must stay live at read
+    time (see with_local_index_fields)."""
+    from .db import list_items  # deferred: avoid a module-level import cycle with db.py
+
     manifest_path = jira_dir / "manifest.json"
     if not manifest_path.exists():
         raise ViewError(f"manifest not found under {jira_dir}. Run jira-wb sync first.")
     manifest = read_json(manifest_path)
-    items = manifest.get("workItems") if isinstance(manifest, dict) else None
-    if not isinstance(items, list):
+    manifest_items = manifest.get("workItems") if isinstance(manifest, dict) else None
+    if not isinstance(manifest_items, list):
         raise ViewError(f"manifest at {manifest_path} does not contain workItems")
     boards = load_cached_boards(jira_dir)
     status_categories = observed_status_category_map(jira_dir)
     version_names = version_id_to_name_map(jira_dir)
-    return sorted(
-        (
-            with_local_index_fields(
+    indexed_by_key = {item["key"]: item for item in list_items(jira_dir)}
+    enriched_items: list[dict[str, Any]] = []
+    for manifest_item in manifest_items:
+        if not isinstance(manifest_item, dict):
+            continue
+        key = display_name(manifest_item.get("key"))
+        indexed = indexed_by_key.get(key)
+        if indexed is None:
+            # Not (yet) in the SQLite index -- index.db predates this item
+            # (a manual file edit outside `jira-wb sync`, or a fresh
+            # manifest.json ahead of the next reindex) -- fall back to
+            # computing it live from the raw issue.json, exactly as before
+            # this index existed.
+            enriched_items.append(
+                with_local_index_fields(
+                    jira_dir,
+                    manifest_item,
+                    component_field,
+                    boards=boards,
+                    status_categories=status_categories,
+                    version_names=version_names,
+                    dev_status_field=dev_status_field,
+                )
+            )
+            continue
+        enriched_items.append(
+            _enrich_indexed_item(
                 jira_dir,
-                item,
+                indexed,
                 component_field,
                 boards=boards,
                 status_categories=status_categories,
                 version_names=version_names,
                 dev_status_field=dev_status_field,
             )
-            for item in items
-            if isinstance(item, dict)
-        ),
+        )
+    return sorted(
+        enriched_items,
         key=lambda item: issue_key_sort_key(display_name(item.get("key"))),
     )
 
 
-def with_local_index_fields(
+def filtered_manifest_items(
     jira_dir: Path,
-    item: dict[str, Any],
-    component_field: str | None = None,
+    component_field: ComponentFields = None,
     *,
-    boards: list[dict[str, Any]] | None = None,
+    field_filters: dict[str, list[str]] | None = None,
+    board: str | None = None,
+    dev_status_field: str | None = None,
+) -> list[dict[str, Any]]:
+    """A faster load_manifest_items for a caller that's about to run
+    view.py's own filter_items on the result anyway (server.py's
+    items_page is the only caller today) -- pushes field_filters/board
+    into the SQL query as a safe-superset WHERE clause (see
+    db.list_items), so filter_items ends up re-checking a small candidate
+    set instead of enriching and then discarding most of 8,759 items on
+    every request.
+
+    Deliberately skips load_manifest_items' manifest.json-driven "not (yet)
+    indexed" fallback: that path exists for an item added to manifest.json
+    before its own first reindex, a rare, transient, self-healing state
+    (the very next `jira-wb sync`/`db reindex` fixes it) -- worth a full
+    file fallback when reading *everything*, not worth reintroducing a
+    disk scan into a path whose entire purpose is avoiding one. If that
+    edge case matters for a given call site, use load_manifest_items
+    instead."""
+    from .db import list_items  # deferred: avoid a module-level import cycle with db.py
+
+    enriched_items = effective_indexed_items(
+        jira_dir,
+        list_items(jira_dir, field_filters=field_filters, board=board),
+        component_field,
+        dev_status_field=dev_status_field,
+    )
+    return sorted(
+        enriched_items,
+        key=lambda item: issue_key_sort_key(display_name(item.get("key"))),
+    )
+
+
+def effective_indexed_items(
+    jira_dir: Path,
+    indexed_items: list[dict[str, Any]],
+    component_field: ComponentFields = None,
+    *,
+    dev_status_field: str | None = None,
+) -> list[dict[str, Any]]:
+    """`db.list_items()`-shaped rows finished the way load_manifest_items
+    finishes them (see _enrich_indexed_item): a shadow-bearing row gets its
+    local shadow applied, so its values are the effective ones rather than
+    the un-shadowed values stored in the index."""
+    if not indexed_items:
+        return []
+    boards = load_cached_boards(jira_dir)
+    status_categories = observed_status_category_map(jira_dir)
+    version_names = version_id_to_name_map(jira_dir)
+    return [
+        _enrich_indexed_item(
+            jira_dir,
+            indexed,
+            component_field,
+            boards=boards,
+            status_categories=status_categories,
+            version_names=version_names,
+            dev_status_field=dev_status_field,
+        )
+        for indexed in indexed_items
+    ]
+
+
+def compute_issue_fields(
+    jira_dir: Path,
+    issue: dict[str, Any],
+    component_field: ComponentFields = None,
+    *,
+    fallback_component: Any = None,
     status_categories: dict[str, str] | None = None,
     version_names: dict[str, str] | None = None,
     dev_status_field: str | None = None,
 ) -> dict[str, Any]:
-    enriched = dict(item)
-    key = display_name(item.get("key"))
-    if not key:
-        return enriched
-    raw_component_hint = item.get("component")
-    component_hint = raw_component_hint if isinstance(raw_component_hint, str) else None
-    path = find_existing_issue(jira_dir / "components", key, component_hint=component_hint)
-    if path is None:
-        return enriched
-    issue = read_json(path)
-    if not isinstance(issue, dict):
-        return enriched
-    shadow = load_shadow(jira_dir, key, component_hint=component_hint)
-    if shadow is not None:
-        issue = apply_shadow(issue, shadow)
+    """Every field `with_local_index_fields` derives purely from one
+    issue's own raw data -- safe to compute once and reuse from two call
+    sites: `with_local_index_fields` itself (read time, on a shadow-merged
+    issue) and `db.reindex_items` (sync time, on the plain synced issue,
+    baked into the SQL index instead of recomputed on every manifest
+    load). Deliberately excludes `boards`/`boardStatus`: those depend on
+    the separately-refreshed boards cache (which can change between
+    re-syncs), so they must stay a read-time-only computation -- see
+    `with_local_index_fields`, the only caller that adds them on top."""
     fields = as_dict(issue.get("fields"))
     issue_type = fields.get("issuetype")
     status = fields.get("status")
     fix_version_names = resolve_fix_version_names(jira_dir, fields.get("fixVersions"), id_to_name=version_names)
     parent = as_dict(fields.get("parent"))
     parent_fields = as_dict(parent.get("fields"))
-    enriched["summary"] = display_name(fields.get("summary"))
-    enriched["status"] = display_name(status)
+    result: dict[str, Any] = {}
+    result["summary"] = display_name(fields.get("summary"))
+    result["status"] = display_name(status)
     # `status` is a bare name string (not the real status dict) whenever a
     # local shadow status-change is in effect (see apply_shadow) -- fall
     # back to whatever category this same status name resolves to
@@ -830,25 +1097,60 @@ def with_local_index_fields(
     if category is None:
         if status_categories is None:
             status_categories = observed_status_category_map(jira_dir)
-        category = status_categories.get(enriched["status"])
-    enriched["statusCategory"] = category
-    enriched["type"] = display_name(issue_type)
-    enriched["component"] = hierarchy_component(issue, component_field) or display_name(item.get("component"))
-    enriched["fixVersion"] = fix_version_names[0] if fix_version_names else ""
-    enriched["priority"] = display_name(fields.get("priority"))
-    enriched["assignee"] = display_name(fields.get("assignee"))
-    enriched["epic"] = display_name(parent.get("key"))
-    enriched["epicSummary"] = display_name(parent_fields.get("summary"))
-    enriched["statusCategoryChangeDate"] = display_name(fields.get("statuscategorychangedate"))
-    enriched["issueId"] = issue.get("id")
-    enriched["project"] = issue_project_key(issue)
-    enriched["devStatus"] = parse_dev_status_summary(fields.get(dev_status_field or DEV_STATUS_FIELD_DEFAULT))
+        category = status_categories.get(result["status"])
+    result["statusCategory"] = category
+    result["type"] = display_name(issue_type)
+    project = issue_project_key(issue)
+    result["component"] = hierarchy_component(issue, resolve_component_field(component_field, project)) or display_name(
+        fallback_component
+    )
+    result["fixVersion"] = fix_version_names[0] if fix_version_names else ""
+    # Full multi-value list, alongside the display-only singular
+    # "fixVersion" above (kept as-is -- other callers already depend on
+    # its exact single-name shape) -- needed by anything that edits fix
+    # versions from an already-enriched item without truncating an
+    # issue that genuinely has more than one.
+    result["fixVersions"] = fix_version_names
+    # The raw (unresolved) fixVersions field value, kept alongside the
+    # resolved names above so a caller working off a *stored* enrichment
+    # (db.reindex_items's SQL index) can re-resolve display names against
+    # whatever the versions cache says right now -- a version can be
+    # renamed well after this issue's own last sync/reindex (see
+    # resolve_fix_version_names), so baking only the resolved name into a
+    # long-lived store would go stale on rename until the next reindex.
+    result["rawFixVersions"] = fields.get("fixVersions")
+    result["priority"] = display_name(fields.get("priority"))
+    result["assignee"] = display_name(fields.get("assignee"))
+    result["assigneeAvatarUrl"] = avatar_url(fields.get("assignee"))
+    result["epic"] = display_name(parent.get("key"))
+    result["epicSummary"] = display_name(parent_fields.get("summary"))
+    result["statusCategoryChangeDate"] = display_name(fields.get("statuscategorychangedate"))
+    result["issueId"] = issue.get("id")
+    result["project"] = project
+    result["devStatus"] = parse_dev_status_summary(fields.get(dev_status_field or DEV_STATUS_FIELD_DEFAULT))
+    result["labels"] = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
+    return result
 
-    labels = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
-    enriched["labels"] = labels
+
+def attach_board_fields(
+    enriched: dict[str, Any],
+    key: str,
+    labels: list[str],
+    boards: list[dict[str, Any]] | None = None,
+    *,
+    jira_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Populate `boards`/`boardStatus` on an already-enriched item. Kept
+    separate from `compute_issue_fields` because board membership depends
+    on `meta/<PROJECT>/boards.json`, which is refreshed independently of
+    (and more often than) a full re-sync -- it must stay a read-time
+    computation, never baked into a sync-time index alongside the rest of
+    `compute_issue_fields`'s output."""
     if boards is None:
+        if jira_dir is None:
+            raise ValueError("attach_board_fields requires jira_dir when boards is not provided")
         boards = load_cached_boards(jira_dir)
-    component_value = enriched["component"] or None
+    component_value = enriched.get("component") or None
     matched_boards: list[str] = []
     board_status: dict[str, str] = {}
     for board in boards:
@@ -860,7 +1162,9 @@ def with_local_index_fields(
             predicate = board.get("predicate")
             if not predicate:
                 continue
-            matched = evaluate_predicate(predicate, component=component_value, labels=labels, project=enriched["project"])
+            matched = evaluate_predicate(
+                predicate, component=component_value, labels=labels, project=enriched.get("project")
+            )
         if not matched:
             continue
         name = str(board.get("name") or "")
@@ -888,11 +1192,50 @@ def with_local_index_fields(
     return enriched
 
 
+def with_local_index_fields(
+    jira_dir: Path,
+    item: dict[str, Any],
+    component_field: ComponentFields = None,
+    *,
+    boards: list[dict[str, Any]] | None = None,
+    status_categories: dict[str, str] | None = None,
+    version_names: dict[str, str] | None = None,
+    dev_status_field: str | None = None,
+) -> dict[str, Any]:
+    enriched = dict(item)
+    key = display_name(item.get("key"))
+    if not key:
+        return enriched
+    raw_component_hint = item.get("component")
+    component_hint = raw_component_hint if isinstance(raw_component_hint, str) else None
+    path = find_existing_issue(jira_dir / "components", key, component_hint=component_hint)
+    if path is None:
+        return enriched
+    issue = read_json(path)
+    if not isinstance(issue, dict):
+        return enriched
+    shadow = load_shadow(jira_dir, key, component_hint=component_hint)
+    if shadow is not None:
+        issue = apply_shadow(issue, shadow)
+    enriched.update(
+        compute_issue_fields(
+            jira_dir,
+            issue,
+            component_field,
+            fallback_component=item.get("component"),
+            status_categories=status_categories,
+            version_names=version_names,
+            dev_status_field=dev_status_field,
+        )
+    )
+    return attach_board_fields(enriched, key, enriched["labels"], boards, jira_dir=jira_dir)
+
+
 def refresh_index_item(
     jira_dir: Path,
     items: list[dict[str, Any]],
     key: str,
-    component_field: str | None = None,
+    component_field: ComponentFields = None,
     *,
     boards: list[dict[str, Any]] | None = None,
     status_categories: dict[str, str] | None = None,
@@ -1005,6 +1348,59 @@ def hierarchy_component(issue: dict[str, Any], component_field: str | None) -> s
     return display_name(fields.get("components")).strip()
 
 
+def _changelog_histories(issue: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The issue's own embedded changelog (sync.py fetches issues with
+    expand="changelog", written verbatim into issue.json), oldest-first --
+    or None if it's known to be incomplete (an issue with more field
+    changes than fit in one page: Jira's embedded expand is paginated,
+    default page size 100, and only ever returns the first/oldest page of
+    it) rather than [] (which would look the same as "genuinely zero
+    changes" to a caller). last_changed_by/resolved_by both refuse to
+    guess from a known-incomplete history rather than silently reporting
+    a wrong "most recent" author -- fetching the remaining pages to make
+    this always-complete is a real, larger follow-up (walking
+    /rest/api/2/issue/{key}/changelog the same way fetch_issue_comments
+    already walks comment pages), not done yet."""
+    changelog = issue.get("changelog")
+    if not isinstance(changelog, dict):
+        return None
+    histories = changelog.get("histories")
+    if not isinstance(histories, list):
+        return None
+    total = changelog.get("total")
+    max_results = changelog.get("maxResults")
+    if isinstance(total, int) and isinstance(max_results, int) and total > max_results:
+        return None
+    return histories
+
+
+def last_changed_by(issue: dict[str, Any]) -> str:
+    """Who made the most recent field change recorded in the issue's own
+    changelog -- Jira's issue fields alone only expose *when* it was last
+    updated (fields.updated), never a person, unlike created/reporter."""
+    histories = _changelog_histories(issue)
+    if not histories:
+        return ""
+    return display_name(as_dict(histories[-1]).get("author"))
+
+
+def resolved_by(issue: dict[str, Any]) -> str:
+    """Who made the changelog entry that set (not cleared) the issue's own
+    resolution field -- the last such entry, in case it was resolved,
+    reopened, and resolved again. Jira's fields.resolutiondate is only a
+    timestamp, same gap as fields.updated has for last_changed_by."""
+    histories = _changelog_histories(issue)
+    if not histories:
+        return ""
+    resolvers = [
+        as_dict(history).get("author")
+        for history in histories
+        for item in (as_dict(history).get("items") or [])
+        if isinstance(item, dict) and item.get("field") == "resolution" and item.get("to")
+    ]
+    return display_name(resolvers[-1]) if resolvers else ""
+
+
 def hierarchy_child_identity(issue: dict[str, Any], component_field: str | None) -> str:
     identity = issue_identity(issue)
     component = hierarchy_component(issue, component_field)
@@ -1025,6 +1421,32 @@ def _enriched_child_identity(item: dict[str, Any]) -> str:
     if not component:
         return identity
     return f"{key} [{component}] {summary}".rstrip()
+
+
+def clone_prefill(jira_dir: Path, issue: dict[str, Any], component_field: str | None) -> dict[str, str]:
+    """Field values to prefill an issue-create form for cloning `issue` --
+    unlike an epic-context prefill (component/version/priority/labels/
+    assignee/parent only, deliberately blank summary/description so a new
+    sibling/child doesn't accidentally inherit the epic's own text), a
+    clone is a genuine duplicate: summary (with a " (clone)" suffix so it's
+    never confused with the original) and description carry over too, and
+    the source issue's own type seeds the type picker instead of requiring
+    it to be re-picked from scratch."""
+    fields = as_dict(issue.get("fields"))
+    summary = display_name(fields.get("summary")).strip()
+    fix_version_names = resolve_fix_version_names(jira_dir, fields.get("fixVersions"))
+    labels = [label for label in as_list(fields.get("labels")) if isinstance(label, str)]
+    return {
+        "type": display_name(fields.get("issuetype")),
+        "summary": f"{summary} (clone)" if summary else "",
+        "description": text_from_adf(fields.get("description")),
+        "component": hierarchy_component(issue, component_field),
+        "version": fix_version_names[0] if fix_version_names else "",
+        "priority": display_name(fields.get("priority")),
+        "labels": ", ".join(labels),
+        "assignee": display_name(fields.get("assignee")),
+        "parent": display_name(as_dict(fields.get("parent")).get("key")),
+    }
 
 
 def hierarchy_section(
@@ -1156,14 +1578,35 @@ def selectable_field_options(
     return []
 
 
+_OBSERVED_FIELD_TO_ITEMS_COLUMN = {
+    "type": "item_type",
+    "status": "status",
+    "assignee": "assignee",
+    "priority": "priority",
+    "resolution": "resolution",
+}
+
+
 def observed_field_options(jira_dir: Path, field: str, *, include_empty: str | None = None) -> list[str]:
-    options = set()
-    for issue in local_issues(jira_dir):
-        fields = as_dict(issue.get("fields"))
-        value = fields.get("issuetype") if field == "type" else fields.get(field)
-        name = display_name(value).strip()
-        if name:
-            options.add(name)
+    from .db import distinct_item_values  # deferred: avoid a module-level import cycle with db.py
+
+    column = _OBSERVED_FIELD_TO_ITEMS_COLUMN.get(field)
+    indexed = distinct_item_values(jira_dir, column) if column else None
+    if indexed is not None:
+        options = set(indexed)
+    else:
+        # Either `field` isn't one of the columns items.py promotes
+        # (e.g. "resolution", "reporter" -- raw Jira fields with no
+        # dedicated column) or the SQL index has no rows yet -- fall back
+        # to scanning every issue.json directly, exactly as before this
+        # index existed.
+        options = set()
+        for issue in local_issues(jira_dir):
+            fields = as_dict(issue.get("fields"))
+            value = fields.get("issuetype") if field == "type" else fields.get(field)
+            name = display_name(value).strip()
+            if name:
+                options.add(name)
     # Priority has a real severity order (same PRIORITY_RANK the index table
     # sorts by) -- alphabetical would scatter it as Highest/High/Low/Lowest/
     # Medium, putting Medium at the end instead of in the middle where it
@@ -1177,7 +1620,7 @@ def observed_field_options(jira_dir: Path, field: str, *, include_empty: str | N
     return sorted_options
 
 
-def observed_status_category_map(jira_dir: Path) -> dict[str, str]:
+def observed_status_category_map(jira_dir: Path, project: str | None = None) -> dict[str, str]:
     """Status display name -> Jira's real statusCategory.key ("new"/
     "indeterminate"/"done"), built from every locally synced issue's own
     (never shadow-merged) status. A project's workflow can name its
@@ -1186,9 +1629,20 @@ def observed_status_category_map(jira_dir: Path) -> dict[str, str]:
     locally changed to (shadow-stored as a bare name, with no category of
     its own -- see apply_shadow) still be classified correctly, as long as
     that name has been observed on some synced issue anywhere in this
-    jira_dir."""
+    jira_dir. Pass `project` to classify an issue's status: workflows are
+    per project, so the same name can map to different categories in two
+    projects."""
+    from .db import observed_status_categories  # deferred: avoid a module-level import cycle with db.py
+
+    indexed = observed_status_categories(jira_dir, project=project)
+    if indexed is not None:
+        return indexed
+    # Not (yet) in the SQL index -- fall back to scanning every issue.json
+    # directly, exactly as before this index existed.
     categories: dict[str, str] = {}
     for issue in local_issues(jira_dir):
+        if project is not None and issue_project_key(issue) != project:
+            continue
         status = as_dict(as_dict(issue.get("fields")).get("status"))
         name = display_name(status.get("name")).strip()
         category = status_category_key(status)
@@ -1235,7 +1689,18 @@ def component_options(jira_dir: Path) -> list[str]:
 
 
 def is_archived_version(version: dict[str, Any]) -> bool:
-    return bool(version.get("archived"))
+    """True for a version Jira itself marks archived, or one literally
+    named "_archived" -- a local convention for treating a version as
+    archived (excluded from every dropdown/selection the same way, an
+    item still tagged with it hidden from the Items list by default) even
+    when it can't or hasn't been marked archived in Jira itself. This is
+    the one place that convention needs to live: every caller here
+    (archived_version_names, version_options, fix_version_groups, the
+    Meta > Versions page) already funnels through this single predicate,
+    so nothing downstream needs its own special case."""
+    if bool(version.get("archived")):
+        return True
+    return version_name(version).strip().lower() == "_archived"
 
 
 def _component_version_filter(
@@ -1354,7 +1819,20 @@ def parent_options(
         if is_valid_parent_candidate(issue, current_issue)
         and (not active or is_active_issue(issue))
     ]
-    return ["(none)", *sorted((option for option in options if option), key=issue_key_option_sort_key)]
+    # A real instance can have hundreds of valid parent candidates once
+    # every synced project's own epics are pooled together -- plain
+    # key-sorted, the current issue's own project's epics (almost always
+    # the ones actually wanted) end up buried wherever its project key
+    # happens to fall alphabetically among every other synced project's,
+    # rather than surfacing first the way a same-project parent should.
+    current_project = issue_project_key(current_issue) if current_issue else None
+
+    def parent_option_sort_key(option: str) -> tuple[int, tuple[str, int, str]]:
+        sort_key = issue_key_option_sort_key(option)
+        same_project = current_project is not None and sort_key[0] == current_project.upper()
+        return (0 if same_project else 1, sort_key)
+
+    return ["(none)", *sorted((option for option in options if option), key=parent_option_sort_key)]
 
 
 def is_active_issue(issue: dict[str, Any]) -> bool:
@@ -1588,6 +2066,65 @@ def list_comments(jira_dir: Path, key: str, shadow: dict[str, Any] | None = None
 
     rows.sort(key=lambda row: row["created"], reverse=True)
     return rows
+
+
+# "PLAT-8618", "SAT-248", etc. -- deliberately not anchored to a specific
+# project list here (see linked_jira_keys' own known_projects filter for
+# that); this pattern alone also matches Craft.io idea-board ids
+# ("STA-1234") and other PREFIX-NUMBER shapes that aren't Jira at all,
+# confirmed against this project's own real synced data.
+JIRA_KEY_MENTION_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]+)-(\d+)\b")
+
+# The Freshdesk-Jira sync bot's own comment phrasing ("Ticket ID: 1293
+# Note Added by ... in Freshdesk: ..."), plus the two real portal URL
+# shapes seen in this account's data (a support.<domain>.com custom-domain
+# link and the underlying stardog.freshdesk.com one) -- both end in
+# "tickets/<id>".
+FRESHDESK_TICKET_MENTION_PATTERN = re.compile(r"(?:Ticket ID:\s*(\d+)|(?:freshdesk\.com|/support/)[^\s]*?tickets/(\d+))")
+
+
+def linked_jira_keys(
+    ticket: dict[str, Any], conversations: list[dict[str, Any]], known_projects: set[str]
+) -> list[str]:
+    """Every Jira key a Freshdesk ticket's own tags/description/conversation
+    text mention, restricted to `known_projects` (the locally-synced Jira
+    project keys) -- without that filter, a coincidentally similar-shaped
+    id from an unrelated system (this account's own Craft.io idea ids look
+    exactly like a Jira key, e.g. "STA-1234") would be treated as a real
+    Jira link. Read-only navigation only -- see the "jump to related item"
+    scope in the architecture memory; this never writes anything back."""
+    keys: set[str] = set()
+
+    def scan(text: str) -> None:
+        for match in JIRA_KEY_MENTION_PATTERN.finditer(text):
+            project, number = match.group(1), match.group(2)
+            if project in known_projects:
+                keys.add(f"{project}-{number}")
+
+    for tag in ticket.get("tags") or []:
+        scan(str(tag))
+    scan(str(ticket.get("description_text") or ticket.get("description") or ""))
+    for conversation in conversations:
+        if isinstance(conversation, dict):
+            scan(str(conversation.get("body_text") or conversation.get("body") or ""))
+
+    return sorted(keys, key=issue_key_sort_key)
+
+
+def linked_freshdesk_ticket_ids(description_text: str, comment_text: str) -> list[str]:
+    """Every Freshdesk ticket id a Jira issue's own description/comments
+    mention -- the sync bot's "Ticket ID: N" phrasing, or a
+    support.stardog.com/stardog.freshdesk.com ticket URL. No known-id
+    filtering here (unlike linked_jira_keys) since any number could
+    plausibly be a real ticket -- the caller is expected to only render a
+    link once it's confirmed to actually exist locally (see
+    find_existing_ticket), the same "never a dead link" rule applied to
+    the Jira-key direction."""
+    ids: set[str] = set()
+    for text in (description_text, comment_text):
+        for match in FRESHDESK_TICKET_MENTION_PATTERN.finditer(text or ""):
+            ids.add(match.group(1) or match.group(2))
+    return sorted(ids, key=int)
 
 
 def other_field_rows(issue: dict[str, Any], component_field: str | None) -> list[tuple[str, str]]:

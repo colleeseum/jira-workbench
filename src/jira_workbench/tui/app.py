@@ -7,6 +7,7 @@ from textual import events
 from textual.app import App
 
 from ..metadata import JiraApiConfig, MetadataError, jira_api_client, load_project_registry
+from ..sync import ComponentFields
 from ..view import DEV_STATUS_FIELD_DEFAULT, normalize_swimlane
 
 DEFAULT_PREVIEW_LINES = 10
@@ -46,10 +47,12 @@ class JiraWorkbenchApp(App):
         config_path: Path | None = None,
         nerd_font: bool = False,
         dev_status_field: str | None = None,
+        component_fields: dict[str, str | None] | None = None,
     ) -> None:
         super().__init__()
         self.jira_dir = jira_dir
         self.component_field = component_field
+        self.component_fields = dict(component_fields or {})
         self.preview_lines = preview_lines if preview_lines and preview_lines > 0 else DEFAULT_PREVIEW_LINES
         self.hide_done_after_days = hide_done_after_days if hide_done_after_days and hide_done_after_days > 0 else None
         self.nerd_font_enabled = nerd_font
@@ -95,6 +98,24 @@ class JiraWorkbenchApp(App):
         # field/status edit already goes through regardless of entry point;
         # checking here just avoids surfacing a raw ShadowError to the user.
         self._read_only_projects = load_project_registry(self.jira_dir)
+
+    @property
+    def index_component_fields(self) -> ComponentFields:
+        """What to derive indexed/enriched components with: every configured
+        project's own field when known (the index spans all projects), else the
+        single default field."""
+        return self.component_fields or self.component_field
+
+    def component_field_for(self, key_or_project: str | None) -> str | None:
+        """The component field of the project an issue key (or project key)
+        belongs to. Projects can configure different fields, so the default
+        project's `component_field` must not be applied to every issue: that
+        would display, stage, and push the wrong field. Projects missing from
+        the configured map fall back to the default field."""
+        project = (key_or_project or "").rsplit("-", 1)[0] if key_or_project else ""
+        if project in self.component_fields:
+            return self.component_fields[project]
+        return self.component_field
 
     def is_project_read_only(self, project_key: str | None) -> bool:
         if not project_key:
@@ -200,6 +221,7 @@ def run_view(
     config_path: Path | None = None,
     nerd_font: bool = False,
     dev_status_field: str | None = None,
+    component_fields: dict[str, str | None] | None = None,
 ) -> None:
     app = JiraWorkbenchApp(
         jira_dir,
@@ -227,6 +249,7 @@ def run_view(
         config_path=config_path,
         nerd_font=nerd_font,
         dev_status_field=dev_status_field,
+        component_fields=component_fields,
     )
     app.run()
 
@@ -241,10 +264,12 @@ def run_meta_app(
     versions_filter: str | None = None,
     component_field: str | None = None,
     config_path: Path | None = None,
+    component_fields: dict[str, str | None] | None = None,
 ) -> int:
     app = JiraWorkbenchApp(
         jira_dir,
         component_field=component_field,
+        component_fields=component_fields,
         jira_url=jira_url,
         jira_email=jira_email,
         jira_api_token=jira_api_token,

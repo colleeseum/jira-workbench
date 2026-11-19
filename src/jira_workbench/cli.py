@@ -9,19 +9,23 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, ConfigError, choose, load_config, resolve_jira_dir, secure_config_permissions
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    ConfigError,
+    WorkbenchConfig,
+    choose,
+    load_config,
+    resolve_jira_dir,
+    secure_config_permissions,
+)
 from .metadata import (
     DEFAULT_METADATA_TTL_SECONDS,
     JiraApiConfig,
     MetadataError,
     add_component_api,
-    add_component_field_option_api,
-    add_version_api,
-    archive_version_api,
     check_jira_api_config,
     delete_version_api,
     format_boards,
-    format_component_field_option_cache,
     format_doctor_checks,
     format_components as format_meta_components,
     format_component_cache,
@@ -32,25 +36,28 @@ from .metadata import (
     load_all_components,
     load_all_versions,
     load_boards,
-    load_component_field_options,
     load_component_summary,
     load_components,
     load_versions,
-    merge_components,
-    normalize_boards,
-    normalize_components,
-    normalize_versions,
-    release_version_api,
-    rename_version_api,
+    refresh_assignees_api,
     refresh_boards_api,
     refresh_component_field_options_api,
     refresh_components_api,
     refresh_versions_api,
-    version_name,
+    seed_project_registry,
     write_project_registry,
 )
 from .issue import IssueError, build_create_fields, create_issue, fetch_issue_type_fields, resolve_reporter
 from .server import serve
+from .service import (
+    add_meta_component_field_option,
+    add_meta_version,
+    api_client_from_config,
+    archive_meta_version,
+    meta_component_field_options_output,
+    release_meta_version,
+    rename_meta_version,
+)
 from .shadow import (
     ShadowError,
     add_comment,
@@ -63,8 +70,20 @@ from .shadow import (
     shadow_status,
     unset_field,
 )
-from .sync import SyncConfig, SyncError, sync_project
-from .view import ViewError, detailed_shadow_report_lines, format_components, format_work_item
+from .sync import ComponentFields, SyncConfig, SyncError, sync_project
+from .view import SWIMLANE_MODES, ViewError, detailed_shadow_report_lines, format_components, format_work_item
+
+
+def tui_component_fields(
+    config: WorkbenchConfig, default_project: str | None, override: object | None = None
+) -> dict[str, str | None]:
+    """Each configured project's own component field, for the TUI to resolve
+    per issue rather than applying the default project's field everywhere.
+    An explicit --component-field applies to the default project only."""
+    fields = config.component_fields_by_project()
+    if override and default_project:
+        fields[default_project] = str(override)
+    return fields
 
 
 def open_interactive_view(
@@ -94,6 +113,7 @@ def open_interactive_view(
     config_path: Path | None = None,
     nerd_font: bool = False,
     dev_status_field: str | None = None,
+    component_fields: dict[str, str | None] | None = None,
 ) -> None:
     from .tui.app import run_view as run_textual_view
 
@@ -123,12 +143,13 @@ def open_interactive_view(
         config_path=config_path,
         nerd_font=nerd_font,
         dev_status_field=dev_status_field,
+        component_fields=component_fields,
     )
 
 
 _IN_PLACE_PROGRESS_PREFIXES = (
-    "[3/6] Syncing changed issues... ",
-    "[4/6] Backfilling parents excluded by the history cutoff... ",
+    "[3/7] Syncing changed issues... ",
+    "[5/7] Backfilling parents excluded by the history cutoff... ",
 )
 
 
@@ -167,7 +188,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    sync_parser = subparsers.add_parser("sync", help="Sync Jira work items into a local directory")
+    sync_parser = subparsers.add_parser(
+        "sync", help="Sync configured Jira and Freshdesk sources into a local directory"
+    )
+    sync_parser.add_argument(
+        "--source",
+        choices=["all", "jira", "freshdesk"],
+        default="all",
+        help=(
+            "Sources to sync (default: all configured Jira projects and Freshdesk sources). "
+            "Use jira or freshdesk to sync only that source kind. --force applies to both; "
+            "project, history, component, and Jira connection options apply only to Jira."
+        ),
+    )
     sync_parser.add_argument("--project", default=os.environ.get("JIRA_PROJECT"))
     sync_parser.add_argument("--component-field", default=os.environ.get("JIRA_COMPONENT_FIELD"))
     sync_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
@@ -212,8 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
     view_parser.add_argument("--filter", help="Filter the interactive item list by text pattern")
     view_parser.add_argument(
         "--swimlane",
-        choices=["none", "epic", "version", "component"],
-        help="Group the interactive item list by epic, version, or component",
+        choices=list(SWIMLANE_MODES),
+        help="Group the interactive item list by epic, version, component, board, or assignee",
     )
     view_parser.add_argument("--components", action="store_true", help="List synced components and exit")
     view_parser.add_argument(
@@ -266,6 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
     meta_refresh.add_argument("--versions", action="store_true", help="Refresh project fix versions")
     meta_refresh.add_argument("--components", action="store_true", help="Refresh project components")
     meta_refresh.add_argument("--boards", action="store_true", help="Refresh Jira Kanban boards and membership")
+    meta_refresh.add_argument(
+        "--assignees", action="store_true", help="Refresh the project's currently assignable (active) users"
+    )
 
     meta_versions = meta_subparsers.add_parser("versions", help="List cached Jira project fix versions")
     meta_versions.add_argument(
@@ -360,6 +396,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     meta_subparsers.add_parser("doctor", help="Test Jira Workbench metadata configuration")
 
+    db_parser = subparsers.add_parser("db", help="Manage the local SQLite index (index.db)")
+    db_parser.add_argument("--jira-dir", default=os.environ.get("JIRA_DIR"))
+    db_parser.add_argument("--component-field", default=os.environ.get("JIRA_COMPONENT_FIELD"))
+    db_subparsers = db_parser.add_subparsers(dest="db_command")
+
+    db_subparsers.add_parser(
+        "reindex", help="Rebuild index.db's items table from the locally synced issue.json files"
+    )
+
+    db_backup = db_subparsers.add_parser("backup", help="Back up index.db via SQLite's online backup API")
+    db_backup.add_argument("dest", help="Destination path for the backup copy")
+
     shadow_parser = subparsers.add_parser(
         "shadow",
         help="Manage local-only Jira changes",
@@ -409,6 +457,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def sync_configured_freshdesk(config: WorkbenchConfig, jira_dir: Path, *, force: bool = False) -> int:
+    from .freshdesk import FreshdeskClient, FreshdeskError, sync_freshdesk_source
+
+    if not config.freshdesk_sources:
+        print(
+            "error: no [[sources]] entries configured (kind = \"freshdesk\") in config.toml",
+            file=sys.stderr,
+        )
+        return 2
+    exit_code = 0
+    for freshdesk_source in config.freshdesk_sources:
+        progress_label = freshdesk_source.slug if len(config.freshdesk_sources) > 1 else None
+        progress = sync_progress_printer(sys.stderr, project=progress_label)
+        client = FreshdeskClient(freshdesk_source, progress=progress)
+        try:
+            result = sync_freshdesk_source(
+                freshdesk_source, jira_dir, client, force=force, progress=progress
+            )
+        except FreshdeskError as exc:
+            print(f"error: syncing freshdesk source {freshdesk_source.slug}: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+        prefix = "Synced" if len(config.freshdesk_sources) == 1 else f"Synced {freshdesk_source.slug}:"
+        failed_note = f", {len(result.failed_keys)} failed" if result.failed_keys else ""
+        print(f"{prefix} {result.ticket_count} tickets ({result.changed_count} changed{failed_note}).")
+        if result.failed_keys:
+            exit_code = 1
+            print(f"  could not sync: {', '.join(result.failed_keys)}", file=sys.stderr)
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -425,9 +504,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # Bring the on-disk read-only/default registry up to date with this
+    # config before any command runs -- otherwise a project newly declared
+    # (or newly marked `read_only = true`) stays "fully permissive" for
+    # staging and pushing until a full `sync` happens to run. This only adds
+    # missing entries and tightens to read-only; clearing read-only is left
+    # to `sync`'s full write_project_registry (see seed_project_registry).
+    seed_project_registry(resolve_jira_dir(getattr(args, "jira_dir", None), config.jira_dir), config.resolved_projects())
+
     if args.command == "sync":
-        component_field = choose(args.component_field, config.component_field) or "components"
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
+
+        if args.source == "freshdesk":
+            return sync_configured_freshdesk(config, jira_dir, force=args.force)
+
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
@@ -442,6 +532,8 @@ def main(argv: list[str] | None = None) -> int:
             projects_to_sync = [settings.key for settings in config.resolved_projects()]
 
         if not projects_to_sync:
+            if args.source == "all" and config.freshdesk_sources:
+                return sync_configured_freshdesk(config, jira_dir, force=args.force)
             print(
                 "error: missing required configuration: "
                 "project. Set it in ~/.config/jira-wb/config.toml or pass --project.",
@@ -455,11 +547,13 @@ def main(argv: list[str] | None = None) -> int:
 
         exit_code = 0
         for project in projects_to_sync:
+            component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
             try:
                 api_project, api_client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             except MetadataError as exc:
                 print(f"error: {exc}", file=sys.stderr)
-                return 2
+                exit_code = 2
+                continue
             history_months = (
                 int(args.history_months) if args.history_months is not None else config.effective_history_months(project)
             )
@@ -471,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
                         jira_dir=jira_dir,
                         force=args.force,
                         history_months=history_months,
+                        index_component_fields=config.component_fields_by_project(),
                     ),
                     api_client,
                     progress=sync_progress_printer(
@@ -485,16 +580,26 @@ def main(argv: list[str] | None = None) -> int:
             backfilled_note = (
                 f", {result.backfilled_parent_count} parent(s) backfilled" if result.backfilled_parent_count else ""
             )
+            deleted_note = f", {len(result.deleted_keys)} missing from Jira moved to trash" if result.deleted_keys else ""
             print(
                 f"{prefix} {result.work_item_count} work items "
                 f"({result.changed_count} changed, {result.skipped_count} unchanged, "
-                f"{result.version_count} versions cached{backfilled_note})."
+                f"{result.version_count} versions cached{backfilled_note}{deleted_note})."
             )
+            if result.shadow_protected_deleted_keys:
+                print(
+                    f"  kept locally (deleted in Jira, but has unpushed changes): "
+                    f"{', '.join(result.shadow_protected_deleted_keys)}",
+                    file=sys.stderr,
+                )
 
         # Keep the read-only/default registry current even when only a
         # single project was actively re-synced (see metadata.py's
         # write_project_registry/is_project_read_only).
         write_project_registry(jira_dir, config.resolved_projects())
+        if args.source == "all" and config.freshdesk_sources:
+            freshdesk_exit_code = sync_configured_freshdesk(config, jira_dir, force=args.force)
+            exit_code = max(exit_code, freshdesk_exit_code)
         return exit_code
 
     if args.command == "serve":
@@ -509,18 +614,19 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        serve(jira_dir, str(host), int(port))
+        serve(jira_dir, str(host), int(port), config, expanded_config_path)
         return 0
 
     if args.command == "view":
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
-        component_field = choose(args.component_field, config.component_field) or "components"
         # config.project is only the legacy flat `project = "SAT"` key -- a
         # [[projects]] config (see resolved_projects) needs this instead, or
         # the TUI thinks no project is configured at all (breaks Meta boards/
         # versions and anything else keyed off self.app.project), even
         # though sync already resolved a real default project just fine.
         default_project = config.default_project_key()
+        component_field = choose(args.component_field, config.effective_component_field(default_project)) or "components"
+        component_fields = tui_component_fields(config, default_project, args.component_field)
         view_project = config.view_project
         view_status = config.view_status
         view_component = choose(args.component, config.view_component)
@@ -578,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
                         config_path=config_path,
                         nerd_font=view_nerd_font,
                         dev_status_field=str(config.view_dev_status_field) if config.view_dev_status_field else None,
+                        component_fields=component_fields,
                     )
             else:
                 if args.diff or args.original:
@@ -607,6 +714,7 @@ def main(argv: list[str] | None = None) -> int:
                     config_path=config_path,
                     nerd_font=view_nerd_font,
                     dev_status_field=str(config.view_dev_status_field) if config.view_dev_status_field else None,
+                    component_fields=component_fields,
                 )
         except ViewError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -622,11 +730,14 @@ def main(argv: list[str] | None = None) -> int:
                 parser.print_help()
             return 0
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
-        project = choose(args.project, config.project)
+        # config.project is only the legacy flat `project = "SAT"` key -- a
+        # [[projects]] config (see resolved_projects) needs this instead,
+        # same fix as the view command's own default_project resolution.
+        project = choose(args.project, config.default_project_key())
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
-        component_field = choose(args.component_field, config.component_field) or "components"
+        component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
         issue_type = choose(args.type, config.issue_default_type)
         try:
             return run_issue(
@@ -638,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
                 jira_email,
                 jira_api_token,
                 issue_type,
+                index_component_fields=config.component_fields_by_project(),
             )
         except MetadataError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -665,11 +777,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "meta":
         jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
-        project = choose(args.project, config.project)
+        # Same fix as run_issue above -- config.project is only the legacy
+        # flat key, [[projects]] needs default_project_key() instead.
+        project = choose(args.project, config.default_project_key())
         jira_url = choose(args.jira_url, config.jira_url)
         jira_email = choose(args.jira_email, config.jira_email)
         jira_api_token = choose(args.jira_api_token, config.jira_api_token)
-        component_field = choose(args.component_field, config.component_field) or "components"
+        component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
+        component_fields = tui_component_fields(config, project, args.component_field)
         versions_filter = config.versions_filter
         try:
             try:
@@ -683,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
                     versions_filter,
                     component_field,
                     config_path,
+                    component_fields=component_fields,
                 )
             except KeyboardInterrupt:
                 print()
@@ -691,34 +807,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
+    if args.command == "db":
+        jira_dir = resolve_jira_dir(args.jira_dir, config.jira_dir)
+        project = config.default_project_key()
+        component_field = choose(args.component_field, config.effective_component_field(project)) or "components"
+        # The index spans every synced project: each one's own field, with an
+        # explicit --component-field applying to the default project only.
+        component_fields = tui_component_fields(config, project, args.component_field)
+        return run_db(args, jira_dir, component_fields or component_field)
+
     parser.print_help()
     return 0
-
-
-def api_client_from_config(
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> tuple[str, object]:
-    missing = [
-        name
-        for name, value in (
-            ("project", project),
-            ("jira_url", jira_url),
-            ("jira_email", jira_email),
-            ("jira_api_token", jira_api_token),
-        )
-        if value is None
-    ]
-    if missing:
-        raise MetadataError(
-            "missing required configuration for Jira API: "
-            f"{', '.join(missing)}. Set them in ~/.config/jira-wb/config.toml or pass flags."
-        )
-    return str(project), jira_api_client(
-        JiraApiConfig(url=str(jira_url), email=str(jira_email), api_token=str(jira_api_token))
-    )
 
 
 def issue_description(args: argparse.Namespace) -> str:
@@ -742,6 +841,8 @@ def run_issue(
     jira_email: object | None,
     jira_api_token: object | None,
     issue_type: object | None,
+    *,
+    index_component_fields: dict[str, str | None] | None = None,
 ) -> int:
     if args.issue_command == "create":
         api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
@@ -779,7 +880,13 @@ def run_issue(
                 print(f"{key}: {fields[key]}")
             return 0
         key = create_issue(client, fields)
-        refresh_local_issue_after_push(jira_dir, key, client, str(component_field or "components"))
+        refresh_local_issue_after_push(
+            jira_dir,
+            key,
+            client,
+            str(component_field or "components"),
+            index_component_fields=index_component_fields,
+        )
         print(f"created {key}: {summary}")
         return 0
 
@@ -809,6 +916,8 @@ def run_meta(
     versions_filter: object | None = None,
     component_field: object | None = None,
     config_path: Path | None = None,
+    *,
+    component_fields: dict[str, str | None] | None = None,
 ) -> int:
     if args.meta_command is None:
         from .tui.app import run_meta_app
@@ -822,6 +931,7 @@ def run_meta(
             versions_filter=str(versions_filter) if versions_filter else None,
             component_field=str(component_field) if component_field else None,
             config_path=config_path,
+            component_fields=component_fields,
         )
 
     if project is not None:
@@ -841,12 +951,16 @@ def run_meta(
         return 2
 
     if args.meta_command == "refresh":
-        refresh_versions_requested = args.versions or not (args.components or args.boards)
-        if refresh_versions_requested:
+        # No flags at all means "refresh everything" -- naming one or more
+        # flags switches to refreshing only those, same as before. Without
+        # this, a bare `meta refresh` silently refreshed versions only,
+        # which reads as "did nothing" for components/boards/assignees.
+        no_flags_given = not (args.versions or args.components or args.boards or args.assignees)
+        if args.versions or no_flags_given:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_versions_api(jira_dir, api_project, client)
             print(f"refreshed {len(cache.get('versions', []))} versions")
-        if args.components:
+        if args.components or no_flags_given:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             if component_field and str(component_field) != "components":
                 cache = refresh_component_field_options_api(jira_dir, api_project, str(component_field), client)
@@ -854,10 +968,21 @@ def run_meta(
             else:
                 cache = refresh_components_api(jira_dir, api_project, client)
                 print(f"refreshed {len(cache.get('components', []))} native components")
-        if args.boards:
+        if args.boards or no_flags_given:
             api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
             cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))
             print(f"refreshed {len(cache.get('boards', []))} boards")
+        if args.assignees or no_flags_given:
+            api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
+            cache = refresh_assignees_api(jira_dir, api_project, client)
+            print(f"refreshed {len(cache.get('assignees', []))} assignable users")
+            if cache.get("source") == "role-api-fallback":
+                print(
+                    "warning: Jira's internal Access-page API was unavailable -- fell back to the "
+                    "classic role-based API, which can still include people who no longer actually "
+                    "have project access (see config.toml's exclude_assignees for a manual override)",
+                    file=sys.stderr,
+                )
         return 0
 
     if args.meta_command == "versions":
@@ -895,7 +1020,7 @@ def run_meta(
                 end="",
             )
             return 0
-        components = load_component_summary(jira_dir)
+        components = load_component_summary(jira_dir, str(project) if project is not None else None)
         if components:
             print(format_meta_components(components), end="")
             return 0
@@ -932,37 +1057,30 @@ def run_meta(
         return 0
 
     if args.meta_command == "version-add":
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        cache = add_version_api(jira_dir, api_project, args.name, client)
-        print(f"created version {args.name}")
-        print(f"refreshed {len(cache.get('versions', []))} versions")
+        print(add_meta_version(jira_dir, args.name, project, jira_url, jira_email, jira_api_token), end="")
         return 0
 
     if args.meta_command == "version-rename":
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        cache = rename_version_api(jira_dir, api_project, args.version, args.new_name, client)
-        print(f"renamed version {args.version} to {args.new_name}")
-        print(f"refreshed {len(cache.get('versions', []))} versions")
+        print(
+            rename_meta_version(jira_dir, args.version, args.new_name, project, jira_url, jira_email, jira_api_token),
+            end="",
+        )
         return 0
 
     if args.meta_command == "version-release":
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        cache = release_version_api(
-            jira_dir,
-            api_project,
-            args.version,
-            client,
-            release_date=args.release_date,
+        print(
+            release_meta_version(
+                jira_dir, args.version, args.release_date, project, jira_url, jira_email, jira_api_token
+            ),
+            end="",
         )
-        print(getattr(cache, "message", f"released version {args.version}"))
-        print(f"refreshed {len(cache.get('versions', []))} versions")
         return 0
 
     if args.meta_command == "version-archive":
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        cache = archive_version_api(jira_dir, api_project, args.version, client)
-        print(getattr(cache, "message", f"archived version {args.version}"))
-        print(f"refreshed {len(cache.get('versions', []))} versions")
+        print(
+            archive_meta_version(jira_dir, args.version, project, jira_url, jira_email, jira_api_token),
+            end="",
+        )
         return 0
 
     if args.meta_command == "version-delete":
@@ -1060,271 +1178,22 @@ def run_meta(
     return 2
 
 
-MetaAction = Callable[[], str]
+def run_db(args: argparse.Namespace, jira_dir: Path, component_field: ComponentFields) -> int:
+    from . import db
 
+    if args.db_command == "reindex":
+        count = db.reindex_items(jira_dir, component_field)
+        print(f"reindexed {count} items into {db.db_path(jira_dir)}")
+        return 0
 
-def meta_versions_output(
-    jira_dir: Path,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    if project is None:
-        merged = load_all_versions(jira_dir)
-        if merged:
-            return format_versions({"versions": merged})
-    else:
-        cache = load_versions(jira_dir, str(project))
-        if cache is not None:
-            return format_versions(cache)
-    if project is not None and jira_url is not None and jira_email is not None and jira_api_token is not None:
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        return format_versions(refresh_versions_api(jira_dir, api_project, client))
-    raise MetadataError("no cached versions found and live metadata access is not configured")
+    if args.db_command == "backup":
+        dest = Path(str(args.dest))
+        db.backup(jira_dir, dest)
+        print(f"backed up index.db to {dest}")
+        return 0
 
-
-def meta_components_output(
-    jira_dir: Path,
-    project: object | None,
-    component_field: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    if component_field and str(component_field) != "components":
-        return meta_component_field_options_output(
-            jira_dir,
-            project,
-            component_field,
-            jira_url,
-            jira_email,
-            jira_api_token,
-        )
-    summary = load_component_summary(jira_dir)
-    if summary:
-        return format_meta_components(summary)
-    if project is None:
-        merged = load_all_components(jira_dir)
-        if merged:
-            return format_component_cache({"components": merged})
-    else:
-        cache = load_components(jira_dir, str(project))
-        if cache is not None:
-            return format_component_cache(cache)
-    if project is not None and jira_url is not None and jira_email is not None and jira_api_token is not None:
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        return format_component_cache(refresh_components_api(jira_dir, api_project, client))
-    raise MetadataError("no cached components found and live metadata access is not configured")
-
-
-def meta_component_field_options_output(
-    jira_dir: Path,
-    project: object | None,
-    component_field: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-    *,
-    cached: bool = False,
-) -> str:
-    if component_field is None:
-        raise MetadataError("component_field is required to list custom component field options")
-    if project is None:
-        raise MetadataError(f"no cached options found for {component_field}")
-    field_id = str(component_field)
-    cache = load_component_field_options(jira_dir, str(project), field_id)
-    if cache is None and not cached:
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        cache = refresh_component_field_options_api(jira_dir, api_project, field_id, client)
-    if cache is None:
-        raise MetadataError(f"no cached options found for {field_id}")
-    summary = load_component_summary(jira_dir)
-    if summary:
-        return format_meta_components(merge_components(normalize_components(cache.get("options")), summary))
-    return format_component_field_option_cache(cache)
-
-
-def add_meta_version(
-    jira_dir: Path,
-    name: str,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-    cache = add_version_api(jira_dir, api_project, name, client)
-    return f"created version {name}\nrefreshed {len(cache.get('versions', []))} versions\n"
-
-
-def add_meta_component(
-    jira_dir: Path,
-    name: str,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-    cache = add_component_api(jira_dir, api_project, name, client)
-    return f"created component {name}\nrefreshed {len(cache.get('components', []))} components\n"
-
-
-def add_meta_component_field_option(
-    jira_dir: Path,
-    name: str,
-    project: object | None,
-    component_field: object | None,
-    context_id: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    if component_field is None:
-        raise MetadataError("component_field is required to add custom component field options")
-    api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-    cache = add_component_field_option_api(
-        jira_dir,
-        api_project,
-        str(component_field),
-        str(context_id) if context_id else None,
-        name,
-        client,
-    )
-    return f"ensured custom component option {name} in {component_field}\nrefreshed {len(cache.get('options', []))} options\n"
-
-
-def rename_meta_version(
-    jira_dir: Path,
-    identifier: str,
-    new_name: str,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-    cache = rename_version_api(jira_dir, api_project, identifier, new_name, client)
-    return f"renamed version {identifier} to {new_name}\nrefreshed {len(cache.get('versions', []))} versions\n"
-
-
-def release_meta_version(
-    jira_dir: Path,
-    identifier: str,
-    release_date: str | None,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-    cache = release_version_api(jira_dir, api_project, identifier, client, release_date=release_date)
-    return f"{getattr(cache, 'message', f'released version {identifier}')}\nrefreshed {len(cache.get('versions', []))} versions\n"
-
-
-def archive_meta_version(
-    jira_dir: Path,
-    identifier: str,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-    cache = archive_version_api(jira_dir, api_project, identifier, client)
-    return f"{getattr(cache, 'message', f'archived version {identifier}')}\nrefreshed {len(cache.get('versions', []))} versions\n"
-
-
-def delete_meta_version(
-    jira_dir: Path,
-    identifier: str,
-    move_fix_to: str | None,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> str:
-    api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-    cache = delete_version_api(
-        jira_dir,
-        api_project,
-        identifier,
-        client,
-        move_fix_to=move_fix_to,
-    )
-    detail = f"deleted version {identifier}"
-    if move_fix_to:
-        detail += f"; moved fixVersion references to {move_fix_to}"
-    return f"{detail}\nrefreshed {len(cache.get('versions', []))} versions\n"
-
-
-def load_meta_versions(
-    jira_dir: Path,
-    project: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> list[dict[str, object]]:
-    if project is None:
-        raise MetadataError("no cached versions found and live metadata access is not configured")
-    cache = load_versions(jira_dir, str(project))
-    if cache is None:
-        if jira_url is None or jira_email is None or jira_api_token is None:
-            raise MetadataError("no cached versions found and live metadata access is not configured")
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        cache = refresh_versions_api(jira_dir, api_project, client)
-    return normalize_versions(cache.get("versions"))
-
-
-def load_meta_boards(
-    jira_dir: Path,
-    project: object | None,
-    component_field: object | None,
-    jira_url: object | None,
-    jira_email: object | None,
-    jira_api_token: object | None,
-) -> list[dict[str, object]]:
-    if project is None:
-        raise MetadataError("no cached boards found and live metadata access is not configured")
-    cache = load_boards(jira_dir, str(project))
-    if cache is None:
-        if jira_url is None or jira_email is None or jira_api_token is None:
-            raise MetadataError("no cached boards found and live metadata access is not configured")
-        api_project, client = api_client_from_config(project, jira_url, jira_email, jira_api_token)
-        cache = refresh_boards_api(jira_dir, api_project, client, str(component_field or "components"))
-    return normalize_boards(cache.get("boards"))
-
-
-def version_identifier(version: dict[str, object]) -> str:
-    value = version.get("id")
-    if isinstance(value, str) and value:
-        return value
-    return version_name(version)
-
-
-def version_filter_text(version: dict[str, object]) -> str:
-    return " ".join(
-        [
-            version_name(version),
-            str(version.get("id") or ""),
-            "released" if version.get("released") else "unreleased",
-            "archived" if version.get("archived") else "",
-        ]
-    )
-
-
-def filter_versions(
-    versions: list[dict[str, object]],
-    pattern: str | None,
-) -> tuple[list[dict[str, object]], str | None]:
-    if not pattern:
-        return versions, None
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error as exc:
-        return versions, f"invalid regex: {exc}"
-    return [version for version in versions if regex.search(version_filter_text(version))], None
+    print("error: missing db command", file=sys.stderr)
+    return 2
 
 
 def run_shadow(args: argparse.Namespace, jira_dir: Path, config: object) -> int:
@@ -1419,7 +1288,8 @@ def run_shadow(args: argparse.Namespace, jira_dir: Path, config: object) -> int:
             jira_client=jira_client,
             dry_run=args.dry_run,
             progress=lambda message: print(message, file=sys.stderr),
-            component_field=str(config.component_field or "components"),
+            component_field_for=config.component_field_for_issue,
+            index_component_fields=config.component_fields_by_project(),
         )
         print(
             f"push summary: pushed={result.pushed} skipped={result.skipped} "

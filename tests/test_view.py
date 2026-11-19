@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from jira_workbench.cli import main
 from jira_workbench.metadata import remember_field_names
 from jira_workbench.shadow import add_comment, delete_comment, edit_comment, load_shadow, set_field
@@ -12,13 +14,17 @@ from jira_workbench.view import (
     PILL_PALETTE,
     PRIORITY_ICONS,
     TYPE_ICONS,
+    archived_component_names,
+    archived_version_names,
     assignee_first_name_map,
+    avatar_url,
     comment_body_text,
     comments_text,
     component_counts,
     cycle_component,
     cycle_fix_version,
     cycle_swimlane,
+    _directory_component_hint,
     detailed_shadow_report_lines,
     detail_field_rows,
     dev_status_indicator,
@@ -31,6 +37,7 @@ from jira_workbench.view import (
     filter_items_for_swimlane,
     find_item_index,
     find_next_item_index,
+    format_display_datetime,
     format_issue,
     format_work_item,
     full_diff_texts,
@@ -40,14 +47,22 @@ from jira_workbench.view import (
     index_item_parent_key,
     is_active_issue,
     is_active_item,
+    is_archived_item,
+    is_archived_version,
     is_stale_done,
     issue_link_groups,
     label_counts,
     label_options,
     label_type_fields,
+    last_changed_by,
+    filtered_manifest_items,
+    linked_freshdesk_ticket_ids,
+    linked_jira_keys,
     load_manifest_items,
     issue_parent_key,
     modified_issue_keys,
+    normalize_swimlane,
+    observed_field_options,
     observed_status_category_map,
     parent_options,
     parse_dev_status_summary,
@@ -58,6 +73,7 @@ from jira_workbench.view import (
     refresh_stale_index_items,
     report_field_label,
     resolve_fix_version_names,
+    resolved_by,
     selectable_field_options,
     shadow_change_summary,
     side_by_side_diff_lines,
@@ -398,6 +414,59 @@ def test_editable_field_choices_replace_native_components_with_override_field() 
     assert ("Components", "customfield_10071") in choices
     assert ("Components", "components") not in choices
     assert ("Parent", "parent") in choices
+
+
+def test_clone_prefill_copies_fields_and_suffixes_summary(tmp_path: Path) -> None:
+    from jira_workbench.view import clone_prefill
+
+    issue = {
+        "key": "SAT-1",
+        "fields": {
+            "summary": "Original title",
+            "description": "Original body",
+            "issuetype": {"name": "Task"},
+            "priority": {"name": "High"},
+            "components": [{"name": "helm-chart"}],
+            "fixVersions": [{"name": "2026.07"}],
+            "labels": ["infra", "helm"],
+            "assignee": {"displayName": "Alex"},
+            "parent": {"key": "SAT-100"},
+        },
+    }
+
+    prefill = clone_prefill(tmp_path, issue, "components")
+
+    assert prefill["type"] == "Task"
+    assert prefill["summary"] == "Original title (clone)"
+    assert prefill["description"] == "Original body"
+    assert prefill["component"] == "helm-chart"
+    assert prefill["version"] == "2026.07"
+    assert prefill["priority"] == "High"
+    assert prefill["labels"] == "infra, helm"
+    assert prefill["assignee"] == "Alex"
+    assert prefill["parent"] == "SAT-100"
+
+
+def test_clone_prefill_uses_custom_component_field_and_handles_blank_summary(tmp_path: Path) -> None:
+    from jira_workbench.view import clone_prefill
+
+    issue = {
+        "key": "SAT-2",
+        "fields": {
+            "summary": "",
+            "issuetype": {"name": "Bug"},
+            "customfield_10071": {"value": "gateway"},
+            "components": [{"name": "stray-native"}],
+        },
+    }
+
+    prefill = clone_prefill(tmp_path, issue, "customfield_10071")
+
+    assert prefill["summary"] == ""  # no source summary -- nothing to suffix
+    assert prefill["component"] == "gateway"
+    assert prefill["description"] == ""
+    assert prefill["version"] == ""
+    assert prefill["labels"] == ""
 
 
 def test_detail_field_rows_include_description_and_global_component_override() -> None:
@@ -963,6 +1032,43 @@ def test_selectable_field_options_use_local_issue_values(tmp_path: Path) -> None
     assert selectable_field_options(jira_dir, "customfield_10071", "customfield_10071") == ["API Team"]
 
 
+def test_observed_field_options_uses_the_sql_index_for_mapped_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # status/assignee/priority/type/resolution are all promoted db.items
+    # columns -- observed_field_options must answer from a single SQL
+    # query for these, not its own full issue.json rescan (the dominant
+    # cost of a real Items-list page load before this).
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"status": {"name": "Open"}, "resolution": {"name": "Fixed"}}},
+    )
+    reindex_items(tmp_path)
+
+    def fail_local_issues(jira_dir):
+        raise AssertionError("observed_field_options should not fall back to a full file scan")
+
+    monkeypatch.setattr(view_module, "local_issues", fail_local_issues)
+
+    assert observed_field_options(tmp_path, "status") == ["Open"]
+    assert observed_field_options(tmp_path, "resolution") == ["Fixed"]
+
+
+def test_observed_field_options_falls_back_to_a_file_scan_for_an_unmapped_field(tmp_path: Path) -> None:
+    # "reporter" (and anything else that isn't one of the fixed columns
+    # DISTINCT_VALUE_COLUMNS promotes) has no dedicated column -- must
+    # still work correctly, just via the slower path.
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"reporter": {"displayName": "Serge Colle"}}},
+    )
+
+    assert observed_field_options(tmp_path, "reporter") == ["Serge Colle"]
+
+
 def test_observed_field_options_orders_priority_by_severity(tmp_path: Path) -> None:
     jira_dir = synced_jira_dir(tmp_path)  # SAT-1 is "Medium"
     for index, name in enumerate(("Highest", "High", "Low", "Lowest")):
@@ -970,6 +1076,7 @@ def test_observed_field_options_orders_priority_by_severity(tmp_path: Path) -> N
             jira_dir / f"components/_unassigned/EXTRA-{index}/issue.json",
             {"key": f"EXTRA-{index}", "fields": {"priority": {"name": name}}},
         )
+    build_manifest(jira_dir)
 
     assert selectable_field_options(jira_dir, "priority") == ["Highest", "High", "Medium", "Low", "Lowest"]
 
@@ -1022,6 +1129,26 @@ def test_version_options_never_includes_archived_even_with_include_released(tmp_
     write_json(
         tmp_path / "meta/SAT/versions.json",
         {"versions": [{"id": "1", "name": "old-archived", "archived": True, "released": True}]},
+    )
+
+    assert version_options(tmp_path, include_released=True) == ["(none)"]
+
+
+def test_is_archived_version_treats_a_version_named__archived_as_archived_regardless_of_the_flag() -> None:
+    # A local convention: a version genuinely named "_archived" is treated
+    # as archived everywhere is_archived_version's callers already
+    # exclude archived versions, even when Jira's own flag says False --
+    # e.g. it can't or hasn't actually been archived in Jira itself.
+    assert is_archived_version({"name": "_archived", "archived": False}) is True
+    assert is_archived_version({"name": "_ARCHIVED", "archived": False}) is True
+    assert is_archived_version({"name": "kube 1.2.0", "archived": False}) is False
+    assert is_archived_version({"name": "kube 1.2.0", "archived": True}) is True
+
+
+def test_version_options_never_includes_a_version_named__archived(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {"versions": [{"id": "1", "name": "_archived", "archived": False, "released": False}]},
     )
 
     assert version_options(tmp_path, include_released=True) == ["(none)"]
@@ -1266,6 +1393,58 @@ def test_parent_options_for_story_only_show_active_epics(tmp_path: Path) -> None
         "(none)",
         "Epic: SAT-740 RELEASE_V1.2.0",
         "Epic: SAT-742 Closed Epic",
+    ]
+
+
+def test_parent_options_sorts_current_issues_own_project_first(tmp_path: Path) -> None:
+    # Regression: plain key-sorted, a real instance's own project's epics
+    # (almost always the ones actually wanted) end up buried wherever that
+    # project's key happens to fall alphabetically among every other
+    # synced project's -- "AAA-1" would always crowd out "SAT-14" even
+    # though the issue being edited is itself a SAT issue.
+    story = {
+        "key": "SAT-741",
+        "fields": {"summary": "Chainguard Zookeeper", "issuetype": {"name": "Story", "hierarchyLevel": 0}},
+    }
+    write_json(
+        tmp_path / "components/other/AAA-1/issue.json",
+        {"key": "AAA-1", "fields": {"summary": "Alphabetically first", "issuetype": {"name": "Epic", "hierarchyLevel": 1}}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-740/issue.json",
+        {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0", "issuetype": {"name": "Epic", "hierarchyLevel": 1}}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-14/issue.json",
+        {"key": "SAT-14", "fields": {"summary": "Secret injection", "issuetype": {"name": "Epic", "hierarchyLevel": 1}}},
+    )
+    write_json(tmp_path / "components/helm-chart/SAT-741/issue.json", story)
+
+    assert parent_options(tmp_path, current_issue=story) == [
+        "(none)",
+        "Epic: SAT-14 Secret injection",
+        "Epic: SAT-740 RELEASE_V1.2.0",
+        "Epic: AAA-1 Alphabetically first",
+    ]
+
+
+def test_parent_options_with_no_current_issue_falls_back_to_plain_key_sort(tmp_path: Path) -> None:
+    # No current_issue -- no project to prioritize, so this stays exactly
+    # the old plain key-sorted behavior (e.g. the New Issue page, before
+    # any issue/project is known).
+    write_json(
+        tmp_path / "components/other/AAA-1/issue.json",
+        {"key": "AAA-1", "fields": {"summary": "Alphabetically first", "issuetype": {"name": "Epic", "hierarchyLevel": 1}}},
+    )
+    write_json(
+        tmp_path / "components/helm-chart/SAT-740/issue.json",
+        {"key": "SAT-740", "fields": {"summary": "RELEASE_V1.2.0", "issuetype": {"name": "Epic", "hierarchyLevel": 1}}},
+    )
+
+    assert parent_options(tmp_path) == [
+        "(none)",
+        "Epic: AAA-1 Alphabetically first",
+        "Epic: SAT-740 RELEASE_V1.2.0",
     ]
 
 
@@ -1540,6 +1719,40 @@ def test_filter_items_can_include_closed_items() -> None:
     assert [item["key"] for item in filtered] == ["SAT-1", "SAT-2"]
 
 
+def test_filter_items_hides_archived_items_by_default() -> None:
+    items = [
+        {"key": "SAT-1", "project": "SAT", "fixVersions": ["kube 1.1.0"], "status": "Open"},
+        {"key": "SAT-2", "project": "SAT", "fixVersions": ["kube 1.3.0"], "status": "Open"},
+    ]
+    archived_by_project = {"SAT": {"kube 1.1.0"}}
+
+    assert [item["key"] for item in filter_items(items, archived_names_by_project=archived_by_project)] == ["SAT-2"]
+    assert [
+        item["key"]
+        for item in filter_items(items, show_archived=True, archived_names_by_project=archived_by_project)
+    ] == ["SAT-1", "SAT-2"]
+    # No archived_names_by_project at all (the default) never hides
+    # anything -- a caller that doesn't pass it shouldn't see items vanish.
+    assert [item["key"] for item in filter_items(items)] == ["SAT-1", "SAT-2"]
+
+
+def test_filter_items_hides_items_with_an_archived_component_by_default() -> None:
+    items = [
+        {"key": "SAT-1", "project": "SAT", "component": "helm-chart", "status": "Open"},
+        {"key": "SAT-2", "project": "SAT", "component": "terraform", "status": "Open"},
+    ]
+    archived_components = {"SAT": {"helm-chart"}}
+
+    assert [
+        item["key"]
+        for item in filter_items(items, archived_component_names_by_project=archived_components)
+    ] == ["SAT-2"]
+    assert [
+        item["key"]
+        for item in filter_items(items, show_archived=True, archived_component_names_by_project=archived_components)
+    ] == ["SAT-1", "SAT-2"]
+
+
 def test_filter_items_matches_text_pattern() -> None:
     items = [
         {"key": "SAT-1", "summary": "Prometheus support", "component": "helm-chart", "status": "Open"},
@@ -1705,12 +1918,24 @@ def test_swimlane_label_uses_virtual_none() -> None:
     assert swimlane_label(item, "none") is None
 
 
+def test_swimlane_label_assignee_mode() -> None:
+    assert swimlane_label({"key": "SAT-1", "assignee": "Serge Colle"}, "assignee") == "Serge Colle"
+    assert swimlane_label({"key": "SAT-2", "assignee": ""}, "assignee") == "(none)"
+    assert swimlane_label({"key": "SAT-3"}, "assignee") == "(none)"
+
+
+def test_normalize_swimlane_accepts_assignee() -> None:
+    assert normalize_swimlane("assignee") == "assignee"
+    assert normalize_swimlane("Assignee") == "assignee"
+
+
 def test_cycle_swimlane() -> None:
     assert cycle_swimlane("none") == "epic"
     assert cycle_swimlane("epic") == "version"
     assert cycle_swimlane("version") == "component"
     assert cycle_swimlane("component") == "board"
-    assert cycle_swimlane("board") == "none"
+    assert cycle_swimlane("board") == "assignee"
+    assert cycle_swimlane("assignee") == "none"
 
 
 def test_sort_items_for_swimlane_groups_virtual_none_first() -> None:
@@ -1816,6 +2041,198 @@ def test_load_manifest_items_enriches_missing_fix_version_from_issue_json(tmp_pa
     )
 
     assert load_manifest_items(tmp_path)[0]["fixVersion"] == "helm-chart-sa 3.4.4"
+
+
+def test_load_manifest_items_reflects_a_fix_version_rename_without_a_reindex(tmp_path: Path) -> None:
+    # Regression: db.reindex_items used to bake the *resolved* fix version
+    # name into the SQL index at reindex time. Renaming a version updates
+    # meta/<PROJECT>/versions.json immediately (see VersionsScreen's
+    # rename action) but doesn't touch the issue itself, so a name baked
+    # in at the last reindex went stale until the next full reindex --
+    # this must instead re-resolve against the current versions cache on
+    # every read, same as resolve_fix_version_names always promised.
+    from jira_workbench.db import reindex_items
+
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1"}]})
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"fixVersions": [{"id": "10000", "name": "v1"}]}},
+    )
+    write_json(tmp_path / "manifest.json", {"workItems": [{"key": "SAT-1"}]})
+    reindex_items(tmp_path, "customfield_10071")
+
+    assert load_manifest_items(tmp_path, component_field="customfield_10071")[0]["fixVersion"] == "v1"
+
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "v1-renamed"}]})
+
+    assert load_manifest_items(tmp_path, component_field="customfield_10071")[0]["fixVersion"] == "v1-renamed"
+
+
+def test_directory_component_hint_parses_the_stored_local_path() -> None:
+    assert _directory_component_hint("components/api-team/SAT-1") == "api-team"
+    assert _directory_component_hint("components/_unassigned/SAT-1") == "_unassigned"
+    assert _directory_component_hint(None) is None
+    assert _directory_component_hint("") is None
+
+
+def test_load_manifest_items_uses_the_directory_path_as_the_shadow_hint_not_the_enriched_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: db.items.component is hierarchy_component's *display*
+    # value ("API Team"), which commonly differs from the actual on-disk
+    # directory an issue synced into ("api-team") -- component_slug and
+    # hierarchy_component don't apply the same casing/hyphenation. Passing
+    # the display value as load_shadow's component_hint made every such
+    # item (the majority of a real dataset) miss the hint and fall back to
+    # a full directory glob per item, on every single load_manifest_items
+    # call -- silently as slow as the pre-SQL-index code it was meant to
+    # replace, just relocated. The hint must come from the item's own
+    # stored path instead.
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+    from jira_workbench.shadow import save_shadow
+
+    write_json(
+        tmp_path / "components/api-team/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "s", "customfield_10071": {"value": "API Team"}}},
+    )
+    write_json(tmp_path / "manifest.json", {"workItems": [{"key": "SAT-1"}]})
+    reindex_items(tmp_path, "customfield_10071")
+    indexed_component = load_manifest_items(tmp_path, component_field="customfield_10071")[0]["component"]
+    assert indexed_component == "API Team"  # confirms the mismatch the bug relied on actually exists
+
+    # A shadow is what actually triggers a load_shadow call with a
+    # component_hint in load_manifest_items now (has_shadow=false items
+    # skip the file check entirely) -- so this needs one to exercise the
+    # hint-selection logic at all.
+    save_shadow(tmp_path, "SAT-1", {"key": "SAT-1", "fields": {"summary": "shadow summary"}})
+
+    seen_hints = []
+    real_load_shadow = view_module.load_shadow
+
+    def spying_load_shadow(jira_dir, key, *, component_hint=None):
+        seen_hints.append(component_hint)
+        return real_load_shadow(jira_dir, key, component_hint=component_hint)
+
+    monkeypatch.setattr(view_module, "load_shadow", spying_load_shadow)
+
+    load_manifest_items(tmp_path, component_field="customfield_10071")
+
+    assert seen_hints == ["api-team"]
+
+
+def test_load_manifest_items_never_calls_load_shadow_for_an_item_without_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole point of items.has_shadow: a plain column read replaces a
+    # filesystem check for every item that doesn't have a shadow (the vast
+    # majority on a real dataset) -- load_shadow (a real path.exists()
+    # call) should only ever run for the few that do.
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+
+    write_json(tmp_path / "components/helm-chart/SAT-1/issue.json", {"key": "SAT-1", "fields": {"summary": "s"}})
+    write_json(tmp_path / "components/helm-chart/SAT-2/issue.json", {"key": "SAT-2", "fields": {"summary": "s"}})
+    write_json(tmp_path / "manifest.json", {"workItems": [{"key": "SAT-1"}, {"key": "SAT-2"}]})
+    reindex_items(tmp_path)
+
+    def fail_load_shadow(jira_dir, key, *, component_hint=None):
+        raise AssertionError(f"load_shadow should not be called for {key} -- it has no shadow")
+
+    monkeypatch.setattr(view_module, "load_shadow", fail_load_shadow)
+
+    load_manifest_items(tmp_path)
+
+
+def test_filtered_manifest_items_matches_load_manifest_items_filtered_in_python(tmp_path: Path) -> None:
+    # filtered_manifest_items pushes field_filters/board into SQL as a
+    # narrowing optimization only -- for any given filter, its result must
+    # be identical to running the exact same filter_items call against
+    # load_manifest_items' full, unfiltered output.
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "one",
+                "status": {"name": "Open"},
+                "assignee": {"displayName": "Serge Colle"},
+                "customfield_10071": {"value": "helm-chart"},
+            },
+        },
+    )
+    write_json(
+        tmp_path / "components/other/SAT-2/issue.json",
+        {
+            "key": "SAT-2",
+            "fields": {"summary": "two", "status": {"name": "Done"}, "customfield_10071": {"value": "other"}},
+        },
+    )
+    write_json(
+        tmp_path / "components/other/PLAT-1/issue.json",
+        {"key": "PLAT-1", "fields": {"summary": "three", "status": {"name": "Open"}}},
+    )
+    build_manifest(tmp_path, "customfield_10071")
+
+    for field_filters in (
+        {},
+        {"project": ["SAT"]},
+        {"status": ["Open"]},
+        {"assignee": ["(none)"]},
+        {"component": ["helm-chart"]},
+        {"project": ["SAT"], "status": ["Done"]},
+    ):
+        expected = filter_items(load_manifest_items(tmp_path, "customfield_10071"), field_filters=field_filters, active=False)
+        actual = filter_items(
+            filtered_manifest_items(tmp_path, "customfield_10071", field_filters=field_filters),
+            field_filters=field_filters,
+            active=False,
+        )
+        assert sorted(item["key"] for item in actual) == sorted(item["key"] for item in expected), field_filters
+
+
+def test_filtered_manifest_items_board_matches_load_manifest_items_filtered_in_python(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "one", "customfield_10071": {"value": "helm-chart"}}},
+    )
+    write_json(
+        tmp_path / "components/other/SAT-2/issue.json",
+        {"key": "SAT-2", "fields": {"summary": "two", "customfield_10071": {"value": "other"}}},
+    )
+    write_json(
+        tmp_path / "meta/SAT/boards.json",
+        {
+            "project": "SAT",
+            "boards": [{"id": 1, "name": "Helm board", "predicate": {"op": "eq", "field": "component", "value": "helm-chart"}}],
+        },
+    )
+    build_manifest(tmp_path, "customfield_10071")
+
+    expected = filter_items(load_manifest_items(tmp_path, "customfield_10071"), board="Helm board", active=False)
+    actual = filter_items(
+        filtered_manifest_items(tmp_path, "customfield_10071", board="Helm board"), board="Helm board", active=False
+    )
+    assert sorted(item["key"] for item in actual) == sorted(item["key"] for item in expected) == ["SAT-1"]
+
+
+def test_filtered_manifest_items_still_reflects_a_shadow_edit(tmp_path: Path) -> None:
+    # A shadow item must never be silently dropped by the SQL narrowing
+    # even when its *stored* column doesn't match the filter.
+    from jira_workbench.db import reindex_items
+    from jira_workbench.shadow import set_field
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "one", "assignee": {"displayName": "Serge Colle"}}},
+    )
+    reindex_items(tmp_path)
+    set_field(tmp_path, "SAT-1", "assignee", {"displayName": "Craig Oberg"})
+
+    items = filtered_manifest_items(tmp_path, field_filters={"assignee": ["Craig Oberg"]})
+    filtered = filter_items(items, field_filters={"assignee": ["Craig Oberg"]}, active=False)
+
+    assert [item["key"] for item in filtered] == ["SAT-1"]
 
 
 def test_refresh_index_item_applies_shadow_fix_version(tmp_path: Path) -> None:
@@ -2180,6 +2597,77 @@ def test_is_active_item_uses_real_status_category_not_hardcoded_names() -> None:
     assert is_active_item({"status": "Solved"}) is True  # unrecognized name, no category -- assumed active
 
 
+def test_archived_version_names_only_returns_versions_marked_archived(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {
+            "versions": [
+                {"id": "1", "name": "kube 1.1.0", "released": True, "archived": True},
+                {"id": "2", "name": "kube 1.3.0", "released": False, "archived": False},
+                {"id": "3", "name": "kube 1.2.0", "released": True, "archived": False},
+            ]
+        },
+    )
+
+    assert archived_version_names(tmp_path, "SAT") == {"kube 1.1.0"}
+
+
+def test_archived_version_names_includes_a_version_named__archived_even_unflagged(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "meta/SAT/versions.json",
+        {"versions": [{"id": "1", "name": "_archived", "released": False, "archived": False}]},
+    )
+
+    assert archived_version_names(tmp_path, "SAT") == {"_archived"}
+
+
+def test_is_archived_item_checks_fix_versions_against_the_archived_set() -> None:
+    archived_by_project = {"SAT": {"kube 1.1.0"}}
+
+    assert is_archived_item({"project": "SAT", "fixVersions": ["kube 1.1.0"]}, archived_by_project) is True
+    assert is_archived_item({"project": "SAT", "fixVersions": ["kube 1.3.0"]}, archived_by_project) is False
+    # No fix version at all, or a project with no known archived versions --
+    # never counts as archived (with no archived_component_names_by_project
+    # given either, see the dedicated component tests below).
+    assert is_archived_item({"project": "SAT"}, archived_by_project) is False
+    assert is_archived_item({"project": "PLAT", "fixVersions": ["kube 1.1.0"]}, archived_by_project) is False
+    # A multi-valued fixVersions list only needs one match.
+    assert is_archived_item({"project": "SAT", "fixVersions": ["kube 1.3.0", "kube 1.1.0"]}, archived_by_project) is True
+
+
+def test_archived_component_names_reads_the_local_component_settings_file(tmp_path: Path) -> None:
+    write_json(tmp_path / "meta/component_settings.json", {"archivedComponents": {"SAT": ["Helm-Chart"]}})
+
+    assert archived_component_names(tmp_path, "SAT") == {"helm-chart"}
+    # A project with no archived components at all -- never in the file --
+    # is just as empty as one that IS in the file with an empty list.
+    assert archived_component_names(tmp_path, "PLAT") == set()
+
+
+def test_is_archived_item_checks_component_against_the_archived_set_too() -> None:
+    archived_components = {"SAT": {"helm-chart"}}
+
+    assert is_archived_item({"project": "SAT", "component": "helm-chart"}, {}, archived_components) is True
+    assert is_archived_item({"project": "SAT", "component": "terraform"}, {}, archived_components) is False
+    # A native multi-valued component is one comma-joined display string --
+    # any one archived name in it is enough.
+    assert (
+        is_archived_item({"project": "SAT", "component": "terraform, helm-chart"}, {}, archived_components) is True
+    )
+    assert is_archived_item({"project": "SAT"}, {}, archived_components) is False
+    assert is_archived_item({"project": "PLAT", "component": "helm-chart"}, {}, archived_components) is False
+    # A fix-version match and a component match are independently
+    # sufficient -- either one alone is enough to count as archived.
+    assert (
+        is_archived_item(
+            {"project": "SAT", "fixVersions": ["kube 1.1.0"], "component": "terraform"},
+            {"SAT": {"kube 1.1.0"}},
+            archived_components,
+        )
+        is True
+    )
+
+
 def test_is_stale_done_uses_real_status_category() -> None:
     from datetime import UTC, datetime, timedelta
 
@@ -2191,6 +2679,97 @@ def test_is_stale_done_uses_real_status_category() -> None:
     assert is_stale_done(
         {"status": "Solved", "statusCategory": "indeterminate", "statusCategoryChangeDate": old}, max_age_days=7
     ) is False
+
+
+def test_format_display_datetime_reads_jiras_own_timestamp_format() -> None:
+    assert format_display_datetime("2025-08-19T14:57:06.203-0400") == "2025-08-19 14:57"
+    assert format_display_datetime("2025-11-12T09:29:10.037Z") == "2025-11-12 09:29"
+
+
+def test_format_display_datetime_handles_missing_or_invalid_values() -> None:
+    assert format_display_datetime(None) == ""
+    assert format_display_datetime("") == ""
+    assert format_display_datetime("not a date") == "not a date"
+
+
+def _issue_with_changelog(histories: list[dict]) -> dict:
+    return {
+        "key": "SAT-1",
+        "fields": {},
+        "changelog": {"startAt": 0, "maxResults": 100, "total": len(histories), "histories": histories},
+    }
+
+
+def test_last_changed_by_reads_the_most_recent_historys_author() -> None:
+    issue = _issue_with_changelog(
+        [
+            {"author": {"displayName": "Ada Lovelace"}, "items": [{"field": "priority"}]},
+            {"author": {"displayName": "Grace Hopper"}, "items": [{"field": "assignee"}]},
+        ]
+    )
+
+    assert last_changed_by(issue) == "Grace Hopper"
+
+
+def test_last_changed_by_empty_when_no_changelog_at_all() -> None:
+    # A pre-expand="changelog" synced issue, or one with genuinely no
+    # history -- either way, nothing to report, not a guess.
+    assert last_changed_by({"key": "SAT-1", "fields": {}}) == ""
+
+
+def test_last_changed_by_refuses_to_guess_from_a_truncated_changelog() -> None:
+    # total > maxResults -- the embedded page is oldest-first and doesn't
+    # include the real most recent change, so reporting histories[-1]'s
+    # author here would be actively wrong, not just incomplete.
+    issue = {
+        "key": "SAT-1",
+        "fields": {},
+        "changelog": {
+            "startAt": 0,
+            "maxResults": 1,
+            "total": 2,
+            "histories": [{"author": {"displayName": "Ada Lovelace"}, "items": []}],
+        },
+    }
+
+    assert last_changed_by(issue) == ""
+
+
+def test_resolved_by_finds_the_author_of_the_resolution_setting_change() -> None:
+    issue = _issue_with_changelog(
+        [
+            {"author": {"displayName": "Ada Lovelace"}, "items": [{"field": "priority"}]},
+            {
+                "author": {"displayName": "Grace Hopper"},
+                "items": [{"field": "resolution", "from": None, "to": "10000", "toString": "Fixed"}],
+            },
+            {"author": {"displayName": "Katherine Johnson"}, "items": [{"field": "assignee"}]},
+        ]
+    )
+
+    assert resolved_by(issue) == "Grace Hopper"
+
+
+def test_resolved_by_ignores_a_change_that_cleared_the_resolution() -> None:
+    # item.to is falsy -- the resolution was cleared (reopened), not set --
+    # this shouldn't count as "who resolved it".
+    issue = _issue_with_changelog(
+        [{"author": {"displayName": "Ada Lovelace"}, "items": [{"field": "resolution", "from": "10000", "to": None}]}]
+    )
+
+    assert resolved_by(issue) == ""
+
+
+def test_resolved_by_uses_the_latest_resolution_setting_change_if_resolved_more_than_once() -> None:
+    issue = _issue_with_changelog(
+        [
+            {"author": {"displayName": "Ada Lovelace"}, "items": [{"field": "resolution", "to": "10000"}]},
+            {"author": {"displayName": "Grace Hopper"}, "items": [{"field": "resolution", "to": None}]},
+            {"author": {"displayName": "Katherine Johnson"}, "items": [{"field": "resolution", "to": "10001"}]},
+        ]
+    )
+
+    assert resolved_by(issue) == "Katherine Johnson"
 
 
 def test_is_active_issue_uses_real_status_category() -> None:
@@ -2212,6 +2791,53 @@ def test_observed_status_category_map_scans_local_issues(tmp_path: Path) -> None
     )
 
     assert observed_status_category_map(tmp_path) == {"Solved": "done", "In Review": "indeterminate"}
+
+
+def test_observed_status_category_map_uses_the_sql_index_when_populated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: this used to unconditionally re-scan every issue.json on
+    # every call regardless of the SQL index existing -- on a large synced
+    # dataset that single call dominated load_manifest_items' total time
+    # even after items itself moved to SQL, since this ran once per
+    # load_manifest_items call independent of item count optimizations.
+    import jira_workbench.view as view_module
+    from jira_workbench.db import reindex_items
+
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"status": {"name": "Solved", "statusCategory": {"key": "done"}}}},
+    )
+    reindex_items(tmp_path)
+
+    def fail_local_issues(jira_dir):
+        raise AssertionError("observed_status_category_map should not fall back to a full file scan")
+
+    monkeypatch.setattr(view_module, "local_issues", fail_local_issues)
+
+    assert observed_status_category_map(tmp_path) == {"Solved": "done"}
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_observed_status_category_map_is_scoped_to_one_project(tmp_path: Path, indexed: bool) -> None:
+    # Regression (#53 review): the map was global, so a status name shared by
+    # two projects' workflows got whichever project's category won.
+    from jira_workbench.db import reindex_items
+
+    for key, category in (("SAT-1", "done"), ("OTH-1", "indeterminate")):
+        write_json(
+            tmp_path / f"components/_unassigned/{key}/issue.json",
+            {
+                "key": key,
+                "fields": {
+                    "project": {"key": key.split("-")[0]},
+                    "status": {"name": "Review", "statusCategory": {"key": category}},
+                },
+            },
+        )
+    if indexed:
+        reindex_items(tmp_path)
+
+    assert observed_status_category_map(tmp_path, "SAT") == {"Review": "done"}
+    assert observed_status_category_map(tmp_path, "OTH") == {"Review": "indeterminate"}
 
 
 def test_with_local_index_fields_resolves_shadow_changed_status_category(tmp_path: Path) -> None:
@@ -2236,6 +2862,49 @@ def test_with_local_index_fields_resolves_shadow_changed_status_category(tmp_pat
 
     assert enriched["status"] == "Solved"
     assert enriched["statusCategory"] == "done"
+
+
+def test_with_local_index_fields_extracts_the_assignees_avatar_url(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {
+            "key": "SAT-1",
+            "fields": {
+                "summary": "One",
+                "assignee": {
+                    "displayName": "Serge Colle",
+                    "avatarUrls": {"48x48": "https://example.com/48.png", "32x32": "https://example.com/32.png"},
+                },
+            },
+        },
+    )
+
+    enriched = with_local_index_fields(tmp_path, {"key": "SAT-1"}, "components")
+
+    assert enriched["assigneeAvatarUrl"] == "https://example.com/32.png"
+
+
+def test_with_local_index_fields_assignee_avatar_url_blank_when_unassigned(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "components/_unassigned/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"summary": "One"}},
+    )
+
+    enriched = with_local_index_fields(tmp_path, {"key": "SAT-1"}, "components")
+
+    assert enriched["assigneeAvatarUrl"] == ""
+
+
+def test_avatar_url_prefers_32x32_then_falls_back_by_size() -> None:
+    assert avatar_url({"avatarUrls": {"48x48": "big", "32x32": "mid"}}) == "mid"
+    assert avatar_url({"avatarUrls": {"48x48": "big"}}) == "big"
+    assert avatar_url({"avatarUrls": {"16x16": "small"}}) == "small"
+
+
+def test_avatar_url_blank_for_non_dict_or_missing_avatar_urls() -> None:
+    assert avatar_url(None) == ""
+    assert avatar_url("Serge Colle") == ""
+    assert avatar_url({"displayName": "Serge Colle"}) == ""
 
 
 def test_filter_items_max_done_age_days() -> None:
@@ -2264,3 +2933,72 @@ def test_cli_view_help_mentions_filters(capsys) -> None:
     assert "--component" in captured.out
     assert "--components" in captured.out
     assert "--all" in captured.out
+
+
+def test_linked_jira_keys_finds_a_tag_shaped_like_a_known_project_key() -> None:
+    ticket = {"tags": ["escalated_to_eng", "PLAT-8618"], "description": ""}
+
+    assert linked_jira_keys(ticket, [], {"PLAT", "SAT"}) == ["PLAT-8618"]
+
+
+def test_linked_jira_keys_ignores_a_tag_from_an_unknown_project() -> None:
+    # Confirmed against this project's own real data: Craft.io idea-board
+    # ids ("STA-1234") look exactly like a Jira key but aren't one --
+    # known_projects (the locally-synced project keys) is what excludes
+    # them, not a blocklist.
+    ticket = {"tags": ["STA-1036"], "description": ""}
+
+    assert linked_jira_keys(ticket, [], {"PLAT", "SAT"}) == []
+
+
+def test_linked_jira_keys_finds_a_mention_in_the_description() -> None:
+    ticket = {"tags": [], "description_text": "I created PLAT-6212 for this."}
+
+    assert linked_jira_keys(ticket, [], {"PLAT"}) == ["PLAT-6212"]
+
+
+def test_linked_jira_keys_finds_a_mention_in_a_conversation_reply() -> None:
+    ticket = {"tags": [], "description": ""}
+    conversations = [{"body_text": "escalated as SAT-883, will follow up"}]
+
+    assert linked_jira_keys(ticket, conversations, {"SAT"}) == ["SAT-883"]
+
+
+def test_linked_jira_keys_deduplicates_and_sorts_by_issue_number() -> None:
+    ticket = {"tags": ["PLAT-100"], "description_text": "see PLAT-100 and PLAT-5"}
+
+    assert linked_jira_keys(ticket, [], {"PLAT"}) == ["PLAT-5", "PLAT-100"]
+
+
+def test_linked_jira_keys_empty_when_nothing_matches() -> None:
+    ticket = {"tags": [], "description": "nothing relevant here"}
+
+    assert linked_jira_keys(ticket, [], {"PLAT"}) == []
+
+
+def test_linked_freshdesk_ticket_ids_finds_the_bot_comment_mirror_phrasing() -> None:
+    comment_text = "Ticket ID: 956 Note Added by Muneet Dohil in Freshdesk: Hi Stephen"
+
+    assert linked_freshdesk_ticket_ids("", comment_text) == ["956"]
+
+
+def test_linked_freshdesk_ticket_ids_finds_a_support_portal_url() -> None:
+    text = "duplicate of https://support.stardog.com/support/tickets/1840"
+
+    assert linked_freshdesk_ticket_ids(text, "") == ["1840"]
+
+
+def test_linked_freshdesk_ticket_ids_finds_the_underlying_freshdesk_com_url() -> None:
+    text = "see stardog.freshdesk.com/a/tickets/1215 for context"
+
+    assert linked_freshdesk_ticket_ids(text, "") == ["1215"]
+
+
+def test_linked_freshdesk_ticket_ids_deduplicates_and_sorts_numerically() -> None:
+    text = "Ticket ID: 200 and also Ticket ID: 50 and Ticket ID: 200 again"
+
+    assert linked_freshdesk_ticket_ids(text, "") == ["50", "200"]
+
+
+def test_linked_freshdesk_ticket_ids_empty_when_nothing_matches() -> None:
+    assert linked_freshdesk_ticket_ids("nothing here", "nor here") == []

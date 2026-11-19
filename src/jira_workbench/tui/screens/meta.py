@@ -11,7 +11,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, ListItem, ListView, Static
 
-from ...cli import (
+from ...service import (
     add_meta_component,
     add_meta_component_field_option,
     add_meta_version,
@@ -379,11 +379,18 @@ class VersionsScreen(Screen[None]):
             # just means these local copies stay stale until the next full
             # sync, not that the rename itself failed.
             return
-        component_field = self.app.component_field or "components"
         refreshed = 0
         for key in keys:
+            component_field = self.app.component_field_for(key) or "components"
             try:
-                await asyncio.to_thread(refresh_local_issue_after_push, self.app.jira_dir, key, client, component_field)
+                await asyncio.to_thread(
+                    refresh_local_issue_after_push,
+                    self.app.jira_dir,
+                    key,
+                    client,
+                    component_field,
+                    index_component_fields=self.app.index_component_fields,
+                )
             except ShadowError:
                 continue
             self.app.mark_changed(key)
@@ -852,7 +859,7 @@ class BoardsScreen(Screen[None]):
 
     def _manifest_items(self) -> list[dict[str, Any]]:
         if self._items is None:
-            self._items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+            self._items = load_manifest_items(self.app.jira_dir, self.app.index_component_fields)
         return self._items
 
     def compose(self) -> ComposeResult:
@@ -1050,7 +1057,7 @@ class LabelsScreen(Screen[None]):
         self._reload()
 
     def _reload(self) -> None:
-        items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        items = load_manifest_items(self.app.jira_dir, self.app.index_component_fields)
         self.counts = label_counts(items)
         self._rebuild_table()
 
@@ -1100,7 +1107,7 @@ class LabelsScreen(Screen[None]):
         await self._bulk_edit(label, None)
 
     async def _bulk_edit(self, label: str, new_name: str | None) -> None:
-        items = load_manifest_items(self.app.jira_dir, self.app.component_field)
+        items = load_manifest_items(self.app.jira_dir, self.app.index_component_fields)
         affected = [item for item in items if label in (item.get("labels") or [])]
         if not affected:
             self.notify(f"no issues currently have label '{label}'")
@@ -1150,7 +1157,13 @@ class LabelsScreen(Screen[None]):
         from .push_all import PushAllProgressScreen
 
         result = await self.app.push_screen_wait(
-            PushAllProgressScreen(self.app.jira_dir, keys, client, self.app.component_field or "components")
+            PushAllProgressScreen(
+                self.app.jira_dir,
+                keys,
+                client,
+                self.app.component_field or "components",
+                component_field_for=self.app.component_field_for,
+            )
         )
         if result is not None:
             self.notify(

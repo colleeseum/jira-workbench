@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from jira_workbench.metadata import (
     DoctorCheck,
@@ -16,6 +19,12 @@ from jira_workbench.metadata import (
     delete_local_board,
     delete_version_api,
     ensure_versions,
+    fetch_backlog_keys,
+    fetch_board_keys,
+    fetch_project_access_members,
+    fetch_project_actors_internal,
+    fetch_rank_field_id,
+    rank_custom_field_number,
     field_clause_names,
     format_boards,
     format_component_field_option_cache,
@@ -25,17 +34,24 @@ from jira_workbench.metadata import (
     format_versions,
     is_project_read_only,
     load_all_boards_with_settings,
+    load_assignees,
     load_board_settings,
     load_boards,
     load_component_field_options,
+    load_component_settings,
     load_component_summary,
     load_components,
     load_field_names,
     load_project_registry,
     load_versions,
+    move_issue_to_backlog,
+    move_issue_to_board,
     normalize_boards,
     normalize_components,
     normalize_versions,
+    rank_issue_after,
+    rank_issue_before,
+    refresh_assignees_api,
     refresh_boards_api,
     refresh_component_field_options_api,
     release_version_api,
@@ -45,9 +61,12 @@ from jira_workbench.metadata import (
     refresh_versions_api,
     remember_field_names,
     resolve_version_id,
+    seed_project_registry,
     set_board_active,
+    set_component_archived,
     set_local_board_filters,
     write_board_settings,
+    write_component_settings,
     write_project_registry,
 )
 from jira_workbench.config import ProjectSettings
@@ -60,6 +79,23 @@ class ApiClient:
         self.versions = [{"id": "10000", "name": "helm-chart-sa 3.4.0", "released": False, "archived": False}]
         self.components = [{"id": "10000", "name": "helm-chart"}]
         self.component_field_options = [{"id": "10114", "value": "helm-chart"}]
+        self.project_roles = {
+            "Administrator": "https://example.atlassian.net/rest/api/2/project/10020/role/10025",
+            "Member": "https://example.atlassian.net/rest/api/2/project/10020/role/10026",
+            "Viewer": "https://example.atlassian.net/rest/api/2/project/10020/role/10027",
+        }
+        self.role_actors = {
+            "10025": [{"displayName": "Serge Colle", "type": "atlassian-user-role-actor", "actorUser": {"accountId": "1"}}],
+            "10026": [
+                {"displayName": "Craig Oberg", "type": "atlassian-user-role-actor", "actorUser": {"accountId": "2"}}
+            ],
+            "10027": [{"displayName": "Al Baker", "type": "atlassian-user-role-actor", "actorUser": {"accountId": "3"}}],
+        }
+        self.project_actors = [
+            {"displayName": "Serge Colle", "accountId": "1", "active": True, "type": "atlassian-user-role-actor"},
+            {"displayName": "Craig Oberg", "accountId": "2", "active": True, "type": "atlassian-user-role-actor"},
+            {"displayName": "Al Baker", "accountId": "3", "active": False, "type": "atlassian-user-role-actor"},
+        ]
 
     def project(self, key: str) -> dict[str, str]:
         self.calls.append(("project", key))
@@ -167,6 +203,14 @@ class ApiClient:
         filter_ids = {32: "10089", 36: "10166"}
         return {"filter": {"id": filter_ids[board_id]}}
 
+    def get_project_roles(self, project_key: str) -> object:
+        self.calls.append(("get_project_roles", project_key))
+        return self.project_roles
+
+    def get_project_actors_for_role_project(self, project_key: str, role_id: object) -> object:
+        self.calls.append(("get_project_actors_for_role_project", (project_key, str(role_id))))
+        return {"actors": self.role_actors.get(str(role_id), [])}
+
     def get(self, path: str, params: dict[str, object] | None = None) -> object:
         self.calls.append(("get", path, params))
         if path == "rest/api/2/field":
@@ -194,7 +238,24 @@ class ApiClient:
             if start == 0:
                 return {"total": 150, "issues": [{"key": f"SAT-{i}"} for i in range(100)]}
             return {"total": 150, "issues": [{"key": f"SAT-{i}"} for i in range(100, 150)]}
+        if path == "rest/agile/1.0/board/36/backlog":
+            return {"total": 2, "issues": [{"key": "SAT-881"}, {"key": "SAT-882"}]}
+        if path == "rest/agile/1.0/board/32/issue":
+            return {"total": 2, "issues": [{"key": "SAT-900"}, {"key": "SAT-901"}]}
+        if path == "rest/agile/1.0/board/36/issue":
+            return {"total": 1, "issues": [{"key": "SAT-902"}]}
         raise AssertionError(f"unexpected get() path in test: {path}")
+
+    def post(self, path: str, json: dict[str, object] | None = None, params: dict[str, object] | None = None) -> object:
+        self.calls.append(("post", path, params))
+        if path == "rest/gira/1/" and params and params.get("operation") == "ProjectActorsQuery":
+            page = json["variables"]["filter"]["page"]
+            number, size = page["number"], page["size"]
+            start = (number - 1) * size
+            chunk = self.project_actors[start : start + size]
+            is_last_batch = start + size >= len(self.project_actors)
+            return {"data": {"projectActors": {"actors": chunk, "isLastBatch": is_last_batch}}}
+        raise AssertionError(f"unexpected post() path in test: {path}")
 
 
 class FailingApiClient(ApiClient):
@@ -265,6 +326,30 @@ def test_is_project_read_only_permissive_when_registry_missing_or_project_unknow
     assert is_project_read_only(tmp_path, None) is False
 
 
+def test_seed_project_registry_adds_missing_projects_and_tightens_to_read_only(tmp_path: Path) -> None:
+    write_project_registry(
+        tmp_path,
+        (ProjectSettings(key="SAT", default=True), ProjectSettings(key="OTHERPROJ", read_only=True)),
+    )
+
+    seed_project_registry(
+        tmp_path,
+        (
+            ProjectSettings(key="SAT", read_only=True),
+            ProjectSettings(key="OTHERPROJ", read_only=False),
+            ProjectSettings(key="NEW", read_only=True),
+        ),
+    )
+
+    # SAT flipped to read-only without a sync takes effect; OTHERPROJ is never
+    # loosened by seeding (only sync's full write may clear read-only).
+    assert load_project_registry(tmp_path) == {
+        "SAT": {"readOnly": True, "default": True},
+        "OTHERPROJ": {"readOnly": True, "default": False},
+        "NEW": {"readOnly": True, "default": False},
+    }
+
+
 def test_load_board_settings_permissive_when_missing(tmp_path: Path) -> None:
     assert load_board_settings(tmp_path) == {"localBoards": [], "disabledBoardIds": []}
 
@@ -278,6 +363,59 @@ def test_write_board_settings_round_trips(tmp_path: Path) -> None:
     write_board_settings(tmp_path, settings)
 
     assert load_board_settings(tmp_path) == settings
+
+
+def test_load_component_settings_permissive_when_missing(tmp_path: Path) -> None:
+    assert load_component_settings(tmp_path) == {"archivedComponents": {}}
+
+
+def test_write_component_settings_round_trips(tmp_path: Path) -> None:
+    settings = {"archivedComponents": {"SAT": ["helm-chart"]}}
+
+    write_component_settings(tmp_path, settings)
+
+    assert load_component_settings(tmp_path) == settings
+
+
+def test_set_component_archived_adds_and_removes(tmp_path: Path) -> None:
+    set_component_archived(tmp_path, "SAT", "helm-chart", True)
+
+    assert load_component_settings(tmp_path) == {"archivedComponents": {"SAT": ["helm-chart"]}}
+
+    set_component_archived(tmp_path, "SAT", "helm-chart", False)
+
+    # Unarchiving the only archived component in a project drops the
+    # project's own now-empty entry entirely, rather than leaving a
+    # dangling empty list around.
+    assert load_component_settings(tmp_path) == {"archivedComponents": {}}
+
+
+def test_set_component_archived_is_case_insensitive_but_keeps_display_casing(tmp_path: Path) -> None:
+    set_component_archived(tmp_path, "SAT", "Helm-Chart", True)
+    set_component_archived(tmp_path, "SAT", "helm-chart", True)  # re-archiving under different casing is a no-op
+
+    assert load_component_settings(tmp_path) == {"archivedComponents": {"SAT": ["Helm-Chart"]}}
+
+    set_component_archived(tmp_path, "SAT", "HELM-CHART", False)
+
+    assert load_component_settings(tmp_path) == {"archivedComponents": {}}
+
+
+def test_set_component_archived_preserves_other_components_and_projects(tmp_path: Path) -> None:
+    set_component_archived(tmp_path, "SAT", "helm-chart", True)
+    set_component_archived(tmp_path, "SAT", "Training", True)
+    set_component_archived(tmp_path, "PLAT", "cache", True)
+
+    set_component_archived(tmp_path, "SAT", "helm-chart", False)
+
+    assert load_component_settings(tmp_path) == {
+        "archivedComponents": {"SAT": ["Training"], "PLAT": ["cache"]}
+    }
+
+
+def test_set_component_archived_rejects_empty_name(tmp_path: Path) -> None:
+    with pytest.raises(MetadataError):
+        set_component_archived(tmp_path, "SAT", "  ", True)
 
 
 def test_add_local_board_then_load_all_boards_with_settings_tags_it_local(tmp_path: Path) -> None:
@@ -295,6 +433,26 @@ def test_add_local_board_then_load_all_boards_with_settings_tags_it_local(tmp_pa
             "kind": "local",
         }
     ]
+
+
+def test_add_local_board_updates_stored_board_membership_without_a_reindex(tmp_path: Path) -> None:
+    # write_board_settings is the sole choke point for every local-board
+    # mutation -- board membership is stored per item (db.items.boards),
+    # so this needs to recompute it the same way a Jira boards refresh or
+    # a full reindex already does.
+    from jira_workbench.db import list_items, reindex_items
+    from jira_workbench.sync import write_json
+
+    write_json(
+        tmp_path / "components/helm-chart/SAT-1/issue.json",
+        {"key": "SAT-1", "fields": {"customfield_10071": {"value": "helm-chart"}}},
+    )
+    reindex_items(tmp_path, "customfield_10071")
+    assert {item["key"]: item for item in list_items(tmp_path)}["SAT-1"]["boards"] == []
+
+    add_local_board(tmp_path, "Helm Filter", {"component": ["helm-chart"]}, None)
+
+    assert {item["key"]: item for item in list_items(tmp_path)}["SAT-1"]["boards"] == ["Helm Filter"]
 
 
 def test_add_local_board_rejects_empty_name(tmp_path: Path) -> None:
@@ -448,6 +606,55 @@ def test_refresh_versions_api_writes_cache(tmp_path: Path) -> None:
     assert ("get_project_versions", "SAT") in client.calls
 
 
+def test_refresh_versions_api_also_populates_the_sql_index(tmp_path: Path) -> None:
+    from jira_workbench import db
+
+    client = ApiClient()
+
+    refresh_versions_api(tmp_path, "SAT", client)
+
+    indexed = db.project_versions(tmp_path, "SAT")
+    assert indexed is not None
+    versions, _fetched_at = indexed
+    assert versions == [{"id": "10000", "name": "helm-chart-sa 3.4.0", "released": False, "archived": False}]
+
+
+def test_load_versions_prefers_the_sql_index_over_a_stale_file(tmp_path: Path) -> None:
+    # A version renamed after the index was populated must show the new
+    # name -- the SQL index, not whatever meta/<PROJECT>/versions.json
+    # happened to say (a caller updating one without the other would be a
+    # bug, but load_versions should still favor the fresher of the two).
+    refresh_versions_api(tmp_path, "SAT", ApiClient())
+    write_json(tmp_path / "meta/SAT/versions.json", {"versions": [{"id": "10000", "name": "stale-name"}]})
+
+    cache = load_versions(tmp_path, "SAT")
+
+    assert cache is not None
+    assert cache["versions"][0]["name"] == "helm-chart-sa 3.4.0"
+
+
+def test_load_versions_falls_back_to_the_file_when_not_yet_in_the_sql_index(tmp_path: Path) -> None:
+    write_json(tmp_path / "meta/SAT/versions.json", {"project": "SAT", "versions": [{"id": "1", "name": "v1"}]})
+
+    cache = load_versions(tmp_path, "SAT")
+
+    assert cache is not None
+    assert cache["versions"] == [{"id": "1", "name": "v1"}]
+
+
+def test_refresh_versions_api_removes_stale_rows_no_longer_returned_by_jira(tmp_path: Path) -> None:
+    from jira_workbench import db
+
+    client = ApiClient()
+    refresh_versions_api(tmp_path, "SAT", client)
+    client.versions = [{"id": "10001", "name": "helm-chart-sa 3.5.0"}]
+
+    refresh_versions_api(tmp_path, "SAT", client)
+
+    versions, _fetched_at = db.project_versions(tmp_path, "SAT")
+    assert [version["id"] for version in versions] == ["10001"]
+
+
 def test_refresh_versions_api_wraps_client_errors(tmp_path: Path) -> None:
     client = FailingApiClient()
 
@@ -538,19 +745,297 @@ def test_refresh_boards_api_writes_cache_with_compiled_predicates_and_backlog(tm
     assert sat_board["predicate"] == {"op": "eq", "field": "project", "value": "SAT"}
     assert sat_board["backlogKeys"] == [f"SAT-{i}" for i in range(150)]
 
+    # boardKeys -- the active/board-side rank order, alongside the
+    # pre-existing backlogKeys -- is what lets the Items list's collapsible
+    # Active/Backlog sections show issues in their real Jira rank order.
+    assert sat_board["boardKeys"] == ["SAT-900", "SAT-901"]
+
     ps_tools = boards["PS Tools"]
     assert ps_tools["type"] == "scrum"
     assert ps_tools["unsupportedReason"] is None
     assert ps_tools["predicate"] is not None
-    # scrum boards are out of scope for the active/backlog split
-    assert ps_tools["backlogKeys"] is None
+    # scrum boards have a real backlog too (unassigned-to-sprint issues) --
+    # the Agile backlog endpoint works for them same as any other board type.
+    assert ps_tools["backlogKeys"] == ["SAT-881", "SAT-882"]
+    assert ps_tools["boardKeys"] == ["SAT-902"]
 
 
-def test_refresh_boards_api_implicitly_scopes_a_project_less_filter_to_its_own_project(tmp_path: Path) -> None:
-    # A board's saved filter doesn't have to mention "project" at all --
-    # Jira itself still only ever shows that board's own project's issues,
-    # so the compiled predicate must be scoped the same way even though
-    # the JQL text alone never says so.
+class CappedAgileClient:
+    """Returns at most `cap` issues per page whatever maxResults asks for, as Jira may."""
+
+    def __init__(self, total: int, cap: int, *, report_total: bool = True) -> None:
+        self.keys = [f"SAT-{n}" for n in range(total)]
+        self.cap = cap
+        self.report_total = report_total
+        self.starts: list[int] = []
+
+    def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        start = params["startAt"]
+        self.starts.append(start)
+        chunk = self.keys[start : start + min(self.cap, params["maxResults"])]
+        page: dict[str, Any] = {"startAt": start, "maxResults": self.cap, "issues": [{"key": k} for k in chunk]}
+        if self.report_total:
+            page["total"] = len(self.keys)
+        return page
+
+
+@pytest.mark.parametrize("fetch", [fetch_backlog_keys, fetch_board_keys])
+@pytest.mark.parametrize("report_total", [True, False])
+def test_board_key_fetchers_advance_by_the_returned_page_size(fetch: Any, report_total: bool) -> None:
+    client = CappedAgileClient(total=120, cap=50, report_total=report_total)
+
+    assert fetch(client, 7) == client.keys
+    assert client.starts[:3] == [0, 50, 100]
+
+
+def test_fetch_board_keys_paginates_like_fetch_backlog_keys() -> None:
+    assert fetch_board_keys(ApiClient(), 32) == ["SAT-900", "SAT-901"]
+
+
+def test_fetch_project_access_members_unions_administrator_and_member_roles() -> None:
+    # ApiClient's fixture: Administrator has Serge Colle, Member has Craig
+    # Oberg, Viewer has Al Baker -- Viewer must be excluded (can't be
+    # assigned issues), even though Al Baker otherwise looks like a normal
+    # actor.
+    users = fetch_project_access_members(ApiClient(), "SAT")
+
+    names = {user["displayName"] for user in users}
+    assert names == {"Serge Colle", "Craig Oberg"}
+
+
+def test_fetch_project_access_members_excludes_addon_and_guest_roles() -> None:
+    client = ApiClient()
+    client.project_roles["atlassian-addons-project-access"] = "https://example.atlassian.net/.../role/10028"
+    client.project_roles["jira-guest-member"] = "https://example.atlassian.net/.../role/10130"
+    client.role_actors["10028"] = [
+        {"displayName": "Some Addon", "type": "atlassian-user-role-actor", "actorUser": {"accountId": "99"}}
+    ]
+
+    users = fetch_project_access_members(client, "SAT")
+
+    assert "Some Addon" not in {user["displayName"] for user in users}
+
+
+def test_fetch_project_access_members_excludes_group_actors() -> None:
+    client = ApiClient()
+    client.role_actors["10026"].append({"displayName": "engineering", "type": "atlassian-group-role-actor"})
+
+    users = fetch_project_access_members(client, "SAT")
+
+    assert "engineering" not in {user["displayName"] for user in users}
+
+
+def test_fetch_project_access_members_dedupes_someone_in_both_roles() -> None:
+    client = ApiClient()
+    client.role_actors["10026"].append(
+        {"displayName": "Serge Colle", "type": "atlassian-user-role-actor", "actorUser": {"accountId": "1"}}
+    )
+
+    users = fetch_project_access_members(client, "SAT")
+
+    assert [user["displayName"] for user in users].count("Serge Colle") == 1
+
+
+def test_fetch_project_access_members_wraps_role_listing_errors() -> None:
+    class BrokenClient(ApiClient):
+        def get_project_roles(self, project_key: str) -> object:
+            raise RuntimeError("unauthorized")
+
+    with pytest.raises(MetadataError):
+        fetch_project_access_members(BrokenClient(), "SAT")
+
+
+def test_fetch_project_access_members_wraps_actor_listing_errors() -> None:
+    class BrokenClient(ApiClient):
+        def get_project_actors_for_role_project(self, project_key: str, role_id: object) -> object:
+            raise RuntimeError("unauthorized")
+
+    with pytest.raises(MetadataError):
+        fetch_project_access_members(BrokenClient(), "SAT")
+
+
+def test_fetch_project_actors_internal_paginates_until_last_batch() -> None:
+    client = ApiClient()
+    client.project_actors = [
+        {"displayName": f"User {i}", "accountId": str(i), "active": True, "type": "atlassian-user-role-actor"}
+        for i in range(120)
+    ]
+
+    actors = fetch_project_actors_internal(client, 10020)
+
+    assert len(actors) == 120
+    post_calls = [call for call in client.calls if call[0] == "post"]
+    assert len(post_calls) == 2
+
+
+def test_fetch_project_actors_internal_stops_on_empty_project() -> None:
+    client = ApiClient()
+    client.project_actors = []
+
+    assert fetch_project_actors_internal(client, 10020) == []
+
+
+def test_refresh_assignees_api_prefers_internal_actors_query_filtered_by_active(tmp_path: Path) -> None:
+    # This is the whole point of the internal query: Al Baker still shows
+    # up as a Member-role actor via the classic role API, but the
+    # internal query (the same one Jira's own Access page uses) correctly
+    # flags him "active": false -- confirmed live to be the only source
+    # that catches this. Craig Oberg is a Member-role actor too but comes
+    # back "active": true here, so he's kept.
+    client = ApiClient()
+    client.role_actors["10026"].append(
+        {"displayName": "Al Baker", "type": "atlassian-user-role-actor", "actorUser": {"accountId": "3"}}
+    )
+
+    cache = refresh_assignees_api(tmp_path, "SAT", client)
+
+    names = {user["displayName"] for user in cache["assignees"]}
+    assert names == {"Serge Colle", "Craig Oberg"}
+    assert any(call[0] == "post" for call in client.calls)
+    assert not any(call[0] == "get_project_roles" for call in client.calls)
+    assert cache["source"] == "internal-access-api"
+
+
+def test_refresh_assignees_api_falls_back_to_role_based_api_when_internal_query_fails(tmp_path: Path) -> None:
+    # The internal query is undocumented and unsupported -- Atlassian can
+    # change or remove it without notice, so a failure there must degrade
+    # to the classic, public role-based API rather than breaking the
+    # refresh outright.
+    class NoInternalApiClient(ApiClient):
+        def post(self, path: str, json: object = None, params: object = None) -> object:
+            raise RuntimeError("404 Not Found")
+
+    cache = refresh_assignees_api(tmp_path, "SAT", NoInternalApiClient())
+
+    assert [user["displayName"] for user in cache["assignees"]] == ["Craig Oberg", "Serge Colle"]
+    assert cache["source"] == "role-api-fallback"
+    assert load_assignees(tmp_path, "SAT") == cache
+
+
+def test_refresh_assignees_api_wraps_client_errors_when_every_source_fails() -> None:
+    class BrokenClient(ApiClient):
+        def post(self, path: str, json: object = None, params: object = None) -> object:
+            raise RuntimeError("unauthorized")
+
+        def get_project_roles(self, project_key: str) -> object:
+            raise RuntimeError("unauthorized")
+
+    with pytest.raises(MetadataError):
+        refresh_assignees_api(Path("/nonexistent"), "SAT", BrokenClient())
+
+
+def test_load_assignees_missing_cache_returns_none(tmp_path: Path) -> None:
+    assert load_assignees(tmp_path, "SAT") is None
+
+
+class AgileWriteClient:
+    """Fake for the new write-capable Agile functions -- move_issue_to_
+    backlog/board and rank_issue_before -- mirroring the atlassian-python-
+    api library's own method surface (move_issues_to_backlog, post,
+    get_agile_resource_url, update_rank, get_all_fields) rather than the
+    read-only ProjectMetadataClient protocol, matching how issue.py's own
+    write-oriented functions type their client as Any."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    def get_agile_resource_url(self, resource: str) -> str:
+        return f"rest/agile/1.0/{resource}"
+
+    def post(self, path: str, json: dict | None = None) -> None:
+        self.calls.append(("post", (path, json)))
+
+    def put(self, path: str, data: dict | None = None) -> None:
+        self.calls.append(("put", (path, data)))
+
+    def update_rank(self, issues_to_rank: list, rank_before: str, customfield_number: str) -> None:
+        self.calls.append(("update_rank", (tuple(issues_to_rank), rank_before, customfield_number)))
+
+    def get_all_fields(self) -> list[dict[str, str]]:
+        return [
+            {"id": "customfield_10071", "name": "Components"},
+            {"id": "customfield_10019", "name": "Rank"},
+        ]
+
+
+def test_move_issue_to_backlog_posts_to_the_board_scoped_backlog_endpoint() -> None:
+    # Not the library's move_issues_to_backlog: that is Jira's global backlog operation, which
+    # removes the issue from every future and active sprint, not just the selected board's.
+    client = AgileWriteClient()
+
+    move_issue_to_backlog(client, 32, "SAT-142")
+
+    assert client.calls == [("post", ("rest/agile/1.0/backlog/32/issue", {"issues": ["SAT-142"]}))]
+
+
+def test_move_issue_to_backlog_requires_a_jira_board_id() -> None:
+    client = AgileWriteClient()
+
+    with pytest.raises(MetadataError):
+        move_issue_to_backlog(client, None, "SAT-142")
+
+    assert client.calls == []
+
+
+def test_move_issue_to_board_posts_to_the_board_issue_endpoint() -> None:
+    # Not wrapped by the library (only the GET side, get_issues_for_board,
+    # exists there) -- goes through the client's own generic post().
+    client = AgileWriteClient()
+
+    move_issue_to_board(client, 32, "SAT-142")
+
+    assert client.calls == [("post", ("rest/agile/1.0/board/32/issue", {"issues": ["SAT-142"]}))]
+
+
+def test_fetch_rank_field_id_matches_by_display_name_case_insensitively() -> None:
+    assert fetch_rank_field_id(AgileWriteClient()) == "customfield_10019"
+
+
+def test_fetch_rank_field_id_returns_none_when_no_rank_field_exists() -> None:
+    class NoRankClient(AgileWriteClient):
+        def get_all_fields(self) -> list[dict[str, str]]:
+            return [{"id": "customfield_10071", "name": "Components"}]
+
+    assert fetch_rank_field_id(NoRankClient()) is None
+
+
+def test_rank_custom_field_number_rejects_an_unexpected_field_id() -> None:
+    # Jira Cloud's issue/rank rejects the "customfield_N" id with 400; only the number is valid.
+    assert rank_custom_field_number("customfield_10019") == 10019
+    with pytest.raises(MetadataError, match="unexpected Rank field id"):
+        rank_custom_field_number("rank")
+
+
+def test_rank_issue_before_calls_update_rank() -> None:
+    client = AgileWriteClient()
+
+    rank_issue_before(client, "SAT-142", "SAT-100", "customfield_10019")
+
+    assert client.calls == [("update_rank", (("SAT-142",), "SAT-100", 10019))]
+
+
+def test_rank_issue_after_puts_a_rank_after_operation() -> None:
+    # The library's update_rank only ranks before an issue.
+    client = AgileWriteClient()
+
+    rank_issue_after(client, "SAT-142", "SAT-100", "customfield_10019")
+
+    assert client.calls == [
+        (
+            "put",
+            (
+                "rest/agile/1.0/issue/rank",
+                {"issues": ["SAT-142"], "rankAfterIssue": "SAT-100", "rankCustomFieldId": 10019},
+            ),
+        )
+    ]
+
+
+def test_refresh_boards_api_keeps_a_project_less_filter_unscoped(tmp_path: Path) -> None:
+    # Regression (#52 review): a company-managed board's saved filter may
+    # span several projects; the project the board was discovered through
+    # must not be AND-ed into it, or other synced projects' issues are
+    # wrongly excluded.
     class ProjectLessFilterClient(ApiClient):
         def get(self, path: str, params: dict[str, object] | None = None) -> object:
             if path == "rest/api/2/filter/10089":
@@ -561,13 +1046,7 @@ def test_refresh_boards_api_implicitly_scopes_a_project_less_filter_to_its_own_p
 
     sat_board = next(board for board in cache["boards"] if board["name"] == "SAT board")
     assert sat_board["unsupportedReason"] is None
-    assert sat_board["predicate"] == {
-        "op": "and",
-        "clauses": [
-            {"op": "eq", "field": "project", "value": "SAT"},
-            {"op": "eq", "field": "component", "value": "helm-chart"},
-        ],
-    }
+    assert sat_board["predicate"] == {"op": "eq", "field": "component", "value": "helm-chart"}
 
 
 def test_refresh_boards_api_wraps_client_errors(tmp_path: Path) -> None:
@@ -612,6 +1091,32 @@ def test_format_boards_reports_membership_and_backlog_counts() -> None:
     assert "1 issues" in output
     assert "n/a" in output
     assert "unsupported: unsupported field: assignee" in output
+
+
+def test_format_boards_includes_jql_alongside_membership() -> None:
+    output = format_boards(
+        {
+            "boards": [
+                {
+                    "name": "SAT board",
+                    "type": "simple",
+                    "unsupportedReason": None,
+                    "backlogKeys": None,
+                    "jql": "project = SAT ORDER BY Rank ASC",
+                },
+                {
+                    "name": "Weird",
+                    "type": "simple",
+                    "unsupportedReason": "unsupported field: assignee",
+                    "backlogKeys": None,
+                    "jql": "assignee = currentUser()",
+                },
+            ]
+        }
+    )
+
+    assert "ok (jql: project = SAT ORDER BY Rank ASC)" in output
+    assert "unsupported: unsupported field: assignee (jql: assignee = currentUser())" in output
 
 
 def test_format_boards_reports_no_boards() -> None:
@@ -844,9 +1349,9 @@ def test_load_and_format_component_summary(tmp_path: Path) -> None:
     components = load_component_summary(tmp_path)
     output = format_components(components)
 
-    assert components[0]["component"] == "helm-chart"
-    assert components[0]["active"] == 2
-    assert components[0]["total"] == 4
+    by_name = {component["component"]: component for component in components}
+    assert by_name["helm-chart"]["active"] == 2
+    assert by_name["helm-chart"]["total"] == 4
     assert "component" in output
     assert "active" in output
     assert "total" in output
@@ -873,3 +1378,71 @@ def test_load_component_summary_uses_real_status_category_not_hardcoded_names(tm
 
     assert components[0]["active"] == 1
     assert components[0]["total"] == 2
+
+
+def test_load_component_summary_scopes_to_the_given_project(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "manifest.json",
+        {
+            "workItems": [
+                {"key": "SAT-1", "project": "SAT", "component": "helm-chart", "status": "To Do"},
+                {"key": "SAT-2", "project": "SAT", "component": "helm-chart", "status": "To Do"},
+                {"key": "PLAT-1", "project": "PLAT", "component": "plat-only-component", "status": "To Do"},
+            ],
+        },
+    )
+
+    scoped = load_component_summary(tmp_path, "SAT")
+
+    names = {component["component"] for component in scoped}
+    assert names == {"helm-chart"}
+    assert next(c for c in scoped if c["component"] == "helm-chart")["total"] == 2
+
+
+def test_load_component_summary_unscoped_still_returns_every_project(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "manifest.json",
+        {
+            "workItems": [
+                {"key": "SAT-1", "project": "SAT", "component": "helm-chart", "status": "To Do"},
+                {"key": "PLAT-1", "project": "PLAT", "component": "plat-only-component", "status": "To Do"},
+            ],
+        },
+    )
+
+    unscoped = load_component_summary(tmp_path)
+
+    names = {component["component"] for component in unscoped}
+    assert names == {"helm-chart", "plat-only-component"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"errors": [{"message": "Not authorized"}], "data": None},
+        {"data": {}},
+        {"unexpected": True},
+    ],
+)
+def test_refresh_assignees_api_falls_back_when_internal_query_returns_errors(tmp_path: Path, payload: object) -> None:
+    # Regression (#52 review): an HTTP 200 GraphQL error or malformed payload
+    # read as "no members", skipped the fallback, and wrote an empty roster.
+    class ErrorPayloadClient(ApiClient):
+        def post(self, path: str, json: object = None, params: object = None) -> object:
+            return payload
+
+    cache = refresh_assignees_api(tmp_path, "SAT", ErrorPayloadClient())
+
+    assert cache["source"] == "role-api-fallback"
+    assert [user["displayName"] for user in cache["assignees"]] == ["Craig Oberg", "Serge Colle"]
+
+
+def test_refresh_assignees_api_accepts_a_genuinely_empty_internal_roster(tmp_path: Path) -> None:
+    class EmptyRosterClient(ApiClient):
+        def post(self, path: str, json: object = None, params: object = None) -> object:
+            return {"data": {"projectActors": {"actors": [], "isLastBatch": True}}}
+
+    cache = refresh_assignees_api(tmp_path, "SAT", EmptyRosterClient())
+
+    assert cache["source"] == "internal-access-api"
+    assert cache["assignees"] == []

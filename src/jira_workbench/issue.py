@@ -80,6 +80,25 @@ def resolve_reporter(client: Any) -> dict[str, object]:
     return {"accountId": fetch_current_user(client)["accountId"]}
 
 
+def current_user_payload(client: Any, value: str) -> dict[str, object] | None:
+    """{"accountId": ...} for the current Jira user when `value` names them
+    (by accountId, displayName or emailAddress) -- e.g. the New Issue form's
+    default reporter, which shows the user's display name. None when it
+    names someone else or the current user cannot be resolved, so the
+    caller can fall back to its usual name lookup."""
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        myself = fetch_current_user(client)
+    except IssueError:
+        return None
+    names = {str(myself.get(field) or "") for field in ("accountId", "displayName", "emailAddress")}
+    if text in names:
+        return {"accountId": myself["accountId"]}
+    return None
+
+
 def issue_component_value(component_field: str, component: str) -> object:
     if component_field == "components":
         return [{"name": component}]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -56,12 +57,21 @@ class PushAllProgressScreen(ModalScreen[PushResult | None]):
         Binding("enter", "close", "Close"),
     ]
 
-    def __init__(self, jira_dir: Path, keys: list[str], client: Any, component_field: str) -> None:
+    def __init__(
+        self,
+        jira_dir: Path,
+        keys: list[str],
+        client: Any,
+        component_field: str,
+        *,
+        component_field_for: Callable[[str], str | None] | None = None,
+    ) -> None:
         super().__init__()
         self._jira_dir = jira_dir
         self._keys = keys
         self._client = client
         self._component_field = component_field
+        self._component_field_for = component_field_for
         self._done = False
         self._result: PushResult | None = None
 
@@ -87,6 +97,8 @@ class PushAllProgressScreen(ModalScreen[PushResult | None]):
         def progress(line: str) -> None:
             self.app.call_from_thread(log.write, line)
 
+        resolve = self._component_field_for
+        index_component_fields = self.app.index_component_fields
         try:
             result = push_shadows(
                 self._jira_dir,
@@ -94,6 +106,8 @@ class PushAllProgressScreen(ModalScreen[PushResult | None]):
                 self._client,
                 progress=progress,
                 component_field=self._component_field,
+                component_field_for=(lambda key: resolve(key) or "components") if resolve else None,
+                index_component_fields=index_component_fields,
             )
         except Exception as exc:
             self.app.call_from_thread(self._finish, None, f"push all failed: {exc}")
