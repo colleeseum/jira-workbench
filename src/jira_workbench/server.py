@@ -26,6 +26,7 @@ from .issue import (
     IssueError,
     build_create_fields,
     create_issue,
+    current_user_payload,
     fetch_current_user,
     fetch_issue_type_fields,
 )
@@ -5794,7 +5795,12 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 labels=label_values or None,
                 assignee=user_payload(jira_dir, assignee_value) if assignee_value else None,
                 create_fields=create_fields,
-                reporter=user_payload(jira_dir, reporter) if reporter.strip() else None,
+                # The form defaults the reporter to the current user's
+                # display name; resolve that to their real accountId even
+                # when they never appear on a synced issue.
+                reporter=(current_user_payload(client, reporter) or user_payload(jira_dir, reporter))
+                if reporter.strip()
+                else None,
             )
             key = create_issue(client, fields)
         except (MetadataError, IssueError, ShadowError) as exc:

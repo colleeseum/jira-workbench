@@ -2722,6 +2722,29 @@ def test_post_new_issue_creates_and_redirects_to_the_new_key(tmp_path: Path, mon
     assert create_client.created_fields["priority"] == {"name": "High"}
 
 
+def test_post_new_issue_sends_the_current_users_account_id_as_reporter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression (#53 review): the form defaults the reporter to the current
+    # user's display name, and user_payload sent that name as the accountId
+    # when no synced issue carried the user's accountId.
+    client = _synced_client(tmp_path, _pushable_config())
+    create_client = CreateIssueJiraClient({"Task": {"summary": {}, "description": {}, "reporter": {}}})
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: create_client)
+
+    page = client.get("/items/new", params={"project": "SAT", "type": "Task"})
+    assert "Serge Colle" in page.text
+
+    response = client.post(
+        "/items/new",
+        data={"project": "SAT", "type": "Task", "summary": "s", "description": "d", "reporter": "Serge Colle"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert create_client.created_fields["reporter"] == {"accountId": "acc-1"}
+
+
 def test_post_new_issue_returns_to_the_list_when_return_to_is_given(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
