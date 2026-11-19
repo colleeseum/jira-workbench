@@ -1018,10 +1018,35 @@ def filtered_manifest_items(
     instead."""
     from .db import list_items  # deferred: avoid a module-level import cycle with db.py
 
+    enriched_items = effective_indexed_items(
+        jira_dir,
+        list_items(jira_dir, field_filters=field_filters, board=board),
+        component_field,
+        dev_status_field=dev_status_field,
+    )
+    return sorted(
+        enriched_items,
+        key=lambda item: issue_key_sort_key(display_name(item.get("key"))),
+    )
+
+
+def effective_indexed_items(
+    jira_dir: Path,
+    indexed_items: list[dict[str, Any]],
+    component_field: ComponentFields = None,
+    *,
+    dev_status_field: str | None = None,
+) -> list[dict[str, Any]]:
+    """`db.list_items()`-shaped rows finished the way load_manifest_items
+    finishes them (see _enrich_indexed_item): a shadow-bearing row gets its
+    local shadow applied, so its values are the effective ones rather than
+    the un-shadowed values stored in the index."""
+    if not indexed_items:
+        return []
     boards = load_cached_boards(jira_dir)
     status_categories = observed_status_category_map(jira_dir)
     version_names = version_id_to_name_map(jira_dir)
-    enriched_items = [
+    return [
         _enrich_indexed_item(
             jira_dir,
             indexed,
@@ -1031,12 +1056,8 @@ def filtered_manifest_items(
             version_names=version_names,
             dev_status_field=dev_status_field,
         )
-        for indexed in list_items(jira_dir, field_filters=field_filters, board=board)
+        for indexed in indexed_items
     ]
-    return sorted(
-        enriched_items,
-        key=lambda item: issue_key_sort_key(display_name(item.get("key"))),
-    )
 
 
 def compute_issue_fields(

@@ -1195,7 +1195,8 @@ def _field_counts_all_sources(
     from .db import field_counts
 
     merged: dict[str, int] = {}
-    for name, count in field_counts(jira_dir, column, **kwargs):
+    # Per project: shadowed items' effective components are re-derived.
+    for name, count in field_counts(jira_dir, column, component_field=config.component_fields_by_project(), **kwargs):
         merged[name] = merged.get(name, 0) + count
     for freshdesk_source in config.freshdesk_sources:
         try:

@@ -4852,6 +4852,21 @@ def test_items_page_filter_form_has_save_and_reset_actions(tmp_path: Path) -> No
     assert ">Reset to saved default filter</a>" in response.text
 
 
+def test_items_page_filters_offer_values_set_only_by_a_local_shadow(tmp_path: Path) -> None:
+    # The index stores un-shadowed values; the Status/Component checklists are built from its
+    # counts, so a value that only a local shadow uses must still be offered (and counted under
+    # it). The component comes from SAT's own component field (customfield_10071).
+    client = _synced_client(tmp_path)
+    set_field(tmp_path, "SAT-1", "status", "Blocked")
+    set_field(tmp_path, "SAT-2", "customfield_10071", {"value": "Shadow Team"})
+
+    response = client.get("/", params={"active": "0"})
+
+    assert re.search(r'name="status" value="Blocked">\s*Blocked<span class="count">1</span>', response.text)
+    assert re.search(r'name="status" value="Open">\s*Open<span class="count">1</span>', response.text)
+    assert re.search(r'name="component" value="Shadow Team">\s*Shadow Team<span class="count">1</span>', response.text)
+
+
 def test_items_page_priority_icon_uses_jira_style_red_chevrons_for_highest(tmp_path: Path) -> None:
     write_json(
         tmp_path / "components/compA/SAT-1/issue.json",

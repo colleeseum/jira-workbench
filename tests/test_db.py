@@ -514,6 +514,38 @@ def test_field_counts_scopes_by_board(tmp_path: Path) -> None:
     assert dict(field_counts(tmp_path, "component", board="Helm board")) == {"helm-chart": 1}
 
 
+def test_field_counts_counts_a_shadowed_item_under_its_effective_value(tmp_path: Path) -> None:
+    # The stored row holds the un-shadowed status; the option list built from these counts must
+    # still offer a status that exists only in a local shadow, or it can never be filtered on.
+    from jira_workbench.shadow import set_field
+
+    _write_issue(tmp_path, "SAT-1", "helm-chart")
+    _write_issue(tmp_path, "SAT-2", "helm-chart")
+    set_field(tmp_path, "SAT-1", "status", "Blocked")
+    reindex_items(tmp_path)
+
+    assert dict(field_counts(tmp_path, "status")) == {"Blocked": 1, "To Do": 1}
+    assert dict(field_counts(tmp_path, "status", projects=["SAT"])) == {"Blocked": 1, "To Do": 1}
+
+
+def test_field_counts_uses_a_shadowed_items_effective_component_and_board(tmp_path: Path) -> None:
+    from jira_workbench.shadow import set_field
+
+    _write_issue(tmp_path, "SAT-1", "helm-chart", customfield_10071={"value": "helm-chart"})
+    _write_issue(tmp_path, "SAT-2", "other", customfield_10071={"value": "other"})
+    _write_boards_cache(
+        tmp_path,
+        [{"id": 1, "name": "Helm board", "predicate": {"op": "eq", "field": "component", "value": "helm-chart"}}],
+    )
+    set_field(tmp_path, "SAT-2", "customfield_10071", {"value": "helm-chart"})
+    reindex_items(tmp_path, "customfield_10071")
+
+    assert dict(field_counts(tmp_path, "component", component_field="customfield_10071")) == {"helm-chart": 2}
+    assert dict(
+        field_counts(tmp_path, "component", board="Helm board", component_field="customfield_10071")
+    ) == {"helm-chart": 2}
+
+
 def test_field_counts_rejects_a_column_outside_the_allow_list(tmp_path: Path) -> None:
     try:
         field_counts(tmp_path, "extra")

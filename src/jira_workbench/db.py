@@ -27,6 +27,7 @@ from .view import (
     attach_board_fields,
     compute_issue_fields,
     display_name,
+    effective_indexed_items,
     load_cached_boards,
     observed_status_category_map,
     version_id_to_name_map,
@@ -823,6 +824,17 @@ def count_items(jira_dir: Path, *, source_slug: str = DEFAULT_SOURCE_SLUG) -> in
 
 
 _FIELD_COUNT_COLUMNS = frozenset({"project", "status", "component", "assignee", "priority", "resolution", "item_type"})
+# Where each counted column's effective value lives on an enriched item
+# (see view.effective_indexed_items). Resolution isn't part of that
+# enrichment, so a shadowed item's resolution is counted as stored.
+_FIELD_COUNT_ITEM_KEYS = {
+    "project": "project",
+    "status": "status",
+    "component": "component",
+    "assignee": "assignee",
+    "priority": "priority",
+    "item_type": "type",
+}
 
 
 def field_counts(
@@ -833,6 +845,7 @@ def field_counts(
     board: str | None = None,
     empty_bucket: str = "(none)",
     source_slug: str = DEFAULT_SOURCE_SLUG,
+    component_field: ComponentFields = None,
 ) -> list[tuple[str, int]]:
     """SQL GROUP BY count of one of _FIELD_COUNT_COLUMNS, optionally scoped
     to a set of projects and/or board membership -- backs the Filters
@@ -841,13 +854,15 @@ def field_counts(
     Python first; this answers straight from the index, never decoding a
     row's JSON columns at all).
 
-    Not shadow-corrected: the row-level `has_shadow` union that keeps
-    list_items' actual filtering exactly correct doesn't apply here -- a
-    shadow-edited item's true value for `column` could differ from what's
-    stored until the next reindex, which could make one bucket's count off
-    by one out of the ~14 shadow items on a real dataset. Accepted
-    trade-off for a purely informational count display; the rows actually
-    shown on the page are still exactly correct via list_items/filter_items.
+    Shadow-corrected: the stored columns hold each item's *un-shadowed*
+    values (reindex_items never applies a shadow), and these rows are the
+    Filters panel's entire option list -- so a value that exists only in a
+    local shadow (a status changed locally to one no indexed row has) would
+    otherwise be impossible to select. Each has_shadow row is moved from
+    its stored bucket to its effective one (and in or out of `board` by its
+    effective membership); only the few shadowed items are enriched.
+    `component_field` (a field or per-project mapping) derives their
+    effective component, as everywhere else.
     """
     if column not in _FIELD_COUNT_COLUMNS:
         raise ValueError(f"{column!r} is not in _FIELD_COUNT_COLUMNS")
@@ -860,6 +875,11 @@ def field_counts(
             placeholders = ", ".join("?" for _ in projects)
             conditions.append(f"project IN ({placeholders})")
             params.extend(projects)
+        # Board membership can itself change with a shadow, so shadowed rows
+        # are scoped by project only and their board checked below.
+        shadow_rows = conn.execute(
+            f"SELECT * FROM items WHERE {' AND '.join(conditions)} AND has_shadow = 1", params
+        ).fetchall()
         if board:
             conditions.append("EXISTS (SELECT 1 FROM json_each(boards) WHERE json_each.value = ?)")
             params.append(board)
@@ -873,7 +893,17 @@ def field_counts(
     for row in rows:
         value = row["value"] or empty_bucket
         counts[value] = counts.get(value, 0) + row["n"]
-    return sorted(counts.items(), key=lambda pair: pair[0].lower())
+    stored_items = [_row_to_item(row) for row in shadow_rows]
+    effective_items = effective_indexed_items(jira_dir, stored_items, component_field)
+    item_key = _FIELD_COUNT_ITEM_KEYS.get(column)
+    for row, stored, effective in zip(shadow_rows, stored_items, effective_items, strict=True):
+        if not board or board in stored["boards"]:
+            value = row[column] or empty_bucket
+            counts[value] = counts.get(value, 0) - 1
+        if not board or board in (effective.get("boards") or []):
+            value = (effective.get(item_key) if item_key else row[column]) or empty_bucket
+            counts[value] = counts.get(value, 0) + 1
+    return sorted(((value, n) for value, n in counts.items() if n > 0), key=lambda pair: pair[0].lower())
 
 
 def distinct_projects_for_board(jira_dir: Path, board: str, *, source_slug: str = DEFAULT_SOURCE_SLUG) -> set[str]:
