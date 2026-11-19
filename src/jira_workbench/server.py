@@ -6055,9 +6055,9 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
     @app.post("/items/{key}/board-position", dependencies=[Depends(_require_same_origin)])
     def post_item_board_position(
         key: str,
-        project: str = Form(...),
         board: str = Form(...),
         target_scope: str = Form(...),
+        project: str = Form(""),
         before_key: str = Form(""),
         after_key: str = Form(""),
     ) -> dict[str, Any]:
@@ -6067,7 +6067,13 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # (post_new_issue) calls the same underlying metadata.py functions
         # directly rather than this route, since it already has a live
         # client open from creating the issue.
-        _require_synced(key)
+        # The project comes from the synced issue, never from the form: the
+        # move/rank calls act on ``key``, so the read-only guard and board
+        # lookup must be evaluated against ``key``'s own project.
+        submitted_project = project.strip()
+        project = issue_project_key(_require_synced(key)["issue"])
+        if submitted_project and submitted_project != project:
+            return {"ok": False, "error": f"{key} belongs to project {project}, not {submitted_project}"}
         board_entry = _find_board_entry(jira_dir, project, board)
         if board_entry is None:
             return {"ok": False, "error": f"board {board!r} not found for project {project}"}

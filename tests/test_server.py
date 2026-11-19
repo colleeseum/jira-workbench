@@ -6556,6 +6556,31 @@ def test_post_item_board_position_refuses_read_only_projects(
     assert read_json(tmp_path / "meta/SAT/boards.json")["boards"][0]["backlogKeys"] == ["SAT-1"]
 
 
+def test_post_item_board_position_derives_project_from_the_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression (#53 review): the route trusted the submitted project, so a
+    # read-only SAT issue could be moved/ranked by naming a writable OTH
+    # project with a valid board.
+    client = _synced_client(tmp_path, _pushable_config())
+    _write_position_board_cache(tmp_path, board_keys=["SAT-1"])
+    write_json(
+        tmp_path / "meta/OTH/boards.json",
+        {"project": "OTH", "boards": [{"id": 99, "name": "OTH board", "backlogKeys": [], "boardKeys": []}]},
+    )
+    write_project_registry(tmp_path, (ProjectSettings(key="SAT", read_only=True), ProjectSettings(key="OTH")))
+    fake = BoardPositionJiraClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    response = client.post(
+        "/items/SAT-1/board-position",
+        data={"project": "OTH", "board": "OTH board", "target_scope": "backlog", "before_key": "SAT-2"},
+    )
+
+    assert response.json()["ok"] is False
+    assert fake.move_calls == [] and fake.rank_calls == []
+
+
 def test_post_meta_label_rename_only_touches_the_selected_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
