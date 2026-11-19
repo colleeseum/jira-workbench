@@ -2816,6 +2816,30 @@ def test_observed_status_category_map_uses_the_sql_index_when_populated(tmp_path
     assert observed_status_category_map(tmp_path) == {"Solved": "done"}
 
 
+@pytest.mark.parametrize("indexed", [False, True])
+def test_observed_status_category_map_is_scoped_to_one_project(tmp_path: Path, indexed: bool) -> None:
+    # Regression (#53 review): the map was global, so a status name shared by
+    # two projects' workflows got whichever project's category won.
+    from jira_workbench.db import reindex_items
+
+    for key, category in (("SAT-1", "done"), ("OTH-1", "indeterminate")):
+        write_json(
+            tmp_path / f"components/_unassigned/{key}/issue.json",
+            {
+                "key": key,
+                "fields": {
+                    "project": {"key": key.split("-")[0]},
+                    "status": {"name": "Review", "statusCategory": {"key": category}},
+                },
+            },
+        )
+    if indexed:
+        reindex_items(tmp_path)
+
+    assert observed_status_category_map(tmp_path, "SAT") == {"Review": "done"}
+    assert observed_status_category_map(tmp_path, "OTH") == {"Review": "indeterminate"}
+
+
 def test_with_local_index_fields_resolves_shadow_changed_status_category(tmp_path: Path) -> None:
     from jira_workbench.shadow import set_field
 

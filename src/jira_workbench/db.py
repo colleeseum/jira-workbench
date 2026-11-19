@@ -293,7 +293,9 @@ def item_id(jira_dir: Path, external_key: str, *, source_slug: str = DEFAULT_SOU
         conn.close()
 
 
-def observed_status_categories(jira_dir: Path, *, source_slug: str = DEFAULT_SOURCE_SLUG) -> dict[str, str] | None:
+def observed_status_categories(
+    jira_dir: Path, *, project: str | None = None, source_slug: str = DEFAULT_SOURCE_SLUG
+) -> dict[str, str] | None:
     """Status display name -> Jira's real statusCategory.key, straight from
     the index instead of view.py's file-scan fallback (`local_issues` over
     every issue.json) -- items.status/status_category are computed at
@@ -302,20 +304,24 @@ def observed_status_categories(jira_dir: Path, *, source_slug: str = DEFAULT_SOU
     view.py's observed_status_category_map promises. Returns None (not an
     empty dict) when this source has no indexed items at all, so the
     caller knows to fall back to the file scan instead of reporting a
-    real dataset as having zero observed statuses."""
+    real dataset as having zero observed statuses. With `project`, only that
+    project's items are considered -- two projects' workflows can give the
+    same status name different categories."""
     conn = connect(jira_dir)
     try:
         sid = source_id(conn, source_slug)
         total = conn.execute("SELECT COUNT(*) FROM items WHERE source_id = ?", (sid,)).fetchone()[0]
         if total == 0:
             return None
-        rows = conn.execute(
-            """
+        sql = """
             SELECT DISTINCT status, status_category FROM items
             WHERE source_id = ? AND status IS NOT NULL AND status_category IS NOT NULL
-            """,
-            (sid,),
-        ).fetchall()
+            """
+        params: tuple[Any, ...] = (sid,)
+        if project is not None:
+            sql += " AND project = ?"
+            params = (sid, project)
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
     return {row["status"]: row["status_category"] for row in rows}

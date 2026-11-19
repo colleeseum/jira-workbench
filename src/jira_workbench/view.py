@@ -1594,7 +1594,7 @@ def observed_field_options(jira_dir: Path, field: str, *, include_empty: str | N
     return sorted_options
 
 
-def observed_status_category_map(jira_dir: Path) -> dict[str, str]:
+def observed_status_category_map(jira_dir: Path, project: str | None = None) -> dict[str, str]:
     """Status display name -> Jira's real statusCategory.key ("new"/
     "indeterminate"/"done"), built from every locally synced issue's own
     (never shadow-merged) status. A project's workflow can name its
@@ -1603,16 +1603,20 @@ def observed_status_category_map(jira_dir: Path) -> dict[str, str]:
     locally changed to (shadow-stored as a bare name, with no category of
     its own -- see apply_shadow) still be classified correctly, as long as
     that name has been observed on some synced issue anywhere in this
-    jira_dir."""
+    jira_dir. Pass `project` to classify an issue's status: workflows are
+    per project, so the same name can map to different categories in two
+    projects."""
     from .db import observed_status_categories  # deferred: avoid a module-level import cycle with db.py
 
-    indexed = observed_status_categories(jira_dir)
+    indexed = observed_status_categories(jira_dir, project=project)
     if indexed is not None:
         return indexed
     # Not (yet) in the SQL index -- fall back to scanning every issue.json
     # directly, exactly as before this index existed.
     categories: dict[str, str] = {}
     for issue in local_issues(jira_dir):
+        if project is not None and issue_project_key(issue) != project:
+            continue
         status = as_dict(as_dict(issue.get("fields")).get("status"))
         name = display_name(status.get("name")).strip()
         category = status_category_key(status)

@@ -1585,6 +1585,67 @@ def test_post_item_status_change_with_resolution_on_a_done_status(tmp_path: Path
     assert shadow["statusChange"] == {"resolution": "Fixed"}
 
 
+def _write_review_status_in_two_projects(tmp_path: Path, sat_category: str, oth_category: str) -> None:
+    # "Review" is Done in one project's workflow and in progress in the
+    # other's -- the shape a global status->category map gets wrong.
+    sat_path = tmp_path / "components/api-team/SAT-1/issue.json"
+    sat = read_json(sat_path)
+    sat["fields"]["status"] = {"name": "Review", "statusCategory": {"key": sat_category}}
+    write_json(sat_path, sat)
+    oth = json.loads(json.dumps(sat))
+    oth["key"] = "OTH-1"
+    oth["fields"]["project"] = {"key": "OTH"}
+    oth["fields"]["status"] = {"name": "Review", "statusCategory": {"key": oth_category}}
+    write_json(tmp_path / "components/api-team/OTH-1/issue.json", oth)
+    build_manifest(tmp_path)
+
+
+# Both orientations, so the result cannot depend on which project's row a
+# global map would happen to keep.
+_TWO_PROJECT_REVIEW_CATEGORIES = [("done", "indeterminate"), ("indeterminate", "done")]
+
+
+@pytest.mark.parametrize(("sat_category", "oth_category"), _TWO_PROJECT_REVIEW_CATEGORIES)
+@pytest.mark.parametrize("route", ["single", "bulk"])
+def test_post_status_resolution_uses_the_issues_own_project_category(
+    tmp_path: Path, sat_category: str, oth_category: str, route: str
+) -> None:
+    # Regression (#53 review): the status->category map was global.
+    client = _synced_client(tmp_path)
+    _write_review_status_in_two_projects(tmp_path, sat_category, oth_category)
+
+    for key in ("SAT-1", "OTH-1"):
+        if route == "single":
+            response = client.post(
+                f"/items/{key}/status", data={"status": "Review", "resolution": "Fixed"}, follow_redirects=False
+            )
+        else:
+            response = client.post(
+                "/items/bulk-fields",
+                data={"keys": [key], "bulk_field": "status", "status_value": "Review", "resolution": "Fixed"},
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+
+    for key, category in {"SAT-1": sat_category, "OTH-1": oth_category}.items():
+        status_change = load_shadow(tmp_path, key).get("statusChange") or {}
+        assert status_change.get("resolution") == ("Fixed" if category == "done" else None), key
+
+
+@pytest.mark.parametrize(("sat_category", "oth_category"), _TWO_PROJECT_REVIEW_CATEGORIES)
+def test_item_detail_status_widget_marks_done_by_the_issues_own_project(
+    tmp_path: Path, sat_category: str, oth_category: str
+) -> None:
+    client = _synced_client(tmp_path)
+    _write_review_status_in_two_projects(tmp_path, sat_category, oth_category)
+
+    for key, category in {"SAT-1": sat_category, "OTH-1": oth_category}.items():
+        page = client.get(f"/items/{key}").text
+        done_attr = re.search(r'data-done="([^"]*)"', page)
+        assert done_attr is not None, key
+        assert ("Review" in json.loads(html.unescape(done_attr.group(1)))) == (category == "done"), key
+
+
 def test_post_item_status_change_to_non_done_status_clears_stale_resolution(tmp_path: Path) -> None:
     # Deliberate fix over the TUI's own _edit_status, which only clears a
     # resolution when a new one is given -- moving off a done status must

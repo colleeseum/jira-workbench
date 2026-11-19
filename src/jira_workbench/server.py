@@ -3388,7 +3388,7 @@ def _status_pill_form_html(
     status_options = _project_scoped_options(project_scoped_items, "status")
     if current_status and current_status not in status_options:
         status_options = [current_status, *status_options]
-    categories = observed_status_category_map(jira_dir)
+    categories = observed_status_category_map(jira_dir, issue_project_key(issue))
     done_statuses = [status for status in status_options if categories.get(status) == "done"]
     # A leading "" entry (rendered as "(none)" by the shared template
     # renderer's own empty-label fallback) lets a status transition to
@@ -5968,8 +5968,8 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
     def post_item_status(
         key: str, status: str = Form(...), resolution: str = Form(""), return_to: str = Form("")
     ) -> RedirectResponse:
-        _require_synced(key)
-        categories = observed_status_category_map(jira_dir)
+        detail = _require_synced(key)
+        categories = observed_status_category_map(jira_dir, issue_project_key(detail["issue"]))
         effective_resolution = resolution.strip() if categories.get(status) == "done" else ""
         try:
             set_field(jira_dir, key, "status", status)
@@ -6049,7 +6049,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 continue
             try:
                 if bulk_field == "status":
-                    categories = observed_status_category_map(jira_dir)
+                    categories = observed_status_category_map(jira_dir, project)
                     effective_resolution = resolution.strip() if categories.get(selected_values[0]) == "done" else ""
                     set_field(jira_dir, key, "status", selected_values[0])
                     set_status_change(jira_dir, key, resolution=effective_resolution or None)
