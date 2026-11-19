@@ -2205,14 +2205,33 @@ def _require_same_origin(request: Request) -> None:
     (normal form POSTs do) -- absent both, this lets the request through
     rather than blocking it, since this is defense-in-depth, not a real
     auth boundary, in a tool with no login system at all."""
-    host = request.url.hostname
+    expected = _url_origin(str(request.url))
     for header_name in ("origin", "referer"):
         value = request.headers.get(header_name)
         if not value:
             continue
-        origin_host = urlparse(value).hostname
-        if origin_host and origin_host != host:
+        # A present but opaque/unparseable value (e.g. ``Origin: null`` from
+        # a sandboxed iframe) cannot be proven same-origin, so reject it.
+        if expected is None or _url_origin(value) != expected:
             raise HTTPException(status_code=403, detail="cross-origin write request rejected")
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    """Return the (scheme, host, effective port) origin of ``value``, or
+    None when it has no parseable http(s) origin."""
+    try:
+        parsed = urlparse(value.strip())
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    if scheme not in _DEFAULT_PORTS or not host:
+        return None
+    return scheme, host, port if port is not None else _DEFAULT_PORTS[scheme]
 
 
 _MULTI_VALUE_ONLY_FIELD = "labels"

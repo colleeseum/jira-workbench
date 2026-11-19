@@ -2172,6 +2172,45 @@ def test_write_route_allows_same_origin_referer(tmp_path: Path) -> None:
     assert response.status_code == 303
 
 
+@pytest.mark.parametrize(
+    "origin",
+    ["http://testserver:3000", "https://testserver", "https://testserver:8443", "null", "not a url"],
+)
+def test_write_route_rejects_other_port_scheme_or_opaque_origin(tmp_path: Path, origin: str) -> None:
+    # Same hostname is not same origin: a page on another local port or
+    # scheme, or an opaque ``Origin: null``, must not pass the check.
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/SAT-1/revert",
+        headers={"Origin": origin},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("origin", ["http://testserver", "http://testserver:80", "HTTP://TestServer"])
+def test_write_route_allows_exact_same_origin(tmp_path: Path, origin: str) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post(
+        "/items/SAT-1/revert",
+        headers={"Origin": origin},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+
+
+def test_write_route_allows_requests_without_origin_or_referer(tmp_path: Path) -> None:
+    client = _synced_client(tmp_path)
+
+    response = client.post("/items/SAT-1/revert", follow_redirects=False)
+
+    assert response.status_code == 303
+
+
 def test_post_item_field_not_synced_returns_404(tmp_path: Path) -> None:
     client = _synced_client(tmp_path)
 
