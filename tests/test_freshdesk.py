@@ -294,6 +294,25 @@ def test_sync_freshdesk_source_keeps_a_tickets_data_when_only_its_conversations_
     assert read_json(tmp_path / "freshdesk/tickets/2/conversations.json") == []
 
 
+def test_sync_freshdesk_source_keeps_cached_conversations_when_a_refresh_fails(tmp_path: Path) -> None:
+    # Regression (#52 review): a transient conversation error on a ticket
+    # synced before overwrote its cached conversations.json with [].
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient({2: _ticket(2)}), progress=None)
+    conversations_path = tmp_path / "freshdesk/tickets/2/conversations.json"
+    assert read_json(conversations_path) == [{"body_text": "reply on 2"}]
+
+    updated = _ticket(2, subject="Renamed")
+    result = sync_freshdesk_source(
+        settings, tmp_path, FakeFreshdeskClient({2: updated}, failing_ticket_ids={2}), progress=None
+    )
+
+    assert result.failed_keys == ("FD-2",)
+    assert read_json(conversations_path) == [{"body_text": "reply on 2"}]
+    assert read_json(tmp_path / "freshdesk/tickets/2/ticket.json")["subject"] == "Renamed"
+    assert read_json(freshdesk_dir(tmp_path) / "last_sync.json")["conversationRetryIds"] == [2]
+
+
 def test_sync_freshdesk_source_still_writes_last_sync_after_a_partial_failure(tmp_path: Path) -> None:
     # A ticket Freshdesk can't serve must not prevent updated_since from
     # advancing -- otherwise every future run keeps redoing a full,

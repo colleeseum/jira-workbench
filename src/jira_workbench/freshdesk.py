@@ -419,17 +419,21 @@ def sync_freshdesk_source(
         # from Freshdesk (we've hit both in practice) shouldn't discard the
         # ticket data already in hand, just leave that one ticket's
         # conversations empty and report it, same as Jira's own
-        # backfill_missing_parents skipping an unfetchable parent.
+        # backfill_missing_parents skipping an unfetchable parent. A ticket
+        # synced before keeps its cached conversations rather than having
+        # them wiped by a transient error; the retry list refetches them.
+        conversations_path = dest / "conversations.json"
         try:
-            conversations = client.list_conversations(ticket_id)
+            conversations: list[dict[str, Any]] | None = client.list_conversations(ticket_id)
         except FreshdeskError as exc:
             failed.append(key)
             failed_ids.append(ticket_id)
-            conversations = []
+            conversations = None if conversations_path.exists() else []
             if progress:
                 progress(f"[3/4] could not fetch conversations for {key}: {exc}")
         write_json(dest / "ticket.json", ticket)
-        write_json(dest / "conversations.json", conversations)
+        if conversations is not None:
+            write_json(conversations_path, conversations)
         changed += 1
 
     # Conversations that failed on an earlier run are retried even when the
