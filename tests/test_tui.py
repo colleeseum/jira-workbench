@@ -4955,6 +4955,59 @@ async def test_detail_screen_status_change_recognizes_custom_done_status_via_cat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sat_category,oth_category", [("done", "indeterminate"), ("indeterminate", "done")])
+async def test_detail_screen_status_change_uses_the_issues_own_project_category(
+    tmp_path: Path, sat_category: str, oth_category: str
+) -> None:
+    # Regression: "Solved" exists in two projects with different categories;
+    # the resolution prompt must follow the opened issue's own project,
+    # whichever project's row a global name->category map would keep.
+    from textual.widgets import OptionList
+
+    from jira_workbench.tui.widgets.prompts import StatusChangeScreen
+
+    jira_dir = synced_jira_dir(tmp_path)
+    for key, project, category in (("SAT-99", "SAT", sat_category), ("OTH-5", "OTH", oth_category)):
+        write_json(
+            jira_dir / f"components/_unassigned/{key}/issue.json",
+            {
+                "key": key,
+                "fields": {
+                    "summary": "Other",
+                    "project": {"key": project},
+                    "status": {"name": "Solved", "statusCategory": {"key": category}},
+                },
+            },
+        )
+    build_manifest(jira_dir, "customfield_10071")
+    app = JiraWorkbenchApp(jira_dir, component_field="customfield_10071")
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, DetailScreen)
+        opened_is_done = (sat_category if app.screen.key.startswith("SAT-") else oth_category) == "done"
+        table = app.screen.query_one(DataTable)
+        table.move_cursor(row=table.get_row_index("status"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        screen = app.screen
+        assert isinstance(screen, StatusChangeScreen)
+        status_options = screen.query_one("#status-options", OptionList)
+        status_options.highlighted = next(
+            index
+            for index in range(status_options.option_count)
+            if str(status_options.get_option_at_index(index).prompt) == "Solved"
+        )
+        await pilot.press("enter")
+        await pilot.pause()
+
+        resolution_shown = any(node.display for node in screen.query("#resolution-options"))
+        assert resolution_shown is opened_is_done
+
+
+@pytest.mark.asyncio
 async def test_status_change_screen_combines_status_and_resolution_in_one_modal() -> None:
     from textual import work
     from textual.app import App

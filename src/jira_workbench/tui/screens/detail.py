@@ -631,7 +631,9 @@ class DetailScreen(Screen[None]):
         # status a picker can ever show here has, by construction, already
         # been observed on some locally synced issue (see
         # observed_field_options), so its category is always known.
-        categories = observed_status_category_map(self.app.jira_dir)
+        # Within this issue's own project: two projects can share a status
+        # name with different categories (team-managed workflows).
+        categories = observed_status_category_map(self.app.jira_dir, issue_project_key(self.effective_issue))
         result = await self.app.push_screen_wait(
             StatusChangeScreen(
                 options,
