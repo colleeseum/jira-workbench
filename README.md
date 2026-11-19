@@ -204,6 +204,16 @@ been synced and later ages out of the window is left alone on disk, not
 deleted. If a project's local storage grows too large over time, pruning
 old synced issues is a separate concern this doesn't address yet.
 
+An issue Jira no longer returns at all -- not even through a direct
+`key in (...)` lookup that ignores the history cutoff -- is either deleted or
+no longer visible to your account (issue security or project permissions);
+Jira hides both the same way. Sync therefore never deletes its local copy:
+it moves the issue's folder to `jira_dir/trash/<KEY>-<UTC timestamp>/` and
+drops it from the index. Move a folder back under `components/` and sync
+again to restore it, or delete `trash/` entries once you no longer need them.
+Issues with unpushed local edits (`shadow.json`) are kept in place and
+reported instead.
+
 One consequence of excluding old Done issues: a parent (Epic, Story, or
 anything else `fields.parent` can point at) might be old and Done enough to
 fall outside the cutoff while a child of it is still open, or was itself

@@ -580,7 +580,7 @@ def main(argv: list[str] | None = None) -> int:
             backfilled_note = (
                 f", {result.backfilled_parent_count} parent(s) backfilled" if result.backfilled_parent_count else ""
             )
-            deleted_note = f", {len(result.deleted_keys)} deleted in Jira removed" if result.deleted_keys else ""
+            deleted_note = f", {len(result.deleted_keys)} missing from Jira moved to trash" if result.deleted_keys else ""
             print(
                 f"{prefix} {result.work_item_count} work items "
                 f"({result.changed_count} changed, {result.skipped_count} unchanged, "

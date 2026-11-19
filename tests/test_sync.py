@@ -722,6 +722,34 @@ def test_remove_deleted_issues_deletes_the_local_directory(tmp_path: Path) -> No
     assert not directory.exists()
 
 
+def test_remove_deleted_issues_moves_the_directory_to_a_recoverable_trash(tmp_path: Path) -> None:
+    # Regression (#52 review): Jira hides issues the account can no longer
+    # browse exactly like deleted ones, so the local copy must stay recoverable.
+    from jira_workbench.sync import trash_dir
+
+    client = FakeJiraClient()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+    original = read_json(tmp_path / "components/_unassigned/SAT-2/issue.json")
+
+    remove_deleted_issues(tmp_path, ["SAT-2"])
+
+    trashed = list(trash_dir(tmp_path).glob("SAT-2-*"))
+    assert len(trashed) == 1
+    assert trash_dir(tmp_path) == tmp_path / "trash"
+    assert read_json(trashed[0] / "issue.json") == original
+    assert {path.name for path in trashed[0].iterdir()} >= {"issue.json", "comments.json", "attachments.json", "sync.json"}
+
+
+def test_remove_deleted_issues_keeps_both_copies_when_a_key_is_trashed_twice(tmp_path: Path) -> None:
+    from jira_workbench.sync import trash_dir
+
+    for _ in range(2):
+        write_json(tmp_path / "components/_unassigned/SAT-2/issue.json", {"key": "SAT-2", "fields": {}})
+        assert remove_deleted_issues(tmp_path, ["SAT-2"]) == ["SAT-2"]
+
+    assert len(list(trash_dir(tmp_path).glob("SAT-2-*"))) == 2
+
+
 def test_remove_deleted_issues_refuses_to_delete_a_directory_with_a_shadow(tmp_path: Path) -> None:
     client = FakeJiraClient()
     sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
@@ -748,7 +776,65 @@ def test_sync_project_removes_a_locally_synced_issue_deleted_in_jira(tmp_path: P
     assert result.deleted_keys == ("SAT-2",)
     assert result.shadow_protected_deleted_keys == ()
     assert not (tmp_path / "components/_unassigned/SAT-2").exists()
-    assert any("Removed 1 item(s) deleted in Jira: SAT-2" in line for line in progress)
+    assert any("Moved 1 item(s) no longer found in Jira" in line and "SAT-2" in line for line in progress)
+    from jira_workbench import db
+    from jira_workbench.sync import trash_dir
+
+    assert (next(trash_dir(tmp_path).glob("SAT-2-*")) / "issue.json").exists()
+    assert {item["key"] for item in db.list_items(tmp_path)} == {"SAT-1"}
+
+
+def test_sync_project_falls_back_to_per_key_checks_when_the_batch_query_is_rejected(tmp_path: Path) -> None:
+    # Jira may answer `key in (...)` with HTTP 400 when one listed key no
+    # longer exists; that must not abort the sync or hide the other keys.
+    import requests
+
+    class RejectingClient(FakeJiraClientForDeletionCheck):
+        def enhanced_jql_get_list_of_tickets(self, jql, fields="*all", limit=None, expand=None):
+            if "key in (" in jql:
+                self.calls.append(("enhanced_jql_get_list_of_tickets", jql, fields, limit))
+                keys = jql.split("key in (", 1)[1].rstrip(")").split(", ")
+                missing = [key for key in keys if key not in self.still_exists_keys]
+                if missing:
+                    response = requests.Response()
+                    response.status_code = 400
+                    raise requests.HTTPError(f"An issue key {missing[0]} does not exist", response=response)
+                return [{"key": key} for key in keys]
+            return super().enhanced_jql_get_list_of_tickets(jql, fields, limit, expand)
+
+    client = RejectingClient(index_keys=["SAT-1", "SAT-2", "SAT-3"])
+    config = SyncConfig(project="SAT", jira_dir=tmp_path)
+    sync_project(config, client, progress=None)
+
+    client.index_keys = ["SAT-1"]
+    client.still_exists_keys = {"SAT-3"}
+    result = sync_project(config, client, progress=None)
+
+    assert result.deleted_keys == ("SAT-2",)
+    assert (tmp_path / "components/_unassigned/SAT-3/issue.json").exists()
+    assert not (tmp_path / "components/_unassigned/SAT-2").exists()
+    single_key_queries = [call[1] for call in client.calls if call[0] == "enhanced_jql_get_list_of_tickets" and "key in (SAT-" in call[1] and "," not in call[1]]
+    assert any("key in (SAT-2)" in jql for jql in single_key_queries)
+
+
+def test_detect_deleted_issues_keeps_a_key_whose_single_lookup_fails_unexpectedly(tmp_path: Path) -> None:
+    import requests
+
+    class FailingClient(FakeJiraClientForDeletionCheck):
+        def enhanced_jql_get_list_of_tickets(self, jql, fields="*all", limit=None, expand=None):
+            if "key in (" in jql:
+                response = requests.Response()
+                response.status_code = 503
+                raise requests.HTTPError("unavailable", response=response)
+            return super().enhanced_jql_get_list_of_tickets(jql, fields, limit, expand)
+
+    client = FailingClient()
+    sync_project(SyncConfig(project="SAT", jira_dir=tmp_path), client, progress=None)
+
+    deleted, shadow_protected = detect_deleted_issues(tmp_path, "SAT", client, {"SAT-1"})
+
+    assert deleted == []
+    assert shadow_protected == []
 
 
 def test_sync_project_keeps_a_deleted_issue_with_unpushed_edits_and_reports_it(tmp_path: Path) -> None:

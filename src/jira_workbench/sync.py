@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import requests
+
 
 class JiraSyncClient(Protocol):
     def enhanced_jql_get_list_of_tickets(
@@ -282,7 +284,8 @@ def detect_deleted_issues(
     client: JiraSyncClient,
     fresh_keys: set[str],
 ) -> tuple[list[str], list[str]]:
-    """Finds locally-synced issues that no longer exist in Jira at all.
+    """Finds locally-synced issues Jira no longer returns at all -- deleted,
+    or no longer visible to this account (Jira hides both the same way).
 
     A key indexed locally but missing from `fresh_keys` (this sync's own
     fresh index fetch) isn't necessarily deleted -- it can simply have aged
@@ -309,11 +312,20 @@ def detect_deleted_issues(
 
     still_exists: set[str] = set()
     for batch in _chunked(candidates, 200):
-        jql = f"project={project} AND key in ({', '.join(batch)})"
-        payload = client.enhanced_jql_get_list_of_tickets(jql, fields=["key"])
-        still_exists.update(
-            item.get("key") for item in normalize_work_items(payload) if isinstance(item.get("key"), str)
-        )
+        try:
+            still_exists.update(_keys_jira_still_returns(project, batch, client))
+        except requests.HTTPError:
+            # Jira can reject the whole `key in (...)` query (HTTP 400) when
+            # one listed key no longer exists. Check each key on its own so
+            # one deleted key cannot abort the sync.
+            for key in batch:
+                try:
+                    still_exists.update(_keys_jira_still_returns(project, [key], client))
+                except requests.HTTPError as exc:
+                    if _http_status(exc) not in (400, 404):
+                        # Unknown failure: treat the key as still existing
+                        # rather than moving away a possibly-live issue.
+                        still_exists.add(key)
 
     genuinely_deleted = []
     shadow_protected = []
@@ -326,13 +338,39 @@ def detect_deleted_issues(
     return genuinely_deleted, shadow_protected
 
 
+def _keys_jira_still_returns(project: str, keys: list[str], client: JiraSyncClient) -> set[str]:
+    jql = f"project={project} AND key in ({', '.join(keys)})"
+    payload = client.enhanced_jql_get_list_of_tickets(jql, fields=["key"])
+    return {item["key"] for item in normalize_work_items(payload) if isinstance(item.get("key"), str)}
+
+
+def _http_status(exc: requests.HTTPError) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+TRASH_DIR_NAME = "trash"
+
+
+def trash_dir(jira_dir: Path) -> Path:
+    """Where issues that vanished from Jira are moved instead of deleted.
+    Outside components/, so nothing indexes or lists them."""
+    return jira_dir / TRASH_DIR_NAME
+
+
 def remove_deleted_issues(jira_dir: Path, keys: list[str]) -> list[str]:
-    """Deletes the local directory for each confirmed-deleted key, skipping
-    (never deleting) any that carry a shadow.json -- belt-and-suspenders on
-    top of detect_deleted_issues already excluding shadow-protected keys,
-    in case one appeared between detection and this call. Returns the keys
-    actually removed."""
+    """Moves the local directory of each confirmed-missing key into
+    `<jira_dir>/trash/<KEY>-<UTC timestamp>/` rather than deleting it: Jira
+    hides issues the account can no longer browse (issue security, project
+    permissions) exactly like deleted ones, so absence from a search is not
+    proof of deletion and the data must stay recoverable. Skips any key that
+    carries a shadow.json -- belt-and-suspenders on top of
+    detect_deleted_issues already excluding shadow-protected keys, in case
+    one appeared between detection and this call. Returns the keys actually
+    moved; the next manifest/reindex drops them from the index."""
     components_dir = jira_dir / "components"
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     removed = []
     for key in keys:
         existing = find_existing_issue(components_dir, key)
@@ -340,7 +378,13 @@ def remove_deleted_issues(jira_dir: Path, keys: list[str]) -> list[str]:
             continue
         if (existing.parent / "shadow.json").exists():
             continue
-        shutil.rmtree(existing.parent)
+        dest = trash_dir(jira_dir) / f"{key}-{stamp}"
+        suffix = 1
+        while dest.exists():
+            suffix += 1
+            dest = trash_dir(jira_dir) / f"{key}-{stamp}-{suffix}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(existing.parent), str(dest))
         removed.append(key)
     return removed
 
@@ -627,7 +671,10 @@ def sync_project(
     deletable, shadow_protected = detect_deleted_issues(jira_dir, config.project, client, fresh_keys)
     removed = remove_deleted_issues(jira_dir, deletable)
     if progress and removed:
-        progress(f"[4/7] Removed {len(removed)} item(s) deleted in Jira: {', '.join(removed)}")
+        progress(
+            f"[4/7] Moved {len(removed)} item(s) no longer found in Jira to "
+            f"{trash_dir(jira_dir)}: {', '.join(removed)}"
+        )
     if progress and shadow_protected:
         progress(
             f"[4/7] {len(shadow_protected)} item(s) deleted in Jira were kept locally "
