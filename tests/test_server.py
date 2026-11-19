@@ -5850,6 +5850,26 @@ def test_items_page_status_component_assignee_options_scoped_to_selected_board(t
         assert plat_value not in checklist
 
 
+def test_items_page_board_scoped_options_include_freshdesk_items_on_a_mixed_local_board(tmp_path: Path) -> None:
+    # A local board can hold Jira issues and Freshdesk tickets together;
+    # with no Project checkbox ticked, the board's projects must be
+    # gathered from every source, or the Freshdesk tickets' own values
+    # (here the "Closed" status) vanish from the filter options.
+    client = _synced_client_with_freshdesk(tmp_path, tickets={1: _ticket(1, status=5)})
+    add_response = client.post(
+        "/meta/boards/add",
+        data={"project": "SAT", "name": "Mixed board", "board_project": "SAT,FRESHDESK"},
+        follow_redirects=False,
+    )
+    assert add_response.status_code == 303
+
+    response = client.get("/", params={"active": "0", "board": "Mixed board"})
+
+    assert "FD-1" in response.text
+    assert "SAT-1" in response.text
+    assert 'value="Closed"' in _field_checklist(response.text, "Status")
+
+
 def _write_two_assignee_issues(tmp_path: Path) -> None:
     write_json(
         tmp_path / "components/helm-chart/SAT-1/issue.json",

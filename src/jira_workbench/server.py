@@ -1208,9 +1208,24 @@ def _field_counts_all_sources(
     return sorted(merged.items())
 
 
-def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any], allowed_version_names: set[str]) -> str:
+def _board_projects_all_sources(jira_dir: Path, config: WorkbenchConfig, board: str) -> set[str]:
+    """distinct_projects_for_board, unioned across the default Jira source
+    and every configured Freshdesk source -- a local board can hold Jira
+    issues and Freshdesk tickets together, and scoping the filter options
+    to the Jira source's projects alone would drop "FRESHDESK" (and so
+    every Freshdesk ticket's status/component/assignee) from them."""
     from .db import distinct_projects_for_board
 
+    projects = set(distinct_projects_for_board(jira_dir, board))
+    for freshdesk_source in config.freshdesk_sources:
+        try:
+            projects |= distinct_projects_for_board(jira_dir, board, source_slug=freshdesk_source.slug)
+        except LookupError:
+            continue
+    return projects
+
+
+def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any], allowed_version_names: set[str]) -> str:
     # Straight SQL GROUP BY counts instead of materializing/JSON-decoding
     # every indexed item to count them in Python -- project/status/
     # component/assignee are all plain promoted columns with no per-request
@@ -1238,7 +1253,7 @@ def _filter_form(jira_dir: Path, config: WorkbenchConfig, query: dict[str, Any],
     if selected_projects_lower:
         scoped_projects = [name for name, _count in project_counts if name.strip().lower() in selected_projects_lower]
     elif board:
-        scoped_projects = sorted(distinct_projects_for_board(jira_dir, board))
+        scoped_projects = sorted(_board_projects_all_sources(jira_dir, config, board))
     else:
         scoped_projects = None
     project_scope = {"projects": scoped_projects} if scoped_projects else {}
