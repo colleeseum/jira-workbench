@@ -355,6 +355,12 @@ def _agent_display_name(agent: dict[str, Any]) -> str:
     return ""
 
 
+def source_identity(settings: FreshdeskSettings) -> dict[str, str]:
+    """Which Freshdesk account a local cache was synced from -- slug and
+    domain only, never the API key."""
+    return {"slug": settings.slug, "domain": settings.domain}
+
+
 def sync_freshdesk_source(
     settings: FreshdeskSettings,
     jira_dir: Path,
@@ -387,12 +393,23 @@ def sync_freshdesk_source(
     last_sync_path = base_dir / "last_sync.json"
     updated_since = None
     retry_ids: list[int] = []
-    if last_sync_path.exists():
-        last_sync = read_json(last_sync_path)
-        if isinstance(last_sync, dict):
-            if not force and isinstance(last_sync.get("syncedAt"), str):
-                updated_since = last_sync["syncedAt"]
-            retry_ids = [i for i in last_sync.get("conversationRetryIds") or [] if isinstance(i, int)]
+    # The account the cache belongs to (never the API key: a new key for the
+    # same domain is the same account, and secrets stay out of the cache). A
+    # cache written for another account must not lend this run its cursor or
+    # its tickets, so a change forces the full-listing reconciliation below.
+    identity = source_identity(settings)
+    last_sync = read_json(last_sync_path) if last_sync_path.exists() else None
+    if not isinstance(last_sync, dict):
+        last_sync = {}
+    # A cache from before identities were recorded is adopted as is.
+    previous_identity = last_sync.get("source") if isinstance(last_sync.get("source"), dict) else None
+    account_changed = previous_identity is not None and previous_identity != identity
+    if not account_changed:
+        if not force and isinstance(last_sync.get("syncedAt"), str):
+            updated_since = last_sync["syncedAt"]
+        retry_ids = [i for i in last_sync.get("conversationRetryIds") or [] if isinstance(i, int)]
+    if account_changed and progress:
+        progress("[2/4] Freshdesk account changed since the last sync; replacing the cached tickets")
 
     if progress:
         progress("[2/4] Listing tickets...")
@@ -445,7 +462,7 @@ def sync_freshdesk_source(
         except FreshdeskError as exc:
             failed.append(key)
             failed_ids.append(ticket_id)
-            conversations = None if conversations_path.exists() else []
+            conversations = None if conversations_path.exists() and not account_changed else []
             if progress:
                 progress(f"[3/4] could not fetch conversations for {key}: {exc}")
         write_json(dest / "ticket.json", ticket)
@@ -483,8 +500,10 @@ def sync_freshdesk_source(
             progress(f"[3/4] could not list deleted/spam tickets: {exc}")
     # A full listing (first sync or --force) is the complete active set, so
     # any other local ticket is gone or no longer visible -- unless the
-    # listing hit Freshdesk's documented size cap and may be truncated.
-    if updated_since is None and not listing_truncated:
+    # listing hit Freshdesk's documented size cap and may be truncated. After
+    # an account change every unlisted local ticket belongs to the previous
+    # account, so it goes even from a truncated listing.
+    if updated_since is None and (account_changed or not listing_truncated):
         gone_ids |= unlisted_ticket_ids(tickets_dir, listed_ids)
     removed_ids = remove_ticket_dirs(tickets_dir, gone_ids)
     if removed_ids and progress:
@@ -495,6 +514,9 @@ def sync_freshdesk_source(
         progress("[4/4] Indexing...")
     from . import db as _db  # deferred: avoid a module-level import cycle with db.py
 
+    previous_slug = previous_identity.get("slug") if previous_identity else None
+    if isinstance(previous_slug, str) and previous_slug != settings.slug:
+        _db.delete_source(jira_dir, previous_slug)
     _db.ensure_source(jira_dir, settings.slug, DEFAULT_SOURCE_KIND, f"Freshdesk ({settings.domain})")
     count = _db.reindex_freshdesk_items(jira_dir, source_slug=settings.slug)
     # Mirrors Jira's build_manifest -> reindex_items -> recompute_board_membership
@@ -504,5 +526,8 @@ def sync_freshdesk_source(
     # computes (see recompute_board_membership's own docstring).
     _db.recompute_board_membership(jira_dir, source_slug=settings.slug)
 
-    write_json(last_sync_path, {"syncedAt": next_cursor, "conversationRetryIds": sorted(set(failed_ids))})
+    write_json(
+        last_sync_path,
+        {"source": identity, "syncedAt": next_cursor, "conversationRetryIds": sorted(set(failed_ids))},
+    )
     return FreshdeskSyncResult(ticket_count=count, changed_count=changed, failed_keys=tuple(failed))

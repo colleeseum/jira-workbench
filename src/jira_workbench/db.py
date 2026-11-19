@@ -543,6 +543,20 @@ def ensure_source(jira_dir: Path, slug: str, kind: str, display_name: str) -> in
         conn.close()
 
 
+def delete_source(jira_dir: Path, slug: str) -> None:
+    """Removes a non-default source and, by cascade, every row indexed under
+    it -- for a source the configuration no longer has (e.g. a Freshdesk
+    slug that was renamed). The bootstrapped Jira source is never removed."""
+    if slug == DEFAULT_SOURCE_SLUG:
+        return
+    conn = connect(jira_dir)
+    try:
+        conn.execute("DELETE FROM sources WHERE slug = ?", (slug,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def reindex_freshdesk_items(jira_dir: Path, *, source_slug: str) -> int:
     """Freshdesk's own reindex_items-equivalent -- structurally the same
     upsert-then-delete-unseen pattern (same temp-table technique, for the

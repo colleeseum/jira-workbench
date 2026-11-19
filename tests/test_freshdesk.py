@@ -22,7 +22,7 @@ from jira_workbench.freshdesk import (
     sync_freshdesk_source,
     ticket_key,
 )
-from jira_workbench.sync import read_json
+from jira_workbench.sync import read_json, write_json
 
 
 class _FakeResponse:
@@ -395,6 +395,81 @@ def test_sync_freshdesk_source_forced_full_listing_removes_unlisted_tickets(tmp_
     assert not (tmp_path / "freshdesk/tickets/5").exists()
     assert (tmp_path / "freshdesk/tickets/1/ticket.json").exists()
     assert {item["key"] for item in db.list_items(tmp_path, source_slug="freshdesk")} == {"FD-1"}
+
+
+def test_sync_freshdesk_source_account_change_forces_a_full_reconciliation(tmp_path: Path) -> None:
+    # Regression (#53 review): a new domain reused the old account's cursor
+    # and kept its cached tickets alongside the new account's.
+    from jira_workbench import db
+
+    old = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="old-key")
+    sync_freshdesk_source(old, tmp_path, FakeFreshdeskClient({1: _ticket(1), 5: _ticket(5)}), progress=None)
+
+    new = FreshdeskSettings(slug="freshdesk", domain="other", api_key="new-key")
+    # The new account also has a ticket 1; its conversations fail to load, and
+    # the old account's cached conversations for ticket 1 must not survive.
+    client = FakeFreshdeskClient({1: _ticket(1), 7: _ticket(7)}, failing_ticket_ids={1})
+    sync_freshdesk_source(new, tmp_path, client, progress=None)
+
+    assert [call[1] for call in client.calls if call[0] == "list_tickets"] == [None]
+    assert not (tmp_path / "freshdesk/tickets/5").exists()
+    assert read_json(tmp_path / "freshdesk/tickets/1/conversations.json") == []
+    assert read_json(freshdesk_dir(tmp_path) / "last_sync.json")["conversationRetryIds"] == [1]
+    assert {item["key"] for item in db.list_items(tmp_path, source_slug="freshdesk")} == {"FD-1", "FD-7"}
+    assert read_json(freshdesk_dir(tmp_path) / "last_sync.json")["source"] == {"slug": "freshdesk", "domain": "other"}
+
+
+def test_sync_freshdesk_source_slug_change_drops_the_old_slugs_index_rows(tmp_path: Path) -> None:
+    from jira_workbench import db
+
+    sync_freshdesk_source(
+        FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key"),
+        tmp_path,
+        FakeFreshdeskClient({1: _ticket(1)}),
+        progress=None,
+    )
+    client = FakeFreshdeskClient({1: _ticket(1)})
+    sync_freshdesk_source(
+        FreshdeskSettings(slug="support", domain="acme", api_key="key"), tmp_path, client, progress=None
+    )
+
+    assert [call[1] for call in client.calls if call[0] == "list_tickets"] == [None]
+    assert {item["key"] for item in db.list_items(tmp_path, source_slug="support")} == {"FD-1"}
+    with pytest.raises(LookupError):
+        db.list_items(tmp_path, source_slug="freshdesk")
+
+
+def test_sync_freshdesk_source_api_key_change_keeps_the_cursor_and_is_never_stored(tmp_path: Path) -> None:
+    sync_freshdesk_source(
+        FreshdeskSettings(slug="freshdesk", domain="acme", api_key="secret-one"),
+        tmp_path,
+        FakeFreshdeskClient({1: _ticket(1)}),
+        progress=None,
+    )
+    client = FakeFreshdeskClient({1: _ticket(1)})
+    sync_freshdesk_source(
+        FreshdeskSettings(slug="freshdesk", domain="acme", api_key="secret-two"), tmp_path, client, progress=None
+    )
+
+    assert [call[1] for call in client.calls if call[0] == "list_tickets"][0] is not None
+    raw = (freshdesk_dir(tmp_path) / "last_sync.json").read_text()
+    assert "secret-one" not in raw and "secret-two" not in raw
+
+
+def test_sync_freshdesk_source_legacy_last_sync_without_identity_stays_incremental(tmp_path: Path) -> None:
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient({1: _ticket(1), 5: _ticket(5)}), progress=None)
+    last_sync_path = freshdesk_dir(tmp_path) / "last_sync.json"
+    legacy = read_json(last_sync_path)
+    del legacy["source"]
+    write_json(last_sync_path, legacy)
+
+    client = FakeFreshdeskClient({1: _ticket(1), 5: _ticket(5)}, index_keys=[1])
+    sync_freshdesk_source(settings, tmp_path, client, progress=None)
+
+    assert [call[1] for call in client.calls if call[0] == "list_tickets"] == [legacy["syncedAt"]]
+    assert (tmp_path / "freshdesk/tickets/5/ticket.json").exists()
+    assert read_json(last_sync_path)["source"] == {"slug": "freshdesk", "domain": "acme"}
 
 
 def test_sync_freshdesk_source_forced_listing_at_the_cap_keeps_unlisted_tickets_and_resumes(

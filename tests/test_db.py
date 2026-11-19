@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 from jira_workbench.db import (
+    delete_source,
     MIGRATIONS,
     backup,
     connect,
@@ -599,6 +600,20 @@ def test_ensure_source_is_idempotent_and_preserves_id(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert row["display_name"] == "Freshdesk (acme), renamed"
+
+
+def test_delete_source_removes_a_source_but_never_the_default_jira_one(tmp_path: Path) -> None:
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+
+    delete_source(tmp_path, "freshdesk")
+    delete_source(tmp_path, "jira")
+
+    conn = connect(tmp_path)
+    try:
+        slugs = {row["slug"] for row in conn.execute("SELECT slug FROM sources")}
+    finally:
+        conn.close()
+    assert slugs == {"jira"}
 
 
 def test_reindex_freshdesk_items_populates_items_from_disk(tmp_path: Path) -> None:

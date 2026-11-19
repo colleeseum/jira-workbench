@@ -137,7 +137,10 @@ api_key = "..."
 Freshdesk sync is read-only and stores tickets under `jira_dir/freshdesk/`.
 Each sync removes local copies of tickets Freshdesk lists as deleted or spam;
 a full sync (the first one, or `--force`) also removes local tickets missing
-from the complete active-ticket listing.
+from the complete active-ticket listing. Changing the source's `domain` or
+`slug` makes the next sync a full one that replaces the previous account's
+cached tickets; changing only the `api_key` does not (the key is never written
+to the cache).
 Tickets appear as `FD-<id>`, so a configuration with a Freshdesk source cannot
 also sync a Jira project keyed `FD`. The source slug `jira` is reserved.
 Only one Freshdesk source is supported for now: a second `[[sources]]` entry
