@@ -5,8 +5,6 @@ import pytest
 from jira_workbench.jql import (
     compile_jql,
     evaluate_predicate,
-    predicate_scopes_project,
-    scope_predicate_to_project,
 )
 
 COMPONENT_FIELD_NAME = "Components[Dropdown]"
@@ -202,13 +200,12 @@ def test_compile_project_not_in() -> None:
 
 
 def test_compile_in_scopes_project_like_a_plain_eq_clause() -> None:
-    # project IN (...) must be recognized by predicate_scopes_project just
-    # like "project = X", so scope_predicate_to_project doesn't redundantly
-    # (and wrongly) AND in another project constraint on top.
+    # project IN (...) constrains the project exactly like OR-ed "project = X" clauses.
     predicate, reason = compile_jql("project IN (SAT, PLAT)", component_field_names=[COMPONENT_FIELD_NAME])
     assert reason is None
-    assert predicate_scopes_project(predicate) is True
-    assert scope_predicate_to_project(predicate, "SAT") == predicate
+    assert evaluate_predicate(predicate, component=None, labels=[], project="SAT") is True
+    assert evaluate_predicate(predicate, component=None, labels=[], project="PLAT") is True
+    assert evaluate_predicate(predicate, component=None, labels=[], project="OTHER") is False
 
 
 def test_compile_real_ps_tools_board_jql_with_project_in() -> None:
@@ -266,45 +263,3 @@ def test_compile_matches_any_configured_clause_name_alias() -> None:
 
     assert reason is None
     assert evaluate_predicate(predicate, component="helm-chart", labels=[]) is True
-
-
-def test_scope_predicate_to_project_wraps_a_filter_with_no_project_clause() -> None:
-    # A Jira board only ever shows issues from its own project even when
-    # its saved filter's JQL doesn't literally say so (real Jira board
-    # behavior, not a JQL default) -- e.g. a board filter that's just
-    # "component = helm-chart" still only ever shows that component's
-    # issues within the one project the board itself belongs to.
-    predicate, reason = compile_jql(
-        f'"{COMPONENT_FIELD_NAME}" = helm-chart', component_field_names=[COMPONENT_FIELD_NAME]
-    )
-    assert reason is None
-    assert predicate_scopes_project(predicate) is False
-
-    scoped = scope_predicate_to_project(predicate, "SAT")
-
-    assert scoped == {
-        "op": "and",
-        "clauses": [{"op": "eq", "field": "project", "value": "SAT"}, predicate],
-    }
-    assert evaluate_predicate(scoped, component="helm-chart", labels=[], project="SAT") is True
-    # same component, wrong project -- the implicit scoping excludes it
-    assert evaluate_predicate(scoped, component="helm-chart", labels=[], project="PLAT") is False
-
-
-def test_scope_predicate_to_project_is_a_no_op_when_already_scoped() -> None:
-    predicate, reason = compile_jql("project = SAT ORDER BY Rank ASC", component_field_names=[COMPONENT_FIELD_NAME])
-    assert reason is None
-    assert predicate_scopes_project(predicate) is True
-
-    assert scope_predicate_to_project(predicate, "SAT") == predicate
-
-
-def test_scope_predicate_to_project_is_a_no_op_for_a_genuine_multi_project_board() -> None:
-    jql = f'project = SAT OR project = PLAT OR "{COMPONENT_FIELD_NAME}" = helm-chart'
-    predicate, reason = compile_jql(jql, component_field_names=[COMPONENT_FIELD_NAME])
-    assert reason is None
-    assert predicate_scopes_project(predicate) is True
-
-    assert scope_predicate_to_project(predicate, "SAT") == predicate
-    # PLAT is still matched via its own explicit "project = PLAT" clause
-    assert evaluate_predicate(predicate, component=None, labels=[], project="PLAT") is True

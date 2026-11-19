@@ -1006,11 +1006,11 @@ def test_rank_issue_after_puts_a_rank_after_operation() -> None:
     ]
 
 
-def test_refresh_boards_api_implicitly_scopes_a_project_less_filter_to_its_own_project(tmp_path: Path) -> None:
-    # A board's saved filter doesn't have to mention "project" at all --
-    # Jira itself still only ever shows that board's own project's issues,
-    # so the compiled predicate must be scoped the same way even though
-    # the JQL text alone never says so.
+def test_refresh_boards_api_keeps_a_project_less_filter_unscoped(tmp_path: Path) -> None:
+    # Regression (#52 review): a company-managed board's saved filter may
+    # span several projects; the project the board was discovered through
+    # must not be AND-ed into it, or other synced projects' issues are
+    # wrongly excluded.
     class ProjectLessFilterClient(ApiClient):
         def get(self, path: str, params: dict[str, object] | None = None) -> object:
             if path == "rest/api/2/filter/10089":
@@ -1021,13 +1021,7 @@ def test_refresh_boards_api_implicitly_scopes_a_project_less_filter_to_its_own_p
 
     sat_board = next(board for board in cache["boards"] if board["name"] == "SAT board")
     assert sat_board["unsupportedReason"] is None
-    assert sat_board["predicate"] == {
-        "op": "and",
-        "clauses": [
-            {"op": "eq", "field": "project", "value": "SAT"},
-            {"op": "eq", "field": "component", "value": "helm-chart"},
-        ],
-    }
+    assert sat_board["predicate"] == {"op": "eq", "field": "component", "value": "helm-chart"}
 
 
 def test_refresh_boards_api_wraps_client_errors(tmp_path: Path) -> None:

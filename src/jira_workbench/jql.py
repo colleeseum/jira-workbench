@@ -195,33 +195,6 @@ def compile_jql(jql: str, *, component_field_names: list[str]) -> tuple[dict[str
     return tree, None
 
 
-def predicate_scopes_project(predicate: dict[str, Any]) -> bool:
-    """True if this predicate tree already constrains "project" somewhere
-    -- an explicit OR of several `project = X` clauses (a genuine
-    multi-project board) counts as scoped, same as a single one."""
-    op = predicate.get("op")
-    if op == "eq":
-        return predicate.get("field") == "project"
-    if op == "not":
-        return predicate_scopes_project(predicate["clause"])
-    if op in ("and", "or"):
-        return any(predicate_scopes_project(clause) for clause in predicate["clauses"])
-    return False
-
-
-def scope_predicate_to_project(predicate: dict[str, Any], project: str) -> dict[str, Any]:
-    """A Jira board only ever shows issues from its own project, even when
-    its saved filter's JQL doesn't literally say so (a board's filter is
-    already implicitly scoped by Jira itself) -- if the compiled predicate
-    doesn't already reference "project" anywhere, AND in that implicit
-    constraint so evaluate_predicate enforces it too. A no-op if the
-    filter already scopes by project on its own (e.g. a genuine
-    multi-project board's own "project = A OR project = B" clause)."""
-    if predicate_scopes_project(predicate):
-        return predicate
-    return {"op": "and", "clauses": [{"op": "eq", "field": "project", "value": project}, predicate]}
-
-
 def evaluate_predicate(
     predicate: dict[str, Any], *, component: str | None, labels: list[str], project: str | None = None
 ) -> bool:

@@ -35,6 +35,7 @@ from .view import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_SOURCE_SLUG = "jira"
+JIRA_SOURCE_KIND = "jira"
 
 
 def db_path(jira_dir: Path) -> Path:
@@ -210,7 +211,7 @@ def _bootstrap_rows(conn: sqlite3.Connection) -> None:
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(slug) DO NOTHING
         """,
-        (DEFAULT_SOURCE_SLUG, DEFAULT_SOURCE_SLUG, "Jira", now, now),
+        (DEFAULT_SOURCE_SLUG, JIRA_SOURCE_KIND, "Jira", now, now),
     )
     user_slug = os.environ.get("USER") or os.environ.get("USERNAME") or "local"
     conn.execute(
@@ -468,9 +469,16 @@ def recompute_board_membership(jira_dir: Path, *, source_slug: str = DEFAULT_SOU
     conn = connect(jira_dir)
     try:
         sid = source_id(conn, source_slug)
+        kind_row = conn.execute("SELECT kind FROM sources WHERE id = ?", (sid,)).fetchone()
         rows = conn.execute("SELECT * FROM items WHERE source_id = ?", (sid,)).fetchall()
         items = [_row_to_item(row) for row in rows]
         boards = load_cached_boards(jira_dir)
+        if kind_row is None or kind_row["kind"] != JIRA_SOURCE_KIND:
+            # Jira boards' saved filters describe Jira issues only (and are
+            # evaluated unscoped, since they may span projects) -- a
+            # project-less filter must never pick up another source's items.
+            # Local boards stay source-agnostic.
+            boards = [board for board in boards if board.get("kind") == "local"]
         updates = []
         for item in items:
             enriched = attach_board_fields(dict(item), item["key"], item.get("labels") or [], boards)

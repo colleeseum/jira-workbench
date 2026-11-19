@@ -342,6 +342,31 @@ def test_recompute_board_membership_all_sources_covers_jira_and_freshdesk(tmp_pa
     assert jira_items["SAT-1"]["boards"] == []
 
 
+def test_project_less_jira_board_matches_other_projects_jira_items_but_not_freshdesk(tmp_path: Path) -> None:
+    # Regression (#52 review): a board discovered through SAT whose saved
+    # filter has no project clause spans projects (company-managed boards
+    # can), so it matches an ABC issue -- but Jira boards never match
+    # another source's items, even when the labels match.
+    from jira_workbench.db import recompute_board_membership_all_sources
+
+    _write_issue(tmp_path, "ABC-1", "helm-chart", labels=["vip"])
+    _write_issue(tmp_path, "SAT-1", "helm-chart", labels=["other"])
+    _write_boards_cache(tmp_path, [{"id": 1, "name": "VIP board", "predicate": {"op": "eq", "field": "labels", "value": "vip"}}])
+    reindex_items(tmp_path, "customfield_10071")
+    ensure_source(tmp_path, "freshdesk", "freshdesk", "Freshdesk (acme)")
+    _write_ticket(tmp_path, 1, tags=["vip"])
+    reindex_freshdesk_items(tmp_path, source_slug="freshdesk")
+
+    recompute_board_membership_all_sources(tmp_path)
+
+    jira_items = {item["key"]: item for item in list_items(tmp_path)}
+    freshdesk_items = {item["key"]: item for item in list_items(tmp_path, source_slug="freshdesk")}
+    assert jira_items["ABC-1"]["boards"] == ["VIP board"]
+    assert jira_items["SAT-1"]["boards"] == []
+    assert freshdesk_items["FD-1"]["labels"] == ["vip"]
+    assert freshdesk_items["FD-1"]["boards"] == []
+
+
 def test_recompute_board_membership_picks_up_a_boards_cache_change_without_a_reindex(tmp_path: Path) -> None:
     # This is the whole point: board data (boards.json/board_settings.json)
     # can change independently of a resync -- recompute_board_membership

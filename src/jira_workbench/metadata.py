@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .config import ProjectSettings
-from .jql import compile_jql, scope_predicate_to_project
+from .jql import compile_jql
 from .sync import FALLBACK_DONE_STATUS_NAMES, read_json, utc_now, write_json
 
 
@@ -1059,14 +1059,12 @@ def refresh_boards_api(
             if not jql:
                 reason = "board has no filter JQL"
             else:
+                # Evaluated as saved: a company-managed board's filter may
+                # span several projects, and the project the board was
+                # discovered through imposes no extra constraint. Keeping
+                # Jira boards away from other sources' items (Freshdesk) is
+                # db.recompute_board_membership's job.
                 predicate, reason = compile_jql(jql, component_field_names=component_field_names)
-                if predicate is not None:
-                    # A board only ever shows issues from its own project,
-                    # even when its saved filter doesn't literally say so
-                    # (that's real Jira behavior, not a JQL quirk) -- so an
-                    # unscoped filter is implicitly AND-ed with this board's
-                    # own project rather than matching every project.
-                    predicate = scope_predicate_to_project(predicate, project)
 
         backlog_keys: list[str] | None = None
         try:
