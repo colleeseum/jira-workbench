@@ -6166,6 +6166,44 @@ def test_post_assistant_follow_up_passes_the_resume_id_and_appends_the_transcrip
     assert "answer to: second question" in response.text
 
 
+@pytest.mark.parametrize("failure", ["error", "raise"])
+def test_post_assistant_failed_resumed_turn_keeps_the_engine_session(tmp_path: Path, monkeypatch, failure: str) -> None:
+    # Regression (#53 review): a resumed turn's new entry started with
+    # engine_session_id None and only success set it, so after a failed
+    # resumed turn the next question started a fresh engine session.
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    calls = []
+    mode = {"value": "ok"}
+
+    def fake_ask(engine, jira_dir, question, *, resume_id=None, on_step=None):
+        calls.append((question, resume_id))
+        if mode["value"] == "error":
+            return AssistantResult(engine=engine, answer="", error="rate limited", session_id=None, duration_seconds=0.0)
+        if mode["value"] == "raise":
+            raise RuntimeError("engine crashed")
+        return AssistantResult(engine=engine, answer=f"answer to: {question}", error=None, session_id="sess-1", duration_seconds=1.0)
+
+    monkeypatch.setattr(jira_workbench.server, "assistant_ask_streaming", fake_ask)
+    client = TestClient(create_app(tmp_path, WorkbenchConfig()))
+
+    first = client.post("/assistant", data={"engine": "claude", "question": "q1"}, follow_redirects=False)
+    mode["value"] = failure
+    second = client.post(
+        "/assistant",
+        data={"engine": "claude", "question": "q2", "conversation": _conversation_id_from_location(first.headers["location"])},
+        follow_redirects=False,
+    )
+    failed_conversation = _conversation_id_from_location(second.headers["location"])
+    assert jira_workbench.server._load_assistant_conversations(tmp_path)[failed_conversation]["engine_session_id"] == "sess-1"
+
+    mode["value"] = "ok"
+    client.post(
+        "/assistant", data={"engine": "claude", "question": "q3", "conversation": failed_conversation}, follow_redirects=False
+    )
+
+    assert calls == [("q1", None), ("q2", "sess-1"), ("q3", "sess-1")]
+
+
 def test_post_assistant_switching_engine_starts_a_fresh_conversation(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
     calls = []

@@ -6589,7 +6589,11 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             "status": "running",
             "steps": [],
             "turns": prior_turns,
-            "engine_session_id": None,
+            # Starts as the session being resumed (if any), not None: a
+            # failed resumed turn must keep pointing at that session, or the
+            # next question on this conversation would silently start a
+            # fresh engine session and lose the earlier context.
+            "engine_session_id": resume_id,
             "error": None,
         }
         _assistant_conversations[new_conversation_id] = entry
@@ -6607,7 +6611,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                     entry["error"] = result.error
                 else:
                     entry["turns"] = [*entry["turns"], {"question": question, "answer": result.answer}]
-                    entry["engine_session_id"] = result.session_id
+                    entry["engine_session_id"] = result.session_id or resume_id
             except Exception as exc:  # noqa: BLE001 -- reported on the page, not raised in a daemon thread
                 entry["error"] = f"assistant failed: {exc}"
             finally:
