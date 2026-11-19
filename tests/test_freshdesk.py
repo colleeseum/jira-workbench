@@ -58,8 +58,10 @@ class FakeFreshdeskClient:
         *,
         index_keys: list[int] | None = None,
         failing_ticket_ids: set[int] = frozenset(),
+        removed_ids: set[int] = frozenset(),
     ) -> None:
         self.tickets = tickets
+        self.removed_ids = set(removed_ids)
         self.index_keys = list(tickets.keys()) if index_keys is None else index_keys
         # Renamed to match reality: with the description/requester embedded
         # directly in list_tickets (see FreshdeskClient.list_tickets), the
@@ -74,6 +76,10 @@ class FakeFreshdeskClient:
         # simulate here.
         self.calls.append(("list_tickets", updated_since))
         return [self.tickets[ticket_id] for ticket_id in self.index_keys]
+
+    def list_removed_ticket_ids(self) -> set[int]:
+        self.calls.append(("list_removed_ticket_ids",))
+        return set(self.removed_ids)
 
     def list_conversations(self, ticket_id: int) -> list[dict[str, Any]]:
         self.calls.append(("list_conversations", ticket_id))
@@ -324,6 +330,71 @@ def test_sync_freshdesk_source_reindex_removes_tickets_no_longer_returned(tmp_pa
     assert {item["key"] for item in db.list_items(tmp_path, source_slug="freshdesk")} == {"FD-1"}
 
 
+def test_sync_freshdesk_source_removes_tickets_freshdesk_reports_deleted_or_spam(tmp_path: Path) -> None:
+    # Regression (#52 review): deleted/spam tickets are excluded from the
+    # default listing, so their local copies were never removed and stayed indexed.
+    from jira_workbench import db
+
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    tickets = {1: _ticket(1), 5: _ticket(5)}
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets), progress=None)
+    assert (tmp_path / "freshdesk/tickets/5/ticket.json").exists()
+
+    # Incremental run: ticket 5 is no longer listed, and Freshdesk reports it deleted.
+    client = FakeFreshdeskClient(tickets, index_keys=[1], removed_ids={5})
+    sync_freshdesk_source(settings, tmp_path, client, progress=None)
+
+    assert not (tmp_path / "freshdesk/tickets/5").exists()
+    assert (tmp_path / "freshdesk/tickets/1/ticket.json").exists()
+    assert {item["key"] for item in db.list_items(tmp_path, source_slug="freshdesk")} == {"FD-1"}
+
+
+def test_sync_freshdesk_source_incremental_run_keeps_unlisted_tickets(tmp_path: Path) -> None:
+    # An incremental listing only returns changed tickets, so absence there is not removal.
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    tickets = {1: _ticket(1), 5: _ticket(5)}
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets), progress=None)
+
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets, index_keys=[1]), progress=None)
+
+    assert (tmp_path / "freshdesk/tickets/5/ticket.json").exists()
+
+
+def test_sync_freshdesk_source_forced_full_listing_removes_unlisted_tickets(tmp_path: Path) -> None:
+    from jira_workbench import db
+
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    tickets = {1: _ticket(1), 5: _ticket(5)}
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets), progress=None)
+
+    # Older tombstones may be missing from the deleted/spam filters; a forced
+    # full listing is the complete active set, so ticket 5 is gone.
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets, index_keys=[1]), force=True, progress=None)
+
+    assert not (tmp_path / "freshdesk/tickets/5").exists()
+    assert (tmp_path / "freshdesk/tickets/1/ticket.json").exists()
+    assert {item["key"] for item in db.list_items(tmp_path, source_slug="freshdesk")} == {"FD-1"}
+
+
+def test_sync_freshdesk_source_keeps_tickets_when_listing_removed_ones_fails(tmp_path: Path) -> None:
+    settings = FreshdeskSettings(slug="freshdesk", domain="acme", api_key="key")
+    tickets = {1: _ticket(1), 5: _ticket(5)}
+    sync_freshdesk_source(settings, tmp_path, FakeFreshdeskClient(tickets), progress=None)
+
+    class FailingRemovedListing(FakeFreshdeskClient):
+        def list_removed_ticket_ids(self) -> set[int]:
+            raise FreshdeskError("simulated failure")
+
+    messages: list[str] = []
+    result = sync_freshdesk_source(
+        settings, tmp_path, FailingRemovedListing(tickets, index_keys=[1]), progress=messages.append
+    )
+
+    assert result.ticket_count == 2
+    assert (tmp_path / "freshdesk/tickets/5/ticket.json").exists()
+    assert any("could not list deleted/spam tickets" in message for message in messages)
+
+
 def _client(
     responses: list[_FakeResponse], *, sleeps: list[float] | None = None
 ) -> tuple[FreshdeskClient, _FakeSession]:
@@ -379,6 +450,18 @@ def test_freshdesk_client_list_tickets_passes_updated_since() -> None:
 
     _, params, _ = session.calls[0]
     assert params["updated_since"] == "2026-01-01T00:00:00Z"
+
+
+def test_freshdesk_client_list_removed_ticket_ids_queries_deleted_and_spam_filters() -> None:
+    client, session = _client(
+        [_FakeResponse(200, [{"id": 5}, {"id": 6}]), _FakeResponse(200, [{"id": 7}, {"subject": "no id"}])]
+    )
+
+    assert client.list_removed_ticket_ids() == {5, 6, 7}
+    assert [(url, params["filter"]) for url, params, _ in session.calls] == [
+        ("https://acme.freshdesk.com/api/v2/tickets", "deleted"),
+        ("https://acme.freshdesk.com/api/v2/tickets", "spam"),
+    ]
 
 
 def test_freshdesk_client_list_tickets_embeds_description_and_requester() -> None:

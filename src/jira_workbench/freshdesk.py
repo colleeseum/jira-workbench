@@ -45,6 +45,15 @@ DEFAULT_RETRY_AFTER_SECONDS = 5.0
 # tickets any real account could have" for every account.
 EPOCH_START = "2000-01-01T00:00:00Z"
 
+# Freshdesk's default ticket listing omits deleted and spam tickets; these
+# documented predefined filters (`?filter=deleted`, `?filter=spam`) list them.
+REMOVED_TICKET_FILTERS = ("deleted", "spam")
+
+# Freshdesk documents that the list endpoint returns at most 300 pages
+# (30000 tickets). A listing that reaches that size may be truncated, so it
+# cannot prove that an unlisted ticket is gone.
+MAX_LISTED_TICKETS = 300 * 100
+
 # Freshdesk's 4 universal built-in statuses -- present on every account
 # regardless of plan, so this is the fallback used only when the real,
 # possibly-larger status map (fetched per-account from ticket_fields, see
@@ -87,6 +96,8 @@ class FreshdeskApiClient(Protocol):
     # per-ticket detail fetch left to protocol over. See list_tickets'
     # own docstring/comment for why.
     def list_tickets(self, *, updated_since: str | None = None) -> list[dict[str, Any]]: ...
+
+    def list_removed_ticket_ids(self) -> set[int]: ...
 
     def list_conversations(self, ticket_id: int) -> list[dict[str, Any]]: ...
 
@@ -190,6 +201,20 @@ class FreshdeskClient:
         }
         return self._paginated("tickets", params)
 
+    def list_removed_ticket_ids(self) -> set[int]:
+        """Ids of tickets Freshdesk reports as deleted or spam -- the ones
+        list_tickets never returns, so a sync can drop their local copies.
+        Uses the documented predefined filters on their own: Freshdesk does
+        not document combining `filter` with `updated_since`, so older
+        tombstones may fall outside what these listings return; a forced
+        full sync reconciles those (see sync_freshdesk_source)."""
+        removed: set[int] = set()
+        for filter_name in REMOVED_TICKET_FILTERS:
+            for ticket in self._paginated("tickets", {"filter": filter_name}):
+                if isinstance(ticket, dict) and isinstance(ticket.get("id"), int):
+                    removed.add(ticket["id"])
+        return removed
+
     def list_conversations(self, ticket_id: int) -> list[dict[str, Any]]:
         return self._paginated(f"tickets/{ticket_id}/conversations", {})
 
@@ -222,6 +247,31 @@ class FreshdeskClient:
 
 def freshdesk_dir(jira_dir: Path) -> Path:
     return jira_dir / "freshdesk"
+
+
+def remove_ticket_dirs(tickets_dir: Path, ticket_ids: set[int]) -> list[int]:
+    """Deletes the local copies of the given tickets; returns the ids that
+    actually had a directory. The next reindex drops their index rows."""
+    import shutil
+
+    removed = []
+    for ticket_id in sorted(ticket_ids):
+        dest = tickets_dir / str(ticket_id)
+        if dest.is_dir():
+            shutil.rmtree(dest)
+            removed.append(ticket_id)
+    return removed
+
+
+def unlisted_ticket_ids(tickets_dir: Path, listed_ids: set[int]) -> set[int]:
+    """Locally stored ticket ids absent from `listed_ids`."""
+    if not tickets_dir.exists():
+        return set()
+    return {
+        int(child.name)
+        for child in tickets_dir.iterdir()
+        if child.is_dir() and child.name.isdigit() and int(child.name) not in listed_ids
+    }
 
 
 def ticket_key(ticket_id: int) -> str:
@@ -400,6 +450,25 @@ def sync_freshdesk_source(
             continue
         write_json(tickets_dir / str(ticket_id) / "conversations.json", conversations)
         changed += 1
+
+    # Deleted and spam tickets never appear in the listing above, so their
+    # local copies would otherwise stay indexed forever. Freshdesk lists them
+    # through dedicated filters; a failure there only postpones the cleanup.
+    try:
+        gone_ids = client.list_removed_ticket_ids() - listed_ids
+    except FreshdeskError as exc:
+        gone_ids = set()
+        if progress:
+            progress(f"[3/4] could not list deleted/spam tickets: {exc}")
+    # A full listing (first sync or --force) is the complete active set, so
+    # any other local ticket is gone or no longer visible -- unless the
+    # listing hit Freshdesk's documented size cap and may be truncated.
+    if updated_since is None and len(tickets) < MAX_LISTED_TICKETS:
+        gone_ids |= unlisted_ticket_ids(tickets_dir, listed_ids)
+    removed_ids = remove_ticket_dirs(tickets_dir, gone_ids)
+    if removed_ids and progress:
+        progress(f"[3/4] Removed {len(removed_ids)} deleted, spam or no-longer-listed ticket(s)")
+    failed_ids = [i for i in failed_ids if i not in removed_ids]
 
     if progress:
         progress("[4/4] Indexing...")
