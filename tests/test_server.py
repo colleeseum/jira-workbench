@@ -6473,6 +6473,124 @@ def test_load_assistant_conversations_degrades_gracefully_when_file_is_missing_o
     }
 
 
+def test_save_assistant_conversations_holds_the_lock_against_a_concurrent_insert(tmp_path: Path) -> None:
+    # Regression (#53 review): saving iterated the shared dict with no lock
+    # while a request thread could insert into it -> "dictionary changed
+    # size during iteration" in the background thread.
+    lock = threading.Lock()
+    inserter_blocked = []
+
+    class InsertingDuringIteration(dict):
+        def items(self):
+            iterator = iter(super().items())
+            yield next(iterator)
+
+            def insert() -> None:
+                with lock:
+                    self["inserted"] = {"engine": "claude", "turns": [], "engine_session_id": None}
+
+            inserter = threading.Thread(target=insert)
+            inserter.start()
+            inserter.join(timeout=0.2)
+            inserter_blocked.append(inserter.is_alive())
+            yield from iterator
+            self.inserter = inserter
+
+    conversations = InsertingDuringIteration(
+        {str(i): {"engine": "claude", "turns": [], "engine_session_id": None} for i in range(3)}
+    )
+    jira_workbench.server._save_assistant_conversations(tmp_path, conversations, lock)
+    conversations.inserter.join(timeout=2)
+
+    assert inserter_blocked == [True]
+    assert set(jira_workbench.server._load_assistant_conversations(tmp_path)) == {"0", "1", "2"}
+    assert "inserted" in conversations
+
+
+def test_post_assistant_inserts_the_conversation_under_the_save_lock(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(
+        jira_workbench.server,
+        "assistant_ask_streaming",
+        lambda engine, jira_dir, question, *, resume_id=None, on_step=None: AssistantResult(
+            engine=engine, answer="a", error=None, session_id="sess-1", duration_seconds=1.0
+        ),
+    )
+    real_save = jira_workbench.server._save_assistant_conversations
+    acquisitions = []
+
+    class CountingLock:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        def __enter__(self):
+            acquisitions.append("acquire")
+            return self.inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+    def save_with_counting_lock(jira_dir, conversations, lock):
+        if not isinstance(lock, CountingLock):
+            raise AssertionError("post_assistant must pass the lock it inserted under")
+        real_save(jira_dir, conversations, lock)
+
+    real_lock = threading.Lock
+    monkeypatch.setattr(jira_workbench.server.threading, "Lock", lambda: CountingLock(real_lock()))
+    app = create_app(tmp_path, WorkbenchConfig())
+    monkeypatch.setattr(jira_workbench.server.threading, "Lock", real_lock)
+    monkeypatch.setattr(jira_workbench.server, "_save_assistant_conversations", save_with_counting_lock)
+    client = TestClient(app)
+
+    client.post("/assistant", data={"engine": "claude", "question": "q"}, follow_redirects=False)
+
+    # Once for the insert in the request thread, once for the save.
+    assert acquisitions == ["acquire", "acquire"]
+
+
+def test_save_assistant_conversations_failed_write_keeps_the_previous_file(tmp_path: Path, monkeypatch) -> None:
+    # Regression (#53 review): the history was rewritten with a truncating
+    # write_text, so a failed or interrupted write lost every conversation.
+    import errno
+    import io
+
+    lock = threading.Lock()
+    good = {"c1": {"engine": "claude", "turns": [{"question": "q", "answer": "a"}], "engine_session_id": "sess-1"}}
+    jira_workbench.server._save_assistant_conversations(tmp_path, good, lock)
+    before = (tmp_path / "assistant_conversations.json").read_text(encoding="utf-8")
+
+    real_open = io.open
+
+    class DiskFullFile:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def write(self, data: str) -> int:
+            self.handle.write(data[: len(data) // 2])
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.handle.close()
+            return False
+
+    def disk_full_open(file, mode="r", *args, **kwargs):
+        handle = real_open(file, mode, *args, **kwargs)
+        return DiskFullFile(handle) if "w" in mode else handle
+
+    monkeypatch.setattr(io, "open", disk_full_open)
+    bigger = {**good, "c2": {"engine": "claude", "turns": [{"question": "q2", "answer": "a2"}], "engine_session_id": None}}
+    with pytest.raises(OSError):
+        jira_workbench.server._save_assistant_conversations(tmp_path, bigger, lock)
+    monkeypatch.setattr(io, "open", real_open)
+
+    assert (tmp_path / "assistant_conversations.json").read_text(encoding="utf-8") == before
+    assert set(jira_workbench.server._load_assistant_conversations(tmp_path)) == {"c1"}
+    assert [p.name for p in tmp_path.iterdir()] == ["assistant_conversations.json"]
+
+
 def test_assistant_conversation_with_an_errored_turn_still_persists_its_prior_history(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(jira_workbench.server.threading, "Thread", _SyncThread)
     monkeypatch.setattr(

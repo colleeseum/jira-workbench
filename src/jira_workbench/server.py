@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import html
 import json
+import os
 import re
+import tempfile
 import threading
 import uuid
 from html.parser import HTMLParser
@@ -4941,22 +4944,46 @@ def _load_assistant_conversations(jira_dir: Path) -> dict[str, dict[str, Any]]:
     return restored
 
 
-def _save_assistant_conversations(jira_dir: Path, conversations: dict[str, dict[str, Any]]) -> None:
+def _save_assistant_conversations(
+    jira_dir: Path, conversations: dict[str, dict[str, Any]], lock: threading.Lock
+) -> None:
     # Rewrites the whole (small -- this is exploratory Q&A history, not a
-    # growing production dataset) file each time, same "just rewrite it"
-    # pattern metadata.py's own write_board_settings already uses for its
-    # similarly small local-only JSON file. Only the settled fields are
-    # written -- see _load_assistant_conversations' own docstring for why
-    # "status"/"steps"/"error" are deliberately left out.
-    persisted = {
-        conversation_id: {
-            "engine": value["engine"],
-            "turns": value["turns"],
-            "engine_session_id": value.get("engine_session_id"),
+    # growing production dataset) file each time. Only the settled fields
+    # are written -- see _load_assistant_conversations' own docstring for
+    # why "status"/"steps"/"error" are deliberately left out.
+    #
+    # `lock` is the same lock post_assistant holds while inserting a new
+    # conversation: several background threads can finish at once, and a
+    # request thread can insert while one of them saves, so the snapshot
+    # (iterating the shared dict) and the write are both done under it.
+    with lock:
+        persisted = {
+            conversation_id: {
+                "engine": value["engine"],
+                "turns": value["turns"],
+                "engine_session_id": value.get("engine_session_id"),
+            }
+            for conversation_id, value in conversations.items()
         }
-        for conversation_id, value in conversations.items()
-    }
-    write_json(_assistant_conversations_path(jira_dir), persisted)
+        _write_json_atomically(_assistant_conversations_path(jira_dir), persisted)
+
+
+def _write_json_atomically(path: Path, value: Any) -> None:
+    # Writes to a temp file in the same directory and os.replace()s it
+    # over the target, so a failed or interrupted write leaves the previous
+    # file intact instead of a truncated one. Kept local to the assistant
+    # history: sync.write_json's own (non-atomic) behaviour is tracked
+    # separately.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _assistant_poll_script(conversation_id: str) -> str:
@@ -5122,11 +5149,14 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
     # "answer":...}, ...] (completed turns, including this one once
     # status=="done"), "engine_session_id": str | None (for the *next*
     # turn's --resume), "error": str | None}. Mutated from both a
-    # request-handling thread and the background thread post_assistant
-    # starts -- left unguarded by an explicit lock; the individual dict/
-    # list operations involved (key assignment, list.append) are atomic
-    # enough under the GIL for this single-local-user tool.
+    # request-handling thread and the background threads post_assistant
+    # starts: inserting a conversation and saving the history (which
+    # iterates the dict) both hold _assistant_conversations_lock, so a save
+    # never sees the dict change size mid-iteration and two finishing turns
+    # never interleave their writes. Per-entry updates (key assignment,
+    # list.append) stay unguarded -- atomic enough under the GIL.
     _assistant_conversations: dict[str, dict[str, Any]] = _load_assistant_conversations(jira_dir)
+    _assistant_conversations_lock = threading.Lock()
 
     @app.get("/api/items")
     def list_items(
@@ -6621,7 +6651,8 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
             "engine_session_id": resume_id,
             "error": None,
         }
-        _assistant_conversations[new_conversation_id] = entry
+        with _assistant_conversations_lock:
+            _assistant_conversations[new_conversation_id] = entry
 
         def on_step(step: str) -> None:
             entry["steps"].append(step)
@@ -6641,7 +6672,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 entry["error"] = f"assistant failed: {exc}"
             finally:
                 entry["status"] = "done"
-                _save_assistant_conversations(jira_dir, _assistant_conversations)
+                _save_assistant_conversations(jira_dir, _assistant_conversations, _assistant_conversations_lock)
 
         threading.Thread(target=run, daemon=True).start()
         return RedirectResponse(url=f"/assistant?{urlencode({'conversation': new_conversation_id})}", status_code=303)
