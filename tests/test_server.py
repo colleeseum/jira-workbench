@@ -2647,6 +2647,37 @@ def test_post_item_board_position_moves_scope_and_ranks(tmp_path: Path, monkeypa
     assert board["boardKeys"] == ["SAT-1", "SAT-2"]
 
 
+def test_post_item_board_position_records_a_successful_move_when_ranking_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Jira has already moved the issue when the rank step raises; the cache
+    # must follow the move, or the page reload shows it in its old section
+    # until the next board metadata refresh.
+    class RankFailsJiraClient(BoardPositionJiraClient):
+        def update_rank(self, issues_to_rank: list, rank_before: str, customfield_number: str) -> None:
+            raise RuntimeError("rank boom")
+
+    client = _synced_client(tmp_path, _pushable_config())
+    _write_position_board_cache(tmp_path, backlog_keys=["SAT-1"], board_keys=["SAT-2"])
+    fake = RankFailsJiraClient()
+    monkeypatch.setattr(jira_workbench.service, "jira_api_client", lambda _config: fake)
+
+    response = client.post(
+        "/items/SAT-1/board-position",
+        data={"project": "SAT", "board": "SAT board", "target_scope": "active", "before_key": "SAT-2"},
+    )
+
+    body = response.json()
+    assert body["ok"] is False
+    assert "rank" in body["error"]
+    assert "rank boom" in body["error"]
+    assert "moved" in body["error"]
+    assert fake.move_calls == [("board", "rest/agile/1.0/board/32/issue", {"issues": ["SAT-1"]})]
+    board = read_json(tmp_path / "meta/SAT/boards.json")["boards"][0]
+    assert board["backlogKeys"] == []
+    assert "SAT-1" in board["boardKeys"]
+
+
 def test_post_item_board_position_rank_only_when_scope_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     client = _synced_client(tmp_path, _pushable_config())
     _write_position_board_cache(tmp_path, board_keys=["SAT-2", "SAT-1"])

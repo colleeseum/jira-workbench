@@ -6181,6 +6181,9 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                     move_issue_to_backlog(client, board_id, key)
                 else:
                     move_issue_to_board(client, board_id, key)
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the caller as JSON, not raised
+            return {"ok": False, "error": str(exc)}
+        try:
             if before_key or after_key:
                 rank_field_id = cached_rank_field_id(client)
                 if rank_field_id and before_key:
@@ -6197,7 +6200,21 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
                 after_key=after_key or None,
             )
         except Exception as exc:  # noqa: BLE001 -- surfaced to the caller as JSON, not raised
-            return {"ok": False, "error": str(exc)}
+            if target_scope == current_scope:
+                return {"ok": False, "error": str(exc)}
+            # Jira already moved the issue to the other scope; record that
+            # (position unknown, so appended) before reporting the failed
+            # rank, or the reload shows it back in its old section.
+            scope_label = "backlog" if target_scope == "backlog" else "board"
+            try:
+                _patch_board_order(jira_dir, project, board, key, target_scope=target_scope, before_key=None)
+            except Exception as patch_exc:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "error": f"{key} was moved to the {scope_label}, but ranking failed: {exc}; "
+                    f"updating the local board cache also failed: {patch_exc}",
+                }
+            return {"ok": False, "error": f"{key} was moved to the {scope_label}, but ranking failed: {exc}"}
         return {"ok": True}
 
     @app.post("/items/{key}/comments", dependencies=[Depends(_require_same_origin)])
