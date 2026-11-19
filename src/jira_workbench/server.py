@@ -1842,16 +1842,25 @@ def render_items_page(
     # this page would otherwise use. Deliberately doesn't combine with
     # swimlane grouping -- picking a swimlane already means "I want that
     # grouping instead", not stacked on top of this one.
+    # Only a cached Jira board (kind "jira", with an id) qualifies: drops
+    # and scoped creation move issues through Jira's board API, which a
+    # locally-defined board has no counterpart in.
     board_scope_value = query.get("board_scope") or ""
-    sections_mode = (
-        bool(board_value) and board_value != MODIFIED_BOARD_NAME and not board_scope_value and swimlane_mode == "none"
-    )
+    board_entry = None
+    if board_value and board_value != MODIFIED_BOARD_NAME and not board_scope_value and swimlane_mode == "none":
+        board_entry = next(
+            (
+                b
+                for b in load_cached_boards(jira_dir)
+                if str(b.get("name") or "") == board_value and b.get("kind") == "jira" and b.get("id") is not None
+            ),
+            None,
+        )
+    sections_mode = board_entry is not None
     section_order: dict[str, list[str]] = {"active": [], "backlog": []}
-    if sections_mode:
-        board_entry = next((b for b in load_cached_boards(jira_dir) if str(b.get("name") or "") == board_value), None)
-        if board_entry:
-            section_order["backlog"] = [k for k in (board_entry.get("backlogKeys") or []) if isinstance(k, str)]
-            section_order["active"] = [k for k in (board_entry.get("boardKeys") or []) if isinstance(k, str)]
+    if board_entry is not None:
+        section_order["backlog"] = [k for k in (board_entry.get("backlogKeys") or []) if isinstance(k, str)]
+        section_order["active"] = [k for k in (board_entry.get("boardKeys") or []) if isinstance(k, str)]
 
     def item_scope(item: dict[str, Any]) -> str:
         # "backlog" only if this board's cache actually says so -- an item

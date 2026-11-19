@@ -14,7 +14,12 @@ import jira_workbench.server
 import jira_workbench.service
 from jira_workbench.assistant import AssistantResult
 from jira_workbench.config import ProjectSettings, WorkbenchConfig
-from jira_workbench.metadata import load_component_settings, set_component_archived, write_project_registry
+from jira_workbench.metadata import (
+    add_local_board,
+    load_component_settings,
+    set_component_archived,
+    write_project_registry,
+)
 from jira_workbench.server import (
     BULK_EDIT_FORM_ID,
     ISSUE_KEY_PATTERN,
@@ -4541,6 +4546,24 @@ def test_items_page_bottom_fab_shown_outside_sections_mode(tmp_path: Path) -> No
 
     response = client.get("/")
 
+    assert 'class="new-issue-fab"' in response.text
+
+
+def test_items_page_local_board_has_no_movable_sections(tmp_path: Path) -> None:
+    # Regression (#53 review): a configured local board enabled the
+    # Active/Backlog sections, draggable rows and scoped "+" links, but
+    # every move fails since only cached Jira boards can be moved on.
+    client = _synced_client(tmp_path, _pushable_config())
+    add_local_board(tmp_path, "Mine", {}, None)
+
+    response = client.get("/", params={"board": "Mine"})
+
+    assert response.status_code == 200
+    assert "SAT-1" in response.text
+    assert 'class="swimlane-header section-header"' not in response.text
+    assert 'draggable="true" ondragstart' not in response.text
+    assert "target_scope=" not in response.text
+    assert "jiraWbDrop" not in response.text
     assert 'class="new-issue-fab"' in response.text
 
 
