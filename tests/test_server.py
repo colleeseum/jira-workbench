@@ -814,6 +814,28 @@ def test_items_page_status_change_redirects_back_to_the_list(tmp_path: Path) -> 
     assert response.headers["location"].startswith("/?project=SAT&")
 
 
+@pytest.mark.parametrize("return_to", ["//evil.example/", "https://evil.example/", "/\\evil.example", "javascript:alert(1)"])
+@pytest.mark.parametrize(
+    ("path", "data", "fallback"),
+    [
+        ("/items/SAT-1/fields", {"field": "priority", "value": "High"}, "/items/SAT-1?"),
+        ("/items/SAT-1/status", {"status": "In Progress"}, "/items/SAT-1?"),
+        ("/items/push-all", {}, "/?"),
+    ],
+)
+def test_write_routes_ignore_a_non_local_return_to(
+    tmp_path: Path, path: str, data: dict[str, str], fallback: str, return_to: str
+) -> None:
+    # return_to is request-supplied; redirecting to it unchecked is an open
+    # redirect. Only a local path is followed, otherwise the route's own default.
+    client = _synced_client(tmp_path)
+
+    response = client.post(path, data={**data, "return_to": return_to}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith(fallback)
+
+
 def test_items_page_field_edit_without_return_to_still_goes_to_detail(tmp_path: Path) -> None:
     # The Detail page's own forms never send return_to -- must keep
     # redirecting there, unchanged, when the field is absent.

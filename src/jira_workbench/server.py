@@ -5877,6 +5877,8 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # silently failed, so that case (and a failed scope_move above)
         # gets a clickable warning banner pointing at the issue instead of
         # a plain success message.
+        # return_to is request-supplied; only a local path may become the redirect target.
+        return_to = _local_href(return_to) or ""
         if scope_move_error:
             params = {"flash": f"{key} {scope_move_error}", "flash_kind": "warning", "flash_href": f"/items/{key}"}
         elif return_to and not _list_url_matches_item(jira_dir, config, return_to, key):
@@ -5977,7 +5979,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # when the edit came from Detail itself but wrongly yanks the user
         # off the list into "view mode" after a list-row edit.
         query_string = urlencode({"flash": flash, "flash_kind": flash_kind})
-        target = return_to or f"/items/{key}"
+        target = _local_href(return_to) or f"/items/{key}"
         separator = "&" if "?" in target else "?"
         return RedirectResponse(url=f"{target}{separator}{query_string}", status_code=303)
 
@@ -6033,7 +6035,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # originates from the Items list, so that's the sensible home
         # instead of a single item's own Detail page.
         query_string = urlencode({"flash": flash, "flash_kind": flash_kind})
-        target = return_to or "/"
+        target = _local_href(return_to) or "/"
         separator = "&" if "?" in target else "?"
         return RedirectResponse(url=f"{target}{separator}{query_string}", status_code=303)
 
@@ -6301,7 +6303,7 @@ def create_app(jira_dir: Path, config: WorkbenchConfig, config_path: Path | None
         # since api_client_from_config/push_shadows are project-scoped
         # (one live Jira client per project, unlike a single-item push
         # which already knows its one project).
-        target = return_to or "/"
+        target = _local_href(return_to) or "/"
         separator = "&" if "?" in target else "?"
 
         def redirect(message: str, kind: str) -> RedirectResponse:
