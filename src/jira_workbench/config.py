@@ -307,14 +307,24 @@ def parse_freshdesk_sources(value: Any, path: Path) -> tuple[FreshdeskSettings, 
     an unrecognized kind raises rather than being silently ignored, since a
     typo'd kind would otherwise look like a working config with a source
     that just never syncs anything. `slug` defaults to `kind` (today that
-    means "freshdesk"), which is enough until a second Freshdesk account
-    is ever configured side by side."""
+    means "freshdesk").
+
+    At most one Freshdesk source is accepted: every Freshdesk source shares
+    the `jira_dir/freshdesk/` cache (sync cursor, tickets, agents, groups)
+    and its tickets are keyed `FD-<id>` without the slug, so two accounts
+    would overwrite each other's cursor and collide on ticket keys.
+    Per-source storage and keys are future work (issue #60)."""
     if value is None:
         return ()
     if not isinstance(value, list):
         raise ConfigError(f"invalid config file {path}: [[sources]] must be an array of tables")
+    if len(value) > 1:
+        raise ConfigError(
+            f"invalid config file {path}: only one [[sources]] Freshdesk entry is supported "
+            f"(got {len(value)}); multiple Freshdesk accounts would share one freshdesk/ cache "
+            "and collide on FD-<id> ticket keys"
+        )
     sources = []
-    seen_slugs: set[str] = set()
     for entry in value:
         if not isinstance(entry, dict):
             raise ConfigError(f"invalid config file {path}: each [[sources]] entry must be a table")
@@ -333,9 +343,6 @@ def parse_freshdesk_sources(value: Any, path: Path) -> tuple[FreshdeskSettings, 
             raise ConfigError(f"invalid config file {path}: sources entry {slug!r} needs a non-empty api_key")
         if slug in RESERVED_SOURCE_SLUGS:
             raise ConfigError(f"invalid config file {path}: sources slug {slug!r} is reserved for Jira")
-        if slug in seen_slugs:
-            raise ConfigError(f"invalid config file {path}: duplicate sources slug {slug!r}")
-        seen_slugs.add(slug)
         sources.append(FreshdeskSettings(slug=slug, domain=domain, api_key=api_key))
     return tuple(sources)
 

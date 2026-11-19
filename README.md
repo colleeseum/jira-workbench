@@ -137,6 +137,9 @@ api_key = "..."
 Freshdesk sync is read-only and stores tickets under `jira_dir/freshdesk/`.
 Tickets appear as `FD-<id>`, so a configuration with a Freshdesk source cannot
 also sync a Jira project keyed `FD`. The source slug `jira` is reserved.
+Only one Freshdesk source is supported for now: a second `[[sources]]` entry
+is rejected as a configuration error, because every Freshdesk source would
+share the `freshdesk/` cache and the `FD-<id>` key space.
 
 ### Multiple projects
 

@@ -715,6 +715,19 @@ def test_load_config_rejects_duplicate_source_slugs(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_load_config_rejects_more_than_one_freshdesk_source(tmp_path: Path) -> None:
+    # Every Freshdesk source shares jira_dir/freshdesk/ (cursor, tickets, metadata) and the FD-<id>
+    # key space, so two accounts with distinct slugs would still overwrite and collide (issue #60).
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[[sources]]\nkind = "freshdesk"\nslug = "support"\ndomain = "acme"\napi_key = "secret"\n'
+        '[[sources]]\nkind = "freshdesk"\nslug = "helpdesk"\ndomain = "other"\napi_key = "secret2"\n'
+    )
+
+    with pytest.raises(ConfigError, match="only one \\[\\[sources\\]\\] Freshdesk entry"):
+        load_config(path)
+
+
 def test_load_config_with_no_sources_array_has_no_freshdesk_sources(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text('project = "SAT"\n')

@@ -258,7 +258,7 @@ def test_sync_selects_configured_source_kinds(tmp_path: Path, monkeypatch, sourc
            'jira_email = "user@example.com"\njira_api_token = "token"\n' if has_jira else "")
         + '\n'.join(
             f'[[sources]]\nkind = "freshdesk"\nslug = "{slug}"\ndomain = "acme"\napi_key = "key"'
-            for slug in ("support", "helpdesk")
+            for slug in ("support",)
         )
     )
     argv = ["--config", str(config_path), "sync", "--force"]
@@ -268,7 +268,7 @@ def test_sync_selects_configured_source_kinds(tmp_path: Path, monkeypatch, sourc
     if has_jira and source != "freshdesk":
         expected.append(("jira", True))
     if source != "jira":
-        expected.extend([("support", True), ("helpdesk", True)])
+        expected.append(("support", True))
     assert main(argv) == (2 if source == "jira" and not has_jira else 0)
     assert calls == expected
 
@@ -306,11 +306,11 @@ def test_sync_all_reports_failures_and_continues(tmp_path: Path, monkeypatch, fa
            'jira_url = "https://example.atlassian.net"\njira_email = "user@example.com"\njira_api_token = "token"\n')
         + '\n'.join(
             f'[[sources]]\nkind = "freshdesk"\nslug = "{slug}"\ndomain = "acme"\napi_key = "key"'
-            for slug in ("support", "helpdesk")
+            for slug in ("support",)
         )
     )
     assert main(["--config", str(config_path), "sync"]) == (2 if failure == "jira_config" else 1)
-    assert calls == ([] if failure == "jira_config" else ["jira"]) + ["support", "helpdesk"]
+    assert calls == ([] if failure == "jira_config" else ["jira"]) + ["support"]
 
 
 def test_sync_reads_config_file_and_flags_override(tmp_path: Path, capsys, monkeypatch) -> None:
