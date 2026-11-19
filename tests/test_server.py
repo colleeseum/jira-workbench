@@ -235,6 +235,33 @@ def test_get_item_reflects_local_shadow_edits(tmp_path: Path) -> None:
     assert response.json()["issue"]["fields"]["summary"] == "Edited locally"
 
 
+def test_get_item_reflects_staged_comment_changes(tmp_path: Path) -> None:
+    # Regression (#52 review): the API returned shadow-merged fields but the raw
+    # comments.json, ignoring staged comment adds/edits/deletes the HTML page shows.
+    from jira_workbench.shadow import delete_comment, edit_comment
+    from jira_workbench.sync import find_existing_issue
+
+    client = _synced_client(tmp_path)
+    issue_dir = find_existing_issue(tmp_path / "components", "SAT-1").parent
+    write_json(
+        issue_dir / "comments.json",
+        {
+            "comments": [
+                {"id": "10", "body": "first", "created": "2026-01-01T00:00:00Z"},
+                {"id": "11", "body": "second", "created": "2026-01-02T00:00:00Z"},
+            ]
+        },
+    )
+    delete_comment(tmp_path, "SAT-1", "10")
+    edit_comment(tmp_path, "SAT-1", "11", "second, edited")
+    add_comment(tmp_path, "SAT-1", "staged reply")
+
+    comments = client.get("/api/items/SAT-1").json()["comments"]
+
+    states = {row["body"]: row["state"] for row in comments}
+    assert states == {"first": "pending-delete", "second, edited": "edited", "staged reply": "local-new"}
+
+
 def test_get_item_not_found_returns_404(tmp_path: Path) -> None:
     client = _synced_client(tmp_path)
 

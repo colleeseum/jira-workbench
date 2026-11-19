@@ -258,19 +258,11 @@ def item_detail_data(jira_dir: Path, key: str) -> dict[str, Any] | None:
         raise MetadataError(f"local issue file for {key} is invalid")
     shadow = load_shadow(jira_dir, key)
     effective = apply_shadow(issue, shadow) if shadow is not None else issue
-    comments_path = path.parent / "comments.json"
     attachments_path = path.parent / "attachments.json"
-    # comments.json can be either a bare list or Jira's own raw
-    # {"comments": [...], "total": ..., ...} shape depending on how it was
-    # fetched (see sync.py's fetch_issue_comments) -- normalized the same
-    # way view.py's own comments_text already handles both, so callers
-    # always get a plain list.
-    comments_payload = read_json(comments_path) if comments_path.exists() else []
-    comments = (
-        as_list(as_dict(comments_payload).get("comments"))
-        if isinstance(comments_payload, dict)
-        else as_list(comments_payload)
-    )
+    # The effective comment rows, staged adds/edits/deletes included -- the
+    # same list the HTML detail page shows, so the API matches the shadowed
+    # issue fields above instead of the raw synced comments.json.
+    comments = list_comments(jira_dir, key, shadow)
     attachments = as_list(read_json(attachments_path)) if attachments_path.exists() else []
     return {"issue": effective, "comments": comments, "attachments": attachments}
 
